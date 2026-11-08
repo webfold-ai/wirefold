@@ -2,7 +2,7 @@
 //! `Segment`/`BuildNode` path tree the CSV/TOON parsers rebuild through, and the escape/attr
 //! helpers those surfaces share. Entry points are re-exported by [`super`].
 
-use super::{field, Atom, SyntaxError, SyntaxTerm};
+use super::{Atom, SyntaxError, SyntaxTerm};
 
 pub(super) fn render_json(term: &SyntaxTerm) -> String {
     let mut out = String::new();
@@ -974,7 +974,7 @@ fn find_balanced_close(s: &str, open: &str, close: &str) -> Option<usize> {
             next_close = s[cursor..].find(close).map(|i| cursor + i);
         }
         match (next_open, next_close) {
-            (_, Some(c)) if next_open.map_or(true, |o| c < o) => {
+            (_, Some(c)) if next_open.is_none_or(|o| c < o) => {
                 if depth == 0 {
                     return Some(c);
                 }

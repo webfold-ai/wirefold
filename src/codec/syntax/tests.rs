@@ -606,10 +606,10 @@ ex:bob ex:name "Bob" ;
 
     #[test]
     fn turtle_handles_comma_for_multiple_objects_on_same_predicate() {
-        let ttl = r#"
+        let ttl = r"
 @prefix ex: <http://ex/> .
 ex:alice ex:knows ex:bob , ex:carol , ex:dave .
-"#;
+";
         let term = parse_turtle(ttl).unwrap();
         let SyntaxTerm::Bu(subs) = &term else {
             panic!("expected Bu");
@@ -627,10 +627,10 @@ ex:alice ex:knows ex:bob , ex:carol , ex:dave .
 
     #[test]
     fn turtle_handles_blank_nodes() {
-        let ttl = r#"
+        let ttl = r"
 @prefix ex: <http://ex/> .
 _:b1 ex:temp 22.5 .
-"#;
+";
         let term = parse_turtle(ttl).unwrap();
         let SyntaxTerm::Bu(subs) = &term else {
             panic!("expected Bu");

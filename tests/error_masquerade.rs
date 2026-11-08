@@ -4,8 +4,8 @@
 
 #![cfg(feature = "error")]
 
-use wirefold::{Context, Error, Result};
 use std::fmt;
+use wirefold::{Context, Error, Result};
 
 // A minimal std error to wrap/convert from, standing in for `std::io::Error` et al.
 #[derive(Debug)]

@@ -14,6 +14,20 @@
 
 #![warn(missing_docs)]
 #![warn(clippy::pedantic)]
+// Style lints inherited from the code this crate was split from (mostly the RDF surface and the
+// codec's reference tests). Allowed by name so `clippy -D warnings` can gate everything else;
+// each one is a candidate for a cleanup PR, not a decision that the pattern is right.
+#![allow(
+    clippy::format_push_string,
+    clippy::type_complexity,
+    clippy::needless_range_loop,
+    clippy::module_inception,
+    clippy::empty_line_after_doc_comments,
+    clippy::mixed_attributes_style,
+    clippy::manual_let_else,
+    clippy::used_underscore_items,
+    clippy::assigning_clones
+)]
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -57,9 +71,9 @@ pub use wirefold_derive::Error;
 pub mod validate;
 
 #[cfg(feature = "validate")]
-pub use wirefold_derive::Validate;
-#[cfg(feature = "validate")]
 pub use validate::{Validate, ValidationError, ValidationErrors};
+#[cfg(feature = "validate")]
+pub use wirefold_derive::Validate;
 
 // The table, pool and counters the codec is built on live in apeiron; re-exported at the crate
 // root so the codec's `crate::{CoordMap, FreqMap}` and `crate::par` paths resolve.

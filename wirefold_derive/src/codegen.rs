@@ -158,7 +158,9 @@ pub(crate) fn derive_struct(name: &Ident, fields: &[Field]) -> proc_masq::TokenS
                     __dst[__oo..__oo + 8].copy_from_slice(&((#lcid - #lbid) as u64).to_le_bytes());
                 }});
                 view_fields.push(quote_tokens! { #cid: ::wirefold::codec::web::Ragged<'a>, });
-                view_opens.push(quote_tokens! { #cid: ::wirefold::codec::web::Ragged::open(s.section(#sec))?, });
+                view_opens.push(
+                    quote_tokens! { #cid: ::wirefold::codec::web::Ragged::open(s.section(#sec))?, },
+                );
                 col_opens.push(quote_tokens! { let #cid = ::wirefold::codec::web::Ragged::open(s.section(#sec))?; });
                 // one entry per record, and every entry valid UTF-8 (so `get_ref`/`collapse_get` cannot panic)
                 col_checks.push(quote_tokens! {

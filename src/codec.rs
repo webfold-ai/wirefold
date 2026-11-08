@@ -637,7 +637,7 @@ pub mod cm {
             let (r2, b2, w2) = apm_apply(&self.apm2, sel2, q1);
             let sel3 = ((ctx % 256) * 769 + nd) % APM3_ROWS;
             let (r3, b3, w3) = apm_apply(&self.apm3, sel3, q1);
-            let out = (q1 + 7.0 * ((r2 + r3) / 2.0)) / 8.0;
+            let out = (q1 + 7.0 * f64::midpoint(r2, r3)) / 8.0;
             (
                 out,
                 MixState {
@@ -939,7 +939,7 @@ pub mod cm {
         let mut a = if i >= 1 { i32::from(data[i - 1]) } else { 0 }; // left
         let b = if i >= w { i32::from(data[i - w]) } else { 0 }; // up
         let mut c = if i > w { i32::from(data[i - w - 1]) } else { 0 }; // up-left
-        if i % w == 0 {
+        if i.is_multiple_of(w) {
             a = b;
             c = b; // row start: no left neighbour
         }
@@ -7786,7 +7786,7 @@ pub mod tans {
                         s ^= s << 13;
                         s ^= s >> 17;
                         s ^= s << 5;
-                        if s % 3 == 0 {
+                        if s.is_multiple_of(3) {
                             b' '
                         } else {
                             b'a' + (s % 26) as u8
@@ -7827,7 +7827,7 @@ pub mod tans {
                         s ^= s << 13;
                         s ^= s >> 17;
                         s ^= s << 5;
-                        if s % 4 == 0 {
+                        if s.is_multiple_of(4) {
                             (s % 7) as u8
                         } else {
                             b'e'
@@ -7865,7 +7865,7 @@ pub mod tans {
                         s ^= s << 13;
                         s ^= s >> 17;
                         s ^= s << 5;
-                        if s % 4 == 0 {
+                        if s.is_multiple_of(4) {
                             (s % 7) as u8
                         } else {
                             b'e'
@@ -7933,7 +7933,9 @@ pub mod web {
     #[must_use]
     pub fn pod_bytes<T: Pod>(v: &T) -> &[u8] {
         // SAFETY: T: Pod ⇒ all size_of::<T>() bytes are initialised (no padding); immutable, tied to v.
-        unsafe { core::slice::from_raw_parts((v as *const T).cast::<u8>(), size_of::<T>()) }
+        unsafe {
+            core::slice::from_raw_parts(std::ptr::from_ref::<T>(v).cast::<u8>(), size_of::<T>())
+        }
     }
 
     /// Read a `Pod` value out of (possibly unaligned) bytes — copies `size_of::<T>()` bytes.
@@ -8050,7 +8052,7 @@ pub mod web {
             if buf.len() < 8 {
                 return Err(WireErr::TooShort);
             }
-            if (buf.as_ptr() as usize) % 8 != 0 {
+            if !(buf.as_ptr() as usize).is_multiple_of(8) {
                 return Err(WireErr::Misaligned);
             }
             let mut hdr = [0u8; 8];
@@ -8264,7 +8266,7 @@ pub mod web {
             if buf.len() < 8 {
                 return Err(WireErr::TooShort);
             }
-            if (buf.as_ptr() as usize) % 8 != 0 {
+            if !(buf.as_ptr() as usize).is_multiple_of(8) {
                 return Err(WireErr::Misaligned);
             }
             // SAFETY: 8-aligned, ≥8 bytes; read the count word (native-endian, the zero-copy convention).
@@ -8313,7 +8315,10 @@ pub mod web {
         pub fn get_as<T: Pod>(&self, i: usize) -> Option<&'a [T]> {
             let s = self.get(i);
             let sz = size_of::<T>();
-            if sz == 0 || s.len() % sz != 0 || (s.as_ptr() as usize) % align_of::<T>() != 0 {
+            if sz == 0
+                || !s.len().is_multiple_of(sz)
+                || !(s.as_ptr() as usize).is_multiple_of(align_of::<T>())
+            {
                 return None;
             }
             // SAFETY: checked alignment and exact multiple of size_of::<T>(); T: Pod (any bitpattern ok).
@@ -8401,7 +8406,7 @@ pub mod web {
 
     impl<'a> Sections<'a> {
         pub fn open(buf: &'a [u8]) -> Result<Self, WireErr> {
-            if buf.len() < 8 || (buf.as_ptr() as usize) % 8 != 0 {
+            if buf.len() < 8 || !(buf.as_ptr() as usize).is_multiple_of(8) {
                 return Err(WireErr::Misaligned);
             }
             // SAFETY: 8-aligned, ≥8 bytes; read the section count.
@@ -8422,10 +8427,10 @@ pub mod web {
             };
             for j in 0..n {
                 let s = starts[j] as usize;
-                if s % 8 != 0
+                if !s.is_multiple_of(8)
                     || (s as u64)
                         .checked_add(lens[j])
-                        .map_or(true, |e| e as usize > buf.len())
+                        .is_none_or(|e| e as usize > buf.len())
                 {
                     return Err(WireErr::BadLength);
                 }
@@ -8810,7 +8815,7 @@ pub mod web {
             let reference: Vec<[f32; D]> = (0..n)
                 .map(|i| {
                     let sc: Vec<f32> = (0..=i).map(|j| dot(&nodes[i].q, &nodes[j].k)).collect();
-                    let mx = sc.iter().cloned().fold(f32::MIN, f32::max);
+                    let mx = sc.iter().copied().fold(f32::MIN, f32::max);
                     let ex: Vec<f32> = sc.iter().map(|&x| (x - mx).exp()).collect();
                     let z: f32 = ex.iter().sum();
                     let mut o = [0f32; D];
@@ -8828,7 +8833,7 @@ pub mod web {
                 |i| 0..i + 1,
                 |_i, me: &Qkv, nbrs: &[Qkv]| {
                     let sc: Vec<f32> = nbrs.iter().map(|nb| dot(&me.q, &nb.k)).collect();
-                    let mx = sc.iter().cloned().fold(f32::MIN, f32::max);
+                    let mx = sc.iter().copied().fold(f32::MIN, f32::max);
                     let ex: Vec<f32> = sc.iter().map(|&x| (x - mx).exp()).collect();
                     let z: f32 = ex.iter().sum();
                     let mut o = [0f32; D];
