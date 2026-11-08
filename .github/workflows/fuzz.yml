@@ -1,0 +1,41 @@
+name: Fuzz
+
+# cargo-fuzz (libFuzzer) against the decoders and parsers that take untrusted bytes.
+# Short runs on every PR that touches code, a scheduled deeper run overnight.
+
+on:
+  pull_request:
+    paths:
+      - "src/**"
+      - "wirefold_derive/**"
+      - "fuzz/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/fuzz.yml"
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: cargo-fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [fuzz_decompress, fuzz_msgpack, fuzz_syntax, fuzz_term]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install nightly toolchain
+        run: rustup toolchain install nightly --profile minimal
+      - name: Install cargo-fuzz
+        run: cargo install --locked cargo-fuzz
+      - name: Run ${{ matrix.target }}
+        run: cargo +nightly fuzz run ${{ matrix.target }} --fuzz-dir fuzz -- -max_total_time=180 -rss_limit_mb=4096

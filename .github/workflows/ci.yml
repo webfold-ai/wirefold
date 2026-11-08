@@ -1,15 +1,43 @@
 name: CI
+
 on:
+  pull_request:
   push:
     branches: [main]
-  pull_request:
+  workflow_dispatch:
+
 permissions:
   contents: read
+
 jobs:
-  test:
+  rust:
+    name: Rust checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - run: rustup toolchain install stable --profile minimal
-      - run: cargo test --all-features
-      - run: cargo check --no-default-features
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --locked --all-features --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked --all-features
+      - name: Run the documented examples
+        run: cargo run --locked --example usage --all-features
+      - name: Build with no default features
+        run: cargo check --locked --no-default-features
+
+  msrv:
+    name: MSRV 1.89
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.89
+        run: rustup toolchain install 1.89.0 --profile minimal
+      - name: Check
+        run: cargo +1.89.0 check --locked --all-features
