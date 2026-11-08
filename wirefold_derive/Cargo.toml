@@ -1,0 +1,22 @@
+[package]
+name = "wirefold_derive"
+version = "0.1.0"
+edition = "2021"
+description = "#[derive(Collapse, Term, Validate, Error)] for wirefold. Build-time only. Zero dependencies: the proc_macro/syn/quote stand-in lives in src/proc_masq.rs."
+license = "Apache-2.0"
+repository = "https://github.com/webfold-ai/wirefold"
+rust-version = "1.89"
+keywords = ["derive", "proc-macro", "wirefold", "zero-copy", "columnar"]
+categories = ["encoding", "data-structures"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+
+[features]
+# A `proc-macro = true` crate cannot export `macro_rules!` macros (hard compile error) — this
+# suppresses the shared `../src/proc_masq.rs`'s `#[macro_export]`s when compiled here. On by
+# default since this crate has no other consumer of the flag.
+default = ["_procmasq_no_export"]
+_procmasq_no_export = []
