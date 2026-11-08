@@ -18,6 +18,15 @@ wirefold = { git = "https://github.com/webfold-ai/wirefold", features = ["derive
 | `error` | `Error`, `Result`, `Context` and `#[derive(Error)]` |
 | `validate` | `Validate` and `#[derive(Validate)]` |
 
+## Documentation
+
+- [Usage guide](docs/USAGE.md): `Collapse`, `Term`, text surfaces, compression, MessagePack. Every snippet
+  is in `examples/usage.rs`, which CI runs (`cargo run --example usage --all-features`).
+- [Benchmarks](docs/BENCHMARKS.md): wirefold against serde_json, bincode, postcard, rmp-serde, rkyv and zstd,
+  with the harness in `bench/` and a plain statement of where it wins and where it does not.
+- [Contributing](CONTRIBUTING.md), [security policy](SECURITY.md), [code of conduct](CODE_OF_CONDUCT.md),
+  [changelog](CHANGELOG.md).
+
 ## Origin
 
 This is the serialization core of [`Ptyktos/hashtrinity`](https://github.com/Ptyktos/hashtrinity),
@@ -30,7 +39,7 @@ and runtime, the rustls provider and small utilities) stays there.
 cargo test --all-features
 ```
 
-Minimum supported Rust version: 1.89 (the derive crate's `rust-version`).
+Minimum supported Rust version: 1.89, checked in CI. `cargo clippy --all-features -- -D warnings` is clean.
 
 ## Licence
 
