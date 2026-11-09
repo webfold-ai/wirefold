@@ -147,7 +147,9 @@ What the measurements say (all in [BENCHMARKS.md](BENCHMARKS.md#layout-columns-a
 - **The column is the right unit.** Making each scalar field a contiguous column took whole-buffer zstd -3 from 234,791 to
   189,754 bytes with no other change. Encoding each column for its type (delta, exact-bit-width packing, decimal scaling,
   a dictionary) took it to 105,790 bytes at zstd -1 in the same encode time, within about 4% of the entropy of the
-  columns. This is where the gain is; it is not specific to blocks.
+  columns on that data (79,795 bytes on the sensor-shaped records, where deltas of a random walk matter). This is where
+  the gain is; it is not specific to blocks, and it is a property of columns rather than of `Collapse`: row formats
+  would have to be transposed to use it.
 - **The block is a random-access and parallelism unit, not a size win.** Block size changes the stored size by under
   0.5% at any size from 4 KiB to a whole column. At a million records a 100-row read costs 0.014 to 0.034 ms from
   4 to 256 KiB blocks against 0.53 ms for a whole column, and the encode and decode costs of small blocks are 4 to 5

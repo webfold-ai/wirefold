@@ -26,14 +26,11 @@ cargo check --locked --no-default-features
 The minimum supported Rust version is 1.89. CI checks it.
 
 Changes to `unsafe` code, the pool or the parallel parsers also run under the sanitizers (nightly, with
-`rust-src`). The library tests run with leak detection on; the integration tests run with it off, because
-`tests/parser_dos.rs` leaks a 200,000-deep term on purpose:
+`rust-src`). AddressSanitizer's leak check is on for every test:
 
 ```sh
-RUSTFLAGS="-Zsanitizer=address" cargo +nightly test --all-features --lib --target x86_64-unknown-linux-gnu
-RUSTFLAGS="-Zsanitizer=address" ASAN_OPTIONS=detect_leaks=0 \
-  cargo +nightly test --all-features --tests --target x86_64-unknown-linux-gnu
-RUSTFLAGS="-Zsanitizer=thread" cargo +nightly test -Zbuild-std --all-features --lib --target x86_64-unknown-linux-gnu
+RUSTFLAGS="-Zsanitizer=address" cargo +nightly test --all-features --tests --target x86_64-unknown-linux-gnu
+RUSTFLAGS="-Zsanitizer=thread" cargo +nightly test -Zbuild-std --all-features --tests --target x86_64-unknown-linux-gnu
 cargo +nightly miri test --all-features --lib -- tans::tests::tans_roundtrip huf:: codec::web::tests
 ```
 

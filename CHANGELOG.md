@@ -33,6 +33,11 @@ All notable changes to this crate are documented in this file. The format follow
   exact-bit-width packing, decimal scaling, dictionary) that take the telemetry records to 105,790 bytes at zstd -1,
   and measures a block store and synthetic bf16 weights. `docs/DESIGN.md` gains a section on a copy-on-write storage
   design (ZFS) from the apeiron basis and `seed-format`. The encodings and the block layer are benchmark code, not library.
+- The sanitizer CI job now runs every test with AddressSanitizer's leak check on: `tests/parser_dos.rs` drops its
+  200,000-deep terms on a large-stack thread instead of leaking them. The benchmark gains a third, sensor-shaped
+  dataset and a delta form for integer columns (a random-walk float column goes from 45.0 to 27.5 KB), and its
+  summary no longer presents the column-encoding result as a comparison of wire formats; `docs/BENCHMARKS.md` now
+  notes that `Collapse` has no version header and that the CI jobs have not run on GitHub.
 - Documentation correction: `Collapse` stores the scalar fields of a record slice as one row-major array of packed
   records and only variable-length fields as columns; earlier text called the whole layout columnar. The
   benchmarks now include compressing the scalar fields plane by plane (a bench-only split): 166,713 bytes against

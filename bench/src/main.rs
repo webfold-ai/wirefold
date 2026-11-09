@@ -116,6 +116,37 @@ fn random(n: usize) -> Vec<Event> {
         .collect()
 }
 
+/// Sensor-shaped: regular ticks with occasional jitter, skewed device ids, a category that changes in
+/// bursts, a float that is a random walk with three decimals, rare faults, and 200 distinct names.
+fn sensor(n: usize) -> Vec<Event> {
+    let mut r = Rng(0x0DDB_1A5E_5BAD_5EED);
+    let (mut ts, mut kind, mut v) = (1_700_000_000_000u64, 0u8, 20_000i64);
+    (0..n)
+        .map(|_| {
+            let g = r.next();
+            ts += if g.is_multiple_of(10) {
+                1 + (g >> 8) % 1000
+            } else {
+                10
+            };
+            if r.next().is_multiple_of(20) {
+                kind = (r.next() % 8) as u8;
+            }
+            v += (r.next() % 2001) as i64 - 1000;
+            let u = (r.next() % 1000) as u32;
+            let id = u * u / 1000;
+            Event {
+                ts,
+                user: id,
+                kind,
+                value: v as f64 / 1000.0,
+                ok: !r.next().is_multiple_of(100),
+                name: format!("sensor-{}", id % 200),
+            }
+        })
+        .collect()
+}
+
 /// Median wall time of `runs` executions of `f`, in milliseconds.
 fn ms<R>(runs: usize, mut f: impl FnMut() -> R) -> f64 {
     let mut t: Vec<f64> = (0..runs)
@@ -130,10 +161,10 @@ fn ms<R>(runs: usize, mut f: impl FnMut() -> R) -> f64 {
 }
 
 fn dataset_by_name(name: &str, n: usize) -> Vec<Event> {
-    if name == "random" {
-        random(n)
-    } else {
-        ordered(n)
+    match name {
+        "random" => random(n),
+        "sensor" => sensor(n),
+        _ => ordered(n),
     }
 }
 
@@ -491,6 +522,8 @@ const T_DICT: u8 = 5;
 /// Integer-stream tags: values minus their minimum at the narrowest byte width, or at the exact bit width.
 const I_NARROW: u8 = 0;
 const I_BITS: u8 = 1;
+/// The first value, then the differences between neighbours as an integer sequence.
+const I_DELTA: u8 = 2;
 
 /// Pack `v` (each below `2^bits`) into `bits` bits apiece, least significant bit first.
 fn pack_bits(v: &[u64], bits: usize) -> Vec<u8> {
@@ -528,10 +561,17 @@ fn unpack_bits(b: &[u8], n: usize, bits: usize) -> Vec<u64> {
         .collect()
 }
 
-/// An integer sequence as `[kind][width][minimum][data]`: the values less their minimum, at the narrowest
-/// byte width (which a byte compressor then shrinks further) or packed to the exact bit width (which it
-/// cannot, but which is smaller when the values are spread evenly). The smaller after zstd -3 wins.
-fn enc_ints(v: &[i64]) -> Vec<u8> {
+/// What the compressor will make of a candidate encoding: its length after zstd -3, or its own length if
+/// that is smaller (a bit-packed stream does not compress).
+fn cost(e: &[u8]) -> usize {
+    zstd::encode_all(e, 3).unwrap().len().min(e.len())
+}
+
+/// An integer sequence in one of three forms, the cheapest of: the values less their minimum at the
+/// narrowest byte width (which zstd then compresses), the same packed to the exact bit width (which it
+/// cannot compress, but which is smaller when the values are spread evenly), or the differences between
+/// neighbours in either of those forms (which is smaller when the sequence moves in small steps).
+fn enc_levels(v: &[i64]) -> Vec<u8> {
     let min = v.iter().copied().min().unwrap_or(0);
     let off: Vec<u64> = v.iter().map(|x| (x - min) as u64).collect();
     let range = off.iter().copied().max().unwrap_or(0);
@@ -545,14 +585,30 @@ fn enc_ints(v: &[i64]) -> Vec<u8> {
     let mut packed = vec![I_BITS, bits as u8];
     packed.extend_from_slice(&min.to_le_bytes());
     packed.extend(pack_bits(&off, bits));
-    if zstd::encode_all(&narrow[..], 3).unwrap().len() <= packed.len() {
+    if cost(&narrow) <= cost(&packed) {
         narrow
     } else {
         packed
     }
 }
 
-fn dec_ints(e: &[u8], n: usize) -> Vec<i64> {
+fn enc_ints(v: &[i64]) -> Vec<u8> {
+    let absolute = enc_levels(v);
+    if v.len() < 2 {
+        return absolute;
+    }
+    let d: Vec<i64> = v.windows(2).map(|p| p[1].wrapping_sub(p[0])).collect();
+    let mut delta = vec![I_DELTA];
+    delta.extend_from_slice(&v[0].to_le_bytes());
+    delta.extend(enc_levels(&d));
+    if cost(&delta) < cost(&absolute) {
+        delta
+    } else {
+        absolute
+    }
+}
+
+fn dec_levels(e: &[u8], n: usize) -> Vec<i64> {
     let w = e[1] as usize;
     let min = i64::from_le_bytes(e[2..10].try_into().unwrap());
     let d = &e[10..];
@@ -562,6 +618,20 @@ fn dec_ints(e: &[u8], n: usize) -> Vec<i64> {
         unpack_bits(d, n, w)
     };
     off.into_iter().map(|x| x as i64 + min).collect()
+}
+
+fn dec_ints(e: &[u8], n: usize) -> Vec<i64> {
+    if e[0] == I_DELTA {
+        let mut v = i64::from_le_bytes(e[1..9].try_into().unwrap());
+        let mut out = vec![v];
+        for d in dec_levels(&e[9..], n - 1) {
+            v = v.wrapping_add(d);
+            out.push(v);
+        }
+        out
+    } else {
+        dec_levels(e, n)
+    }
 }
 
 /// Encode scalar plane `j` (raw values) with the encoding that suits its type, or leave it raw.
@@ -1017,6 +1087,7 @@ fn serialize_tables(n: usize, runs: usize) {
     for (title, dataset) in [
         ("Telemetry-shaped records", "ordered"),
         ("Random records (no structure to exploit)", "random"),
+        ("Sensor-shaped records (smooth)", "sensor"),
     ] {
         println!("\n### {title} ({n} records)\n");
         println!("Encode is serialize then compress; decode is decompress then deserialize. Milliseconds. Allocations are Rust-side calls and MiB requested for one encode and one decode.\n");

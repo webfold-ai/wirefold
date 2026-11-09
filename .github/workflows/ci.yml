@@ -55,18 +55,10 @@ jobs:
           persist-credentials: false
       - name: Install nightly with rust-src
         run: rustup toolchain install nightly --profile minimal --component rust-src
-      # AddressSanitizer, with leak detection on for the library tests. The integration tests run with
-      # it off: tests/parser_dos.rs leaks a 200,000-deep term on purpose (dropping it would recurse).
-      - name: Library tests
-        run: >
-          cargo +nightly test --locked --all-features --lib
-          --target x86_64-unknown-linux-gnu -Zbuild-std
-        env:
-          RUSTFLAGS: -Zsanitizer=${{ matrix.sanitizer }}
-      - name: Integration tests
+      # AddressSanitizer runs with its leak check on for every test.
+      - name: Tests under the sanitizer
         run: >
           cargo +nightly test --locked --all-features --tests
           --target x86_64-unknown-linux-gnu -Zbuild-std
         env:
           RUSTFLAGS: -Zsanitizer=${{ matrix.sanitizer }}
-          ASAN_OPTIONS: detect_leaks=0
