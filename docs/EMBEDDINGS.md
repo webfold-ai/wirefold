@@ -26,7 +26,7 @@ The first version of this report was wrong in ways that mattered. What was wrong
    Resident scan per query: f16 107 to 16 ms, 2-bit 28 to 1.7 ms.
 3. **Small columns were measured from cache.** The machine has a 260 MiB L3; at 200,000 rows every column but f32
    and f16 fit in it, so their "scan GB/s" (40 to 75) was cache speed, and the cost model scaled that to 10M and
-   100M rows. All speed claims now come from columns of at least 2 GiB. In DRAM every format runs at 16 to 23 GB/s
+   100M rows. All speed claims now come from columns of at least 2 GiB. In DRAM every format runs at 16 to 24 GB/s
    and time is proportional to bytes.
 4. **Statistics were a median of three runs with min-max.** They now follow spbench's criterion port: twelve samples per
    measurement, percentile-bootstrap 95% intervals (10,000 resamples, fixed seed), Tukey fences, and for the
@@ -62,10 +62,10 @@ Raw sequential read of a 2 GiB buffer on this machine (median of 3 runs):
 | all 4 cores | 43.9 |
 | one core | 12.9 |
 
-Each kernel on a row that stays in L1 (compute-bound floor, slope estimator with 95% interval; the bracket spans the
-run medians, so a wide one is a noisy run):
+Each kernel on a row that stays in L1 (compute-bound floor, from the slope estimator; the bracket is the range of the three runs' medians,
+so a wide one is a noisy run):
 
-| format | B/vec | L1-resident ns/row [95% CI] | r^2 | GB/s of stored bytes (one core) |
+| format | B/vec | L1-resident ns/row [range of 3 runs] | r^2 | GB/s of stored bytes (one core) |
 | --- | ---: | ---: | ---: | ---: |
 | f32 | 4096 | 193.2 [178.4-196.1] | 0.9783 | 21.2 |
 | f16 | 2048 | 56.9 [54.4-59.4] | 0.9837 | 36.0 |
@@ -77,10 +77,9 @@ run medians, so a wide one is a noisy run):
 | mrl256 int8 | 260 | 10.8 [9.7-20.7] | 0.9886 | 24.1 |
 | mrl64 int8 | 68 | 5.8 [5.8-11.6] | 0.9913 | 11.7 |
 
-Scan of a 2 GiB column of each format (one query at a time, all 4 cores; the interval is the bootstrap 95% CI of the
-median of the best-agreeing run), against the 200,000-row column that sits in L3:
+Scan of a 2 GiB column of each format (one query at a time, all 4 cores; the bracket is the range of the three runs' medians; each run's own bootstrap 95% interval is in that run's output), against the 200,000-row column that sits in L3:
 
-| format | B/vec | resident: 200k rows ms/query | resident GB/s | DRAM: 2 GiB column ms/query [95% CI] | DRAM GB/s | DRAM 1-core ns/row | rows/s/core (DRAM) |
+| format | B/vec | resident: 200k rows ms/query | resident GB/s | DRAM: 2 GiB column ms/query [range of 3 runs] | DRAM GB/s | DRAM 1-core ns/row | rows/s/core (DRAM) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | f32 | 4096 | 39.53 | 20.7 | 118.3 [118.2-119.0] | 20.8 | 715 | 1.4M |
 | f16 | 2048 | 17.14 | 23.9 | 103.4 [100.0-104.0] | 23.8 | 282 | 3.5M |
@@ -92,8 +91,8 @@ median of the best-agreeing run), against the 200,000-row column that sits in L3
 | mrl256 int8 | 260 | 1.26 | 41.4 | 106.1 [100.7-108.7] | 20.6 | 42 | 24.0M |
 | mrl64 int8 | 68 | 0.65 | 20.9 | 131.0 [128.6-132.8] | 16.4 | 14 | 72.3M |
 
-**Reading it.** Every format lands at 16 to 23 GB/s in DRAM, against 43.9 GB/s for the raw read: the scan reaches
-roughly 40 to 50% of the read bandwidth whatever the format, and one core manages about 7 GB/s of the 12.9 it can
+**Reading it.** Every format lands at 16 to 24 GB/s in DRAM, against 43.9 GB/s for the raw read: the scan reaches
+about 40 to 55% of the read bandwidth whatever the format, and one core manages 6 to 7 GB/s of the 12.9 it can
 read. I did not find out why (prefetch, TLB reach on 4 KiB pages and the top-k insertion are the candidates; none was
 tested). Because the time is set by bytes, rows per second per core go as 1/bytes: 1.4M for f32 down to 72M for the 68-byte prefix.
 
@@ -169,7 +168,7 @@ Isotropic corpus:
 
 ## The six points, pushed further
 
-**1. Do not compress the scanned column.** A DRAM scan reads stored bytes at 16 to 23 GB/s. The coders decode at
+**1. Do not compress the scanned column.** A DRAM scan reads stored bytes at 16 to 24 GB/s. The coders decode at
 0.5 to 0.9 GB/s (tANS) and 0.55 to 1.0 GB/s (zstd), so decompress-then-scan is about 20 to 50 times slower than
 scanning the codes as stored, and the 2-bit and binary columns do not compress at all (0.95 to 1.00). Store the hot
 column uncompressed and fixed-width, so a row range is a byte range.
@@ -194,7 +193,7 @@ row on its own does not work, and larger granules make re-rank decode slow:
 | f16 | 256 rows | 0.928 | 608.7 | 0.861 | 291.4 | 60.87 |
 
 At one row, tANS expands the data (1.06 for f32, 1.19 for f16: the per-granule table costs more than it saves) and
-zstd saves 6%. At 256 rows both save 7 to 14%, and a 100-row re-rank then decodes 100 granules: 123 ms with tANS,
+zstd saves 4 to 6%. At 256 rows both save 7 to 14%, and a 100-row re-rank then decodes 100 granules: 123 ms with tANS,
 against a few milliseconds for the whole scan. **Keep the master uncompressed.** What does help is f16 for the master:
 recall after re-rank is 1.00 on both corpora with an f16 scan alone, it halves the bytes with no decode at all, and
 the half-to-float conversion is hardware (57 ns per row in L1). It is lossy (about 5e-4 relative), which this
@@ -350,8 +349,8 @@ so its price is for a result a real model may not give you. Formats never measur
 ```
 
 What that shows: at 1 QPS owning is cheaper at every size; at 50 QPS the cheaper side flips to renting, because the
-synthetic node costs about A$6.5 per vCore-month against BinaryLane's A$7 plus its RAM charge. At 10M rows and 1
-QPS the cheapest format that holds recall on both corpora is int4 rot (A$7 per month on an owned node batched, A$24
+synthetic node costs about A$8.6 per vCore-month at full load (A$138 for 16 vCores) against BinaryLane's A$7 per vCore plus a RAM charge. At 10M rows and 1
+QPS the cheapest format that holds recall on both corpora is int4 rot (A$5 per month on an owned node batched, A$24
 rented) against A$34 / A$81 for f32. At 100M rows and 50 QPS an exact scan needs hundreds to thousands of vCores
 for any format that holds recall, which is where an index stops being optional; this report does not measure one.
 
