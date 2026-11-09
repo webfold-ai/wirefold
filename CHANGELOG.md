@@ -10,11 +10,13 @@ All notable changes to this crate are documented in this file. The format follow
 
 - `docs/DESIGN.md` (the apeiron basis against serde, bincode, ryu and itoa) and fresh serialization and
   number-formatting benchmarks.
-- The cm coder is 2.4 to 5 times faster: diffuse context tables are keyed per nibble (one cache-line bucket
-  instead of one hash probe per bit), and the stride trials and face measurements run as parallel batches.
-  Output is within 0.1% of the previous size and still round-trips; the byte stream differs from the previous
-  version. Nested pool dispatch from inside a task now runs inline instead of deadlocking.
-- (previous entry, kept for the record:) the cm coder's stride search runs its trials in parallel with byte-identical output; nested pool dispatch
+- The cm coder is a fold over fixed-size chunks coded in waves: the chunks of a wave run concurrently in both
+  encode and decode, each reading the counts folded from earlier waves, so there is no model restart. Encode is
+  5 to 6.5 times faster and decode 5.8 to 7.5 times faster, at 0.2% to 3.9% larger output. Sparse context tables
+  are keyed per nibble (one cache-line bucket instead of one probe per bit). The stream format changed; chunking
+  moved from `compress_at` into `cm::compress`, and `compress_at` and `decompress_framed` are now thin wrappers.
+  Nested pool dispatch from inside a task runs inline instead of deadlocking.
+- The cm coder's stride search and the face measurement run as parallel batches with the same choice; nested pool dispatch
   from inside a task now runs inline instead of deadlocking.
 
 - Initial release of wirefold: the serialization core split out of `hashtrinity` and renamed. It contains

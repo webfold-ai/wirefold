@@ -84,33 +84,39 @@ Documents under 512 KiB take the unchanged path.
 ## The context-mixing coder
 
 The `cm` coder predicts each bit from many contexts and mixes them. It is the slowest part of the crate on
-purpose and the benchmark says so: it is about 7 microseconds per byte on compress. It earns its place on size
+purpose and the benchmark says so: it is about 5 microseconds per byte on compress. It earns its place on size
 (telemetry records at 7.4 bytes each against 10.0 for zstd -19), and it chooses among three faces (cm, lz,
 hybrid) through `compress_shaped`.
 
-Where the time was, and what changed (all measured, all lossless; sizes within 0.1% of before on a mixed set of
-inputs, and every case round-trips):
+The coder is a fold over the stream, not a loop over its bits.
 
-- **One cache miss per bit became one per nibble.** Each of the 8 bits of a byte used to hash `(context, node)`
-  into a table on its own, a random probe per bit for each of about ten context lanes, and then probed again to
-  bump the count it had just read. The diffuse tables are now `NibbleTable`s: the context and the nibble's
-  starting node pick one 64-byte bucket, found once per nibble per lane, holding the 15 counts for that nibble's
-  nodes and a 32-bit tag of the owning context. The read and the later bump of a bit use the same cell, so there is
-  no second probe, and the four bits of a nibble share one miss. A tag collision (2^-32 per probe) costs a hair of
-  ratio, never correctness, because encode and decode build the table from the same coded prefix. Instruction
-  count fell 24%; wall-clock fell more than 2x because the work was memory-bound.
-- **Independent passes run as one static batch.** The stride search tries the raw stream and each proposed 2-D
-  stride, and `compress_shaped` measures the cm, lz and hybrid faces on the input. Each is an independent whole
-  coding pass, so they run on the pool and the winner is picked in the original order: the choice is identical.
-  The faces run concurrently only below two chunks of input; above that `compress_at` already spreads the cm face
-  over the pool and the faces run in turn.
+- **Chunks in waves, counts as the state.** The stream is cut into fixed 32 KiB chunks, grouped four to a
+  wave (both constants are part of the format, so the stream decodes the same whatever the pool width). A chunk
+  is coded from its own bytes plus the counts folded from every earlier wave, read-only. After a wave its
+  chunks' counts are folded into that base in chunk order, and its last chunk's mixer, APM and state-map
+  parameters are handed on. The four chunks of a wave run concurrently on apeiron's pool in both encode and
+  decode, because the base a chunk reads depends only on earlier waves. There is no model restart: a chunk
+  that repeats earlier data is predicted from the counts of the earlier waves (a test codes twelve repeats of a
+  block in under 67% of twelve independent copies (54% measured), and fails if the fold is removed). The only loss is that
+  the chunks of one wave do not see each other's counts, measured at 3.9% of size on the telemetry data, the
+  price of coding four chunks at once; wave width 2 halves that and halves the speedup (measured, 2^15-byte
+  chunks: +3.9% at 2.2 s with four, +1.1% at 3.4 s with two).
+- **One cache-line bucket per context and nibble.** The sparse tables are `NibbleTable`s: the context and the
+  nibble's starting node pick one 64-byte bucket holding the 15 counts for that nibble, with a 32-bit tag. The
+  bucket index is a function of the tag, so tables of different sizes fold into one another. The read and the
+  later bump of a bit use the same cell and the four bits of a nibble share one cache miss. A tag collision
+  costs a hair of ratio, never correctness.
+- **Independent passes run as one static batch.** The stride search tries the raw stream and each proposed
+  stride, and `compress_shaped` measures the cm, lz and hybrid faces; each is an independent coding pass, so they
+  run on the pool and the winner is picked in the original order. The faces run concurrently only below two
+  chunks of sample; above that the cm face already uses the pool and the faces run in turn.
 
-The numbers are in [BENCHMARKS.md](BENCHMARKS.md). The coder is still the slowest part of the crate: a flat
-profile of about 4,000 instructions per coded bit (twelve lanes of floating-point mixing, three APM stages, state
-maps) with no single hot spot left, so another large gain would mean a different arithmetic (integer
-lpaq-style mixing), which would change the format and is not attempted here. A single stream cannot be coded on
-several cores without restarting the model, and the chunked path documents what that costs in ratio, so the
-chunk size is left alone. The predictor's dense low orders still use `CoordMap`.
+What a chunk does not see: bytes of the sibling chunks in its own wave, so the match model, the rolling
+contexts and the hashed high-order contexts start empty at each chunk's first bytes. Decode could not have those
+bytes either. The numbers are in [BENCHMARKS.md](BENCHMARKS.md). The coder is still the slowest part of the
+crate: about 4,000 instructions per coded bit (twelve lanes of floating-point mixing, three APM stages, state
+maps), with no single hot spot left. The merge of a wave's tables into the base is sequential over the chunks
+of the wave.
 
 ## Numbers: why not ryu and itoa
 
@@ -133,7 +139,7 @@ convert only at a boundary that needs text.
 ## What wirefold gives up
 
 - **Ecosystem.** Nothing outside wirefold understands its formats, and it does not implement serde's traits.
-- **cm speed.** Compress is about 20 times slower than zstd -19 and decompress thousands of times slower, even
+- **cm speed.** Compress is about 14 times slower than zstd -19 and decompress over a thousand times slower, even
   after the changes above.
 - **rkyv's validated column read** is faster in the measured case.
 - **MessagePack** encode and decode are slower than `rmp-serde`.
