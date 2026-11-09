@@ -1201,7 +1201,7 @@ fn big(rot: &Rot, x: &[f32], queries: &[f32]) {
 
 /// Queries per pass over a DRAM-resident column.
 fn batch(rot: &Rot, x: &[f32], queries: &[f32]) {
-    let kinds = [Kind::F32, Kind::I8(D), Kind::I8R, Kind::B2, Kind::Bin, Kind::I8(128)];
+    let kinds = [Kind::F32, Kind::F16, Kind::I8(D), Kind::I8R, Kind::I4R, Kind::B2, Kind::Bin, Kind::I8(256), Kind::I8(64)];
     let sizes = [1usize, 4, 16, 64];
     println!("| format | {} |", sizes.iter().map(|q| format!("{q} q/pass: ns/row/query")).collect::<Vec<_>>().join(" | "));
     println!("|---|{}", "---:|".repeat(sizes.len()));
