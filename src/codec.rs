@@ -38,1105 +38,25 @@ pub use wirefold_derive::Collapse;
 
 #[cfg(feature = "compress")]
 pub mod cm {
-    //! The context-mixing byte codec — a zero-dep port of `compressOk`/`decompressOk` in
-    //! `proof/Runtime/SangClone.lean`, with the context store standing on the framework's own law.
+    //! The static context-model byte codec: the counts of a stream, accumulated exactly into a table,
+    //! read out as a tANS code.
     //!
-    //! α IS THE BIT (`UniversalEncoding`, Axiom XXII): a byte is 8 binary `B/U` collapses, coded
-    //! MSB-first down a bit-tree (`nd` from 1, `nd := 2·nd + bit`). For each bit, predict
-    //! `P(bit=1 | k-byte context, tree-node)` by an order-0 add-½ floor refined up the orders by the
-    //! binary KN backoff (`bin_blend`), then 3 SSE/APM stages, then a 2-symbol Null-cell rANS.
+    //! A context's counts are an order-free accumulation: they add, split across any partition of the
+    //! stream and recombine to the same table, and the table is read back by its address. So the model is
+    //! built once from the whole stream by that fold and is not adapted bit by bit; encode and decode are
+    //! table lookups over fixed tables ([`super::tans`]: order-0 or the class-shaped order-1 family, four
+    //! interleaved streams), with no state carried from one symbol's prediction to the next. That is what
+    //! makes the coder run at memory-streaming speed instead of the per-bit mixing of an adaptive model,
+    //! and it costs density: a static model cannot track data that changes along the stream.
     //!
-    //! THE CONTEXT STORE STANDS ON THE LIBRARY'S OWN PRIMITIVES — the dense/diffuse trinity, shape
-    //! selected per order by occupancy ([`OrderStore`]). Each order's `(n0,n1)` counter is a coordinate
-    //! key `(ctx % 256ᵒ)·256 + nd`; where the coordinate space `S_o` is small enough to be ~fully
-    //! occupied (`S_o ≤ 8n`) it rides an exact [`CoordMap`] (the **B** face, worst-probe-1, no fold),
-    //! and where it is a high-entropy sparse space it rides a nibble-bucket hash table (`NibbleTable`:
-    //! one cache-line bucket per context and nibble, checked by a 32-bit tag, sized from the buffer).
-    //! Lossless by construction: the tables are seedless-deterministic (no `SipHash`, no random seed), so the identical encode/decode key streams // LOOP-EXEMPT: prose reference
-    //! grow byte-identical stores, and the count updates match.
+    //! Before coding, a 2-D stride is looked for (below): if replacing the stream by its median-edge
+    //! residual at some row stride codes smaller on a sample, the residual is coded instead.
+    //! Format: `[byteLen][k][stride][tANS stream]`.
 
-    use super::{read_uvarint, try_vec, DecodeError};
-    use crate::CoordMap;
+    use super::{read_uvarint, DecodeError};
 
-    const PROB_M: u64 = 16384; // 1<<14 — the rANS frequency total
-    const RANS_L: u64 = 8_388_608; // 1<<23 — the rANS renorm floor
-
-    const SSE_BINS: usize = 33;
-    const SSE_LO: f64 = -8.0;
-    const SSE_HI: f64 = 8.0;
-    const SSE_RATE: f64 = 0.012;
-
-    const APM1_ROWS: u64 = 512;
-    const APM2_ROWS: u64 = 16384;
-    const APM3_ROWS: u64 = 4096;
-
-    const COUNT_CAP: u32 = 60000; // halve the cell when the count would overflow u16
-    const MAX_ORDER: usize = 6; // the context order is capped here (see `compress`) — so the lanes stack-alloc
-
-    // stretch (logit) and squash (sigmoid) are fixed monotone maps called 3×/bit (the APM) plus once per
-    // APM knot at init — tens of millions of transcendentals per MB. Tabulate them once (both sides use
-    // the SAME table → lossless) and read with linear interpolation: an L2 gather instead of a libm call.
-    const STRETCH_BITS: usize = 14; // 2^14+1 knots over p ∈ [0,1] — finer than the APM's own 33 bins
-    const SQUASH_BITS: usize = 14; // over s ∈ [SSE_LO, SSE_HI]
-
-    fn stretch_table() -> &'static [f64] {
-        static T: std::sync::OnceLock<Vec<f64>> = std::sync::OnceLock::new();
-        T.get_or_init(|| {
-            let n = 1usize << STRETCH_BITS;
-            (0..=n)
-                .map(|i| {
-                    let q = (i as f64 / n as f64).clamp(0.0001, 0.9999);
-                    (q / (1.0 - q)).ln()
-                })
-                .collect()
-        })
-    }
-
-    fn squash_table() -> &'static [f64] {
-        static T: std::sync::OnceLock<Vec<f64>> = std::sync::OnceLock::new();
-        T.get_or_init(|| {
-            let n = 1usize << SQUASH_BITS;
-            (0..=n)
-                .map(|i| {
-                    let s = SSE_LO + (SSE_HI - SSE_LO) * i as f64 / n as f64;
-                    1.0 / (1.0 + (-s).exp())
-                })
-                .collect()
-        })
-    }
-
-    #[inline]
-    fn stretch(p: f64) -> f64 {
-        let n = 1usize << STRETCH_BITS;
-        let x = p.clamp(0.0, 1.0) * n as f64;
-        let i = (x as usize).min(n - 1);
-        let t = stretch_table();
-        t[i] + (t[i + 1] - t[i]) * (x - i as f64)
-    }
-
-    #[inline]
-    fn squash(s: f64) -> f64 {
-        let n = 1usize << SQUASH_BITS;
-        let x = (s.clamp(SSE_LO, SSE_HI) - SSE_LO) / (SSE_HI - SSE_LO) * n as f64;
-        let i = (x as usize).min(n - 1);
-        let t = squash_table();
-        t[i] + (t[i + 1] - t[i]) * (x - i as f64)
-    }
-
-    fn bin_mods(k: usize) -> Vec<u64> {
-        (0..=k).map(|o| 256u64.pow(o as u32)).collect()
-    }
-
-    /// Order `o`'s coordinate space `S_o` — how many `(ctx,nd)` keys it can address. Order 0 keys by the
-    /// tree-node `nd` (`<512`); order `o≥1` by `(ctx % 256ᵒ)·256 + nd`. Saturates for huge orders.
-    fn order_space(o: usize) -> u64 {
-        if o == 0 {
-            512
-        } else {
-            256u64
-                .checked_pow(o as u32)
-                .and_then(|m| m.checked_mul(256))
-                .map_or(u64::MAX, |s| s + 512)
-        }
-    }
-
-    /// One order's `(n0,n1)` count store — the trinity's two OCCUPIED faces, selected per order by
-    /// occupancy. The exact-sparse `Table`/`Stored` (B/U) face is deliberately absent: the codec never
-    /// reads a key back and a `2⁻⁶⁴` mis-blend only costs a hair of ratio, so per the library's own
-    /// guidance it never reaches for the key-storing table.
-    ///   * `Dense` (**B**, a [`CoordMap`]) — the coordinate space is small enough to be ~fully occupied    ///     (`S_o ≤ 8n`, ≥ one bit-event per coordinate on average); every key has an exact home, no fold.
-    ///   * `Diffuse` (a [`NibbleTable`]) — a high-entropy sparse space: one cache-line bucket per
-    ///     context and nibble, found once and indexed by the partial-nibble path.
-    enum OrderStore {
-        Dense(CoordMap<u64, (u16, u16)>),
-        Diffuse(NibbleTable),
-    }
-
-    /// The per-bit count merge — add the incoming `(n0,n1)` event into the cell, halving both on the
-    /// `u16` cap (the count-aging that also tracks non-stationary data). Commutative and deterministic,
-    /// so the encode/decode key streams build byte-identical stores → lossless.
-    #[inline(always)]
-    fn cell_merge(a: (u16, u16), b: (u16, u16)) -> (u16, u16) {
-        let (mut n0, mut n1) = (
-            u32::from(a.0) + u32::from(b.0),
-            u32::from(a.1) + u32::from(b.1),
-        );
-        if n0 + n1 > COUNT_CAP {
-            n0 >>= 1;
-            n1 >>= 1;
-        }
-        (n0 as u16, n1 as u16)
-    }
-
-    /// One 64-byte bucket: the counts for the 15 nodes of one nibble of the coded byte (cell `1..=15`,
-    /// indexed by the partial-nibble path) and, in cell 0, a 32-bit check of the context that owns it.
-    #[derive(Clone, Copy)]
-    #[repr(C, align(64))]
-    struct Bucket([(u16, u16); 16]);
-
-    /// A diffuse count store keyed per NIBBLE, not per bit. The old layout hashed `(context, node)` for
-    /// every bit, so each of the 8 bits of a byte was a separate random probe (a cache miss each, twice:
-    /// once to read the counts and once to bump them). Here the context and the nibble's starting node
-    /// pick one cache-line bucket, found once per nibble and then indexed by the partial-nibble path, so
-    /// the read and the later bump of a bit hit the same line and the four bits of a nibble share one
-    /// miss. A context is identified by a 32-bit check; two adjacent buckets are tried and, on a miss,
-    /// the one whose root node has seen fewer events is replaced (a false match, 2⁻³² per probe, costs a
-    /// hair of ratio and never correctness: encode and decode build the same table from the same
-    /// coded prefix). Probe cost is O(1): one hash and at most two bucket checks.
-    struct NibbleTable {
-        buckets: Vec<Bucket>,
-        mask: usize,
-    }
-
-    impl NibbleTable {
-        /// Sized from the buffer: about half a bucket per byte (a byte touches two), at least 2¹⁰ and at
-        /// most 2¹⁸ buckets (16 MiB), a power of two so the index is a mask.
-        fn new(nbytes: usize) -> Self {
-            let n = (nbytes.max(1).next_power_of_two() / 2).clamp(1 << 10, 1 << 18);
-            NibbleTable {
-                buckets: vec![Bucket([(0, 0); 16]); n],
-                mask: n - 1,
-            }
-        }
-
-        /// The tag of `(base, nd)`'s bucket and the cell of node `nd` inside it. The bucket index is a
-        /// function of the tag alone (see [`index`](Self::index)), so a table of any size can place a
-        /// bucket from its tag, which is what lets tables of different sizes merge.
-        #[inline]
-        fn hash(base: u64, nd: u64) -> (u32, usize) {
-            let bi = nd.ilog2(); // bits of this byte coded so far, 0..=7
-            let (start, cell) = if bi < 4 {
-                (1u64, nd)
-            } else {
-                let j = bi - 4;
-                (nd >> j, (1u64 << j) | (nd & ((1u64 << j) - 1)))
-            };
-            let mut h = (base ^ start.wrapping_mul(0xD6E8_FEB8_6659_FD93)).wrapping_mul(GOLD);
-            h ^= h >> 32;
-            h = h.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
-            h ^= h >> 29;
-            ((h as u32) | 1, cell as usize) // the tag is never 0, so an empty bucket never matches
-        }
-
-        #[inline(always)]
-        fn index(&self, chk: u32) -> usize {
-            (chk >> 1) as usize & self.mask
-        }
-
-        #[inline(always)]
-        fn tag(chk: u32) -> (u16, u16) {
-            ((chk & 0xFFFF) as u16, (chk >> 16) as u16)
-        }
-
-        /// The bucket owned by `chk`, claiming one (replacing the less-used of the two candidates) on a
-        /// miss. O(1): at most two bucket checks.
-        #[inline]
-        fn claim(&mut self, chk: u32) -> usize {
-            let want = Self::tag(chk);
-            let i0 = self.index(chk);
-            let i1 = i0 ^ 1;
-            if self.buckets[i0].0[0] == want {
-                i0
-            } else if self.buckets[i1].0[0] == want {
-                i1
-            } else {
-                let pri = |b: &Bucket| u32::from(b.0[1].0) + u32::from(b.0[1].1);
-                let v = if pri(&self.buckets[i0]) <= pri(&self.buckets[i1]) {
-                    i0
-                } else {
-                    i1
-                };
-                self.buckets[v] = Bucket([(0, 0); 16]);
-                self.buckets[v].0[0] = want;
-                v
-            }
-        }
-
-        /// The cell for tree node `nd` (`1..=255`, the partial byte) under context hash `base`:
-        /// returns `bucket * 16 + cell`. Claims a bucket on a miss.
-        #[inline]
-        fn locate(&mut self, base: u64, nd: u64) -> usize {
-            let (chk, cell) = Self::hash(base, nd);
-            self.claim(chk) * 16 + cell
-        }
-
-        /// The counts for `(base, nd)` if their bucket is present, else zero; never claims.
-        #[inline]
-        fn peek(&self, base: u64, nd: u64) -> (u16, u16) {
-            let (chk, cell) = Self::hash(base, nd);
-            let want = Self::tag(chk);
-            let i0 = self.index(chk);
-            if self.buckets[i0].0[0] == want {
-                self.buckets[i0].0[cell]
-            } else if self.buckets[i0 ^ 1].0[0] == want {
-                self.buckets[i0 ^ 1].0[cell]
-            } else {
-                (0, 0)
-            }
-        }
-
-        #[inline(always)]
-        fn get(&self, loc: usize) -> (u16, u16) {
-            self.buckets[loc >> 4].0[loc & 15]
-        }
-
-        #[inline(always)]
-        fn bump(&mut self, loc: usize, bit: u64) {
-            let inc = if bit == 1 { (0u16, 1u16) } else { (1u16, 0u16) };
-            let c = &mut self.buckets[loc >> 4].0[loc & 15];
-            *c = cell_merge(*c, inc);
-        }
-
-        /// Fold `other`'s counts into this table, bucket by bucket. O(buckets of `other`): one claim
-        /// and up to 15 cell merges per occupied bucket. The result depends on the order tables are
-        /// folded in (a bucket evicted by a later claim is lost), so callers fold in chunk order.
-        fn merge_from(&mut self, other: &NibbleTable) {
-            for b in &other.buckets {
-                let (lo, hi) = b.0[0];
-                if (lo, hi) == (0, 0) {
-                    continue;
-                }
-                let chk = u32::from(lo) | (u32::from(hi) << 16);
-                let v = self.claim(chk);
-                for c in 1..16 {
-                    if b.0[c] != (0, 0) {
-                        self.buckets[v].0[c] = cell_merge(self.buckets[v].0[c], b.0[c]);
-                    }
-                }
-            }
-        }
-    }
-
-    impl OrderStore {
-        /// Select the face for order `o`: dense when the whole coordinate space sees ≥ 1 event on
-        /// average over a `shape_bytes` buffer (`S_o ≤ 8·shape_bytes`), else the diffuse nibble-bucket
-        /// table sized for `table_bytes`. The face depends on the fixed chunk size, never on the input
-        /// length, so a chunk's table and the table folded from earlier chunks always have one shape.
-        fn select(o: usize, shape_bytes: usize, table_bytes: usize) -> Self {
-            let events = (shape_bytes as u64).saturating_mul(8).max(512);
-            let s_o = order_space(o);
-            if s_o <= events {
-                OrderStore::Dense(CoordMap::coordinate_with_capacity(s_o as usize))
-            } else {
-                OrderStore::Diffuse(NibbleTable::new(table_bytes))
-            }
-        }
-
-        /// Read the counts for `(ctx-part, nd)` and return them with the cell location to bump later
-        /// (`usize::MAX` for the dense face, which re-derives its key).
-        #[inline(always)]
-        fn read(&mut self, base: u64, nd: u64) -> ((u16, u16), usize) {
-            match self {
-                OrderStore::Dense(m) => (
-                    m.get(&(base * 256 + nd)).copied().unwrap_or((0, 0)),
-                    usize::MAX,
-                ),
-                OrderStore::Diffuse(t) => {
-                    let loc = t.locate(base, nd);
-                    (t.get(loc), loc)
-                }
-            }
-        }
-
-        /// The counts for `(base, nd)` without touching the table: the read-only view a chunk takes of
-        /// the counts folded from earlier waves.
-        #[inline(always)]
-        fn peek(&self, base: u64, nd: u64) -> (u16, u16) {
-            match self {
-                OrderStore::Dense(m) => m.get(&(base * 256 + nd)).copied().unwrap_or((0, 0)),
-                OrderStore::Diffuse(t) => t.peek(base, nd),
-            }
-        }
-
-        /// Fold `other` (the same face and key space) into this store.
-        fn merge_from(&mut self, other: &OrderStore) {
-            match (self, other) {
-                (OrderStore::Dense(a), OrderStore::Dense(b)) => {
-                    for (k, v) in b {
-                        a.insert_with(k, *v, cell_merge);
-                    }
-                }
-                (OrderStore::Diffuse(a), OrderStore::Diffuse(b)) => a.merge_from(b),
-                _ => unreachable!("an order's face is fixed by the format, not by the buffer"),
-            }
-        }
-
-        /// Bump the cell read earlier: `loc` from [`read`](Self::read), `base`/`nd` for the dense face.
-        #[inline(always)]
-        fn bump(&mut self, base: u64, nd: u64, loc: usize, bit: u64) {
-            match self {
-                OrderStore::Dense(m) => {
-                    let inc = if bit == 1 { (0u16, 1u16) } else { (1u16, 0u16) };
-                    m.insert_with(base * 256 + nd, inc, cell_merge);
-                }
-                OrderStore::Diffuse(t) => t.bump(loc, bit),
-            }
-        }
-    }
-
-    /// The suffix-web counter — one `OrderStore` per order `0..=k`, each shape-selected from `nbytes`.
-    type Store = Vec<OrderStore>;
-
-    fn new_store(k: usize, table_bytes: usize) -> Store {
-        (0..=k)
-            .map(|o| OrderStore::select(o, CHUNK, table_bytes))
-            .collect()
-    }
-
-    const GOLD: u64 = 0x9E37_79B9_7F4A_7C15; // φ-hash mix for the match-context fold
-    const MCTX: usize = 6; // the generator's genome window — match on the last MCTX bytes
-                           // engage the fast path only for matches LONGER than the CM's own order (`MAX_ORDER`) — past that the
-                           // match predicts from context the CM structurally cannot see, so it no longer competes with (and
-                           // loses to) the CM on the CM's turf. Measured insensitive in [8,32]: prose keeps full ratio, repeats
-                           // stay fast — a floor set by the CM order, not a tuned ratio dial.
-    const MATCH_MIN: usize = 16;
-    const CONF_ROWS: usize = 64; // match-length buckets for the learned confidence
-
-    /// **The generator — the `B` arm (`Seed.Gen`), a closed-form O(1) read-off.** Predict the next byte
-    /// as the one that FOLLOWED the last occurrence of the current `MCTX`-byte context — one pointer
-    /// deref into the already-coded history, no table probe (the last-occurrence instance of the proven
-    /// generator interface `Gen.decode_encode`, lossless for any predictor). Where it fits, the residual
-    /// → 0 and the low-order prediction freq-pins → the B-face passthrough fires → the diffuse probes are
-    /// skipped (O(1) on the run). Its per-length confidence (`conf`) is LEARNED, not dialed. All state
-    /// derives from the coded prefix, so encode and decode build it identically — lossless.
-    struct MatchGen {
-        htab: Vec<u32>, // hash(last MCTX bytes) → position+1 (0 = empty)
-        hbits: u32,
-        ptr: usize,            // the read-off source: predict `hist[ptr]`
-        len: usize,            // current match length (consecutive bytes agreed)
-        conf: Vec<(u16, u16)>, // [len bucket] → (miss, hit) — the learned strength of a match this long
-        pb: i32,               // predicted byte for the current position, or -1 if none
-    }
-
-    impl MatchGen {
-        fn new(nbytes: usize) -> Self {
-            // size the table to stay L2-RESIDENT (2¹⁶ u32 = 256 KiB) — the generator's find must be an L2
-            // hit, not a DRAM miss per byte (measured: a 64 MiB table cost +42% on match-poor prose for
-            // no gain). Collisions just cost a stale prediction, which the learned `conf` down-weights.
-            let hbits = ((nbytes.max(1) as u64).saturating_mul(2))
-                .ilog2()
-                .clamp(12, 16);
-            MatchGen {
-                htab: vec![0u32; 1usize << hbits],
-                hbits,
-                ptr: 0,
-                len: 0,
-                conf: vec![(0u16, 0u16); CONF_ROWS],
-                pb: -1,
-            }
-        }
-
-        /// The slot of the `MCTX`-byte context immediately BEFORE position `end` (uses only `hist[<end]`).
-        #[inline]
-        fn slot(hist: &[u8], end: usize, hbits: u32) -> Option<usize> {
-            if end < MCTX {
-                return None;
-            }
-            let mut h = 0u64;
-            for &b in &hist[end - MCTX..end] {
-                h = (h ^ u64::from(b)).wrapping_mul(GOLD);
-            }
-            Some((h.wrapping_mul(GOLD) >> (64 - hbits)) as usize)
-        }
-
-        /// Set the predicted byte for coding position `i`. If not already in a match, try to start one by
-        /// looking up the current context's last occurrence (the O(1) read-off).
-        #[inline]
-        fn begin(&mut self, hist: &[u8], i: usize) {
-            if self.len == 0 {
-                if let Some(h) = Self::slot(hist, i, self.hbits) {
-                    let s = self.htab[h] as usize;
-                    if s != 0 && s - 1 < i {
-                        self.ptr = s - 1;
-                        self.len = 1;
-                    }
-                }
-            }
-            self.pb = if self.len > 0 && self.ptr < i {
-                i32::from(hist[self.ptr])
-            } else {
-                -1
-            };
-        }
-
-        /// Whether to code a byte-level hit flag: a live match, held ≥ `MATCH_MIN`, that has been RIGHT
-        /// more often than wrong at this length (`hit > miss` in the learned `conf`). The flag replaces
-        /// the CM only where the match out-predicts a coin — so prose's short, unreliable coincidences
-        /// (which the CM models better) stay on the CM path, while reliable runs take the fast path.
-        /// Self-calibrating: `finish` scores `conf` on EVERY prediction, engaged or not, so the gate
-        /// warms up from evidence — a derived reliability cut, not a tuned threshold.
-        #[inline]
-        fn has_pred(&self) -> bool {
-            if self.pb < 0 || self.len < MATCH_MIN {
-                return false;
-            }
-            let (miss, hit) = self.conf[self.len.min(CONF_ROWS - 1)];
-            hit > miss
-        }
-
-        /// The learned hit probability at the CURRENT match length — the match model's confidence, fed to
-        /// the mixer as an input (for matches too short/uncertain for the bypass `has_pred`). `0.5` when no
-        /// match is live (neutral). All from the learned `conf`, no dial.
-        #[inline]
-        fn phit_now(&self) -> f64 {
-            if self.pb < 0 {
-                return 0.5;
-            }
-            let (miss, hit) = self.conf[self.len.min(CONF_ROWS - 1)];
-            (f64::from(hit) + 0.5) / (f64::from(hit) + f64::from(miss) + 1.0)
-        }
-
-        /// The rANS frequencies `(f_hit, f_miss)` for the hit flag — `p(hit)` learned for this match
-        /// length (`conf[len]`), the derived strength. A long reliable match → `f_hit → probM` → the hit
-        /// costs ~0 bits, and the whole byte is one O(1) event (no tree, no model probe).
-        #[inline]
-        fn hit_freqs(&self) -> (u64, u64) {
-            let (miss, hit) = self.conf[self.len.min(CONF_ROWS - 1)];
-            let p_hit = (f64::from(hit) + 0.5) / (f64::from(hit) + f64::from(miss) + 1.0);
-            let f_hit = ((p_hit * PROB_M as f64) as u64).clamp(1, PROB_M - 1);
-            (f_hit, PROB_M - f_hit)
-        }
-
-        /// After byte `i` is known: score the prediction into its length bucket, extend or break the
-        /// match, and record this context→next-byte so future occurrences read it off. `hit` is whether
-        /// the prediction was right (the caller already knows it — from the flag on the hot path).
-        #[inline]
-        fn finish(&mut self, hist: &[u8], i: usize) {
-            if self.pb >= 0 {
-                let hit = self.pb == i32::from(hist[i]);
-                let bucket = self.len.min(CONF_ROWS - 1);
-                let (mut miss, mut ht) = self.conf[bucket];
-                if hit {
-                    ht = ht.saturating_add(1);
-                } else {
-                    miss = miss.saturating_add(1);
-                }
-                if u32::from(miss) + u32::from(ht) > COUNT_CAP {
-                    miss >>= 1;
-                    ht >>= 1;
-                }
-                self.conf[bucket] = (miss, ht);
-                if hit {
-                    self.len += 1;
-                    self.ptr += 1;
-                } else {
-                    self.len = 0;
-                }
-            }
-            if let Some(h) = Self::slot(hist, i, self.hbits) {
-                self.htab[h] = (i + 1) as u32; // context-before-i was followed by byte i
-            }
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════════════
-    // THE LOGISTIC MIXER — learned weights in stretch (logit) space (the paq core the KN blend lacked)
-    // ═══════════════════════════════════════════════════════════════════
-    // The fixed KN backoff chain (`blend_one`) folds the orders in a FIXED hierarchy; it cannot learn
-    // that (say) the word model beats order-4 on English. The mixer replaces it with a single-layer
-    // logistic combiner: each model's prediction is stretched to a logit, the logits are weighted-summed
-    // (weights LEARNED per bit by the logistic gradient, selected by a context), and squashed back. The
-    // match model — a bypass before — is now an INPUT the mixer weighs, and a word model (context = the
-    // current partial word) joins the orders. This is the paq/cmix combiner; the weights are learned, not
-    // dialed (the `MIX_LR` step, like the match `conf`). Deterministic f64 on both sides → lossless.
-
-    // The exact orders `0..=k` (nested, correlated) are joined by HASHED high-order contexts — the
-    // long-range structure order ≤6 cannot reach (order 256^o overflows past 7 anyway). Each is a FNV
-    // hash of the last `ord` bytes, its own diffuse store; these are the orthogonal inputs the mixer needs.
-    const HI_ORDERS: [usize; 3] = [8, 12, 20];
-    /// Sparse (skip-gram) contexts `(a,b)` — hash of the bytes at `i−a`, `i−b` (a gap between them).
-    /// Orthogonal to the nested orders: catches a pattern that skips the immediately-preceding byte.
-    const SPARSE: [(usize, usize); 2] = [(1, 3), (2, 4)];
-    const N_HI: usize = HI_ORDERS.len() + SPARSE.len(); // 5 hashed contexts (3 high orders + 2 sparse)
-    const HI_BASE: usize = MAX_ORDER + 1; // inputs[HI_BASE .. HI_BASE+N_HI] are the hashed contexts
-    const WORD_IDX: usize = HI_BASE + N_HI;
-    const MATCH_IDX: usize = WORD_IDX + 1;
-    const N_INPUTS: usize = MATCH_IDX + 1; // orders 0..=6, 3 hi, word, match = 12
-    const MIX_CTX: usize = 512; // weight sets, selected by the tree node `nd` (the partial byte)
-    const MIX_LR: f64 = 0.01; // the mixer learning rate — the gradient step (measured sweet spot on enwik)
-    const WORD_MUL: u64 = 0x100_0000_01b3; // FNV-style rolling hash of the current word
-    const FNV_OFF: u64 = 0xcbf2_9ce4_8422_2325;
-
-    /// The hashed high-order context keys at position `i` — a FNV hash of the last `ord` bytes for each
-    /// `HI_ORDERS`. One read per byte (shared across its 8 bits); each order's space is separated so the
-    /// diffuse stores don't collide across orders.
-    #[inline]
-    fn high_ctx(hist: &[u8], i: usize) -> [u64; N_HI] {
-        let mut h = [0u64; N_HI];
-        for (j, &ord) in HI_ORDERS.iter().enumerate() {
-            let start = i.saturating_sub(ord);
-            let mut x = FNV_OFF;
-            for &b in &hist[start..i] {
-                x = (x ^ u64::from(b)).wrapping_mul(WORD_MUL);
-            }
-            h[j] = x.wrapping_mul(ord as u64 + 1);
-        }
-        for (j, &(a, b)) in SPARSE.iter().enumerate() {
-            let ba = if i >= a { hist[i - a] } else { 0 };
-            let bb = if i >= b { hist[i - b] } else { 0 };
-            let mut x = (FNV_OFF ^ u64::from(ba)).wrapping_mul(WORD_MUL);
-            x = (x ^ u64::from(bb)).wrapping_mul(WORD_MUL);
-            h[HI_ORDERS.len() + j] = x.wrapping_mul((a * 31 + b) as u64 + 1);
-        }
-        h
-    }
-
-    // ── THE ICM STATE MAP — the bounded-count coordinate read out to a LEARNED, POOLED probability ──
-    // `NullCellCoding` codes a bit with a Null cell of norm P; the two outcomes are the orthogonal
-    // idempotents `ePlus/eMinus`. A context's `(n0,n1)` is the bounded fold of those projectors (aged at
-    // the cap — the recursion floor's bounded return). The ICM (cmix `indirect.cpp`) does NOT read the
-    // local ratio; it QUANTIZES the count to a state coordinate and reads the probability out of a global
-    // map LEARNED across every context sharing that state (`CoordinateReadout`: the state is the address,
-    // the prob is the readout). That pooling is the win — a context seen once as `(2,1)` uses the global
-    // `P(state)`, not its noisy local `2/3`. The paq 256-entry state table is one quantization of this
-    // manifold; ours is derived from the `(n0,n1)` return directly (bit-length buckets, 16×16 = 256).
-
-    const NSTATE: usize = 256; // 16 buckets of n0 × 16 of n1
-    const N_SM: usize = WORD_IDX + 1; // one StateMap per count-based input (orders + hi + word; not match)
-
-    /// Quantize a count to a bit-length bucket `0..=15` — the bounded coordinate of the fold (a raw count
-    /// is unbounded; its order of magnitude is the state that matters).
-    #[inline(always)]
-    fn qcount(c: u16) -> usize {
-        (32 - (u32::from(c)).leading_zeros()).min(15) as usize
-    }
-
-    /// The state coordinate of a `(n0,n1)` cell — the bounded 2-D index the readout is keyed by.
-    #[inline(always)]
-    fn count_state(n0: u16, n1: u16) -> usize {
-        qcount(n0) * 16 + qcount(n1)
-    }
-
-    /// A **StateMap** — the learned readout `state → P(bit=1)`, pooled across all contexts of one model.
-    /// Each state carries `(prob, count)`; the update rate slows as the state is seen (`1/(n+1.5)`), so it
-    /// learns fast then stabilizes — the adaptive readout, not a fixed formula.
-    #[derive(Clone)]
-    struct StateMap {
-        t: Vec<(f64, u16)>,
-    }
-    impl StateMap {
-        fn new() -> Self {
-            StateMap {
-                t: vec![(0.5, 0u16); NSTATE],
-            }
-        }
-        #[inline(always)]
-        fn prob(&self, s: usize) -> f64 {
-            self.t[s].0
-        }
-        #[inline(always)]
-        fn learn(&mut self, s: usize, bit: u64) {
-            let (p, n) = self.t[s];
-            self.t[s] = (
-                p + (bit as f64 - p) / (f64::from(n) + 1.5),
-                (n + 1).min(1023),
-            );
-        }
-    }
-
-    /// The match model's logit input for the current tree node `nd`. If the predicted byte's prefix still
-    /// agrees with the path coded so far, the match predicts the next bit with strength `p_hit` (the
-    /// learned confidence); if the path has diverged (or no match), it is neutral (`0`).
-    #[inline]
-    fn match_input(pb: i32, p_hit: f64, nd: u64) -> f64 {
-        if pb < 0 {
-            return 0.0;
-        }
-        let bi = u64::from(nd.ilog2()); // bits of this byte coded so far (nd ∈ [1,255] ⇒ bi ∈ [0,7])
-        let path = nd - (1u64 << bi);
-        let pbu = pb as u64;
-        if bi > 0 && (pbu >> (8 - bi)) != path {
-            return 0.0; // the match's byte no longer matches the path — no prediction for this bit
-        }
-        let predbit = (pbu >> (7 - bi)) & 1;
-        stretch(if predbit == 1 { p_hit } else { 1.0 - p_hit })
-    }
-
-    /// The per-bit prediction state carried from `predict` to `update` — the mixer inputs and selector,
-    /// the pre-APM mixed probability (the mixer trains on its own output), the word key, the APM coords.
-    struct MixState {
-        inp: [f64; N_INPUTS],
-        sel: usize,
-        p_mix: f64,
-        locs: [usize; N_SM], // the cell each count-based input was read from, bumped in `update`
-        states: [usize; N_SM], // the StateMap coordinate read for each count-based input
-        apm: [(usize, f64); 3],
-        gated: bool, // the monad passthrough — the cheap prediction was saturated, expensive lanes skipped
-        cheap: usize, // the largest cheap order read (only 0..=cheap were touched when gated)
-    }
-
-    /// The cheap gate orders — the cache-resident low orders whose mix decides the monad passthrough.
-    const GATE_CHEAP: usize = 2;
-
-    /// The context-mixing model — the order stores, the word store, the learned mixer, the three APMs.
-    /// One object shared by encode and decode; both drive it identically off the coded prefix → lossless.
-    struct Model<'a> {
-        local: Counts,    // this chunk's own counts, adapted bit by bit
-        base: &'a Counts, // the counts folded from every earlier wave, read-only
-        p: Params,
-        k: usize,
-        mods: Vec<u64>,
-        lr: f64,
-        gate: f64, // the monad band — skip the expensive lanes when the cheap prediction is within this of 0/1
-    }
-
-    /// Every count-based lane's table: the order stores, the hashed high-order contexts and the word
-    /// context. The unit that is folded from chunk to chunk.
-    struct Counts {
-        store: Store,
-        hi: Vec<NibbleTable>, // the hashed high-order stores (one per HI_ORDERS and SPARSE)
-        word: NibbleTable,
-    }
-
-    impl Counts {
-        /// Tables for order `k`, each diffuse table sized for `table_bytes` of input.
-        fn new(k: usize, table_bytes: usize) -> Self {
-            Counts {
-                store: new_store(k, table_bytes),
-                hi: (0..N_HI).map(|_| NibbleTable::new(table_bytes)).collect(),
-                word: NibbleTable::new(table_bytes),
-            }
-        }
-
-        /// Fold another chunk's counts into these. Called in chunk order, so the result is a function
-        /// of the chunk sequence alone.
-        fn merge_from(&mut self, o: &Counts) {
-            for (a, b) in self.store.iter_mut().zip(&o.store) {
-                a.merge_from(b);
-            }
-            for (a, b) in self.hi.iter_mut().zip(&o.hi) {
-                a.merge_from(b);
-            }
-            self.word.merge_from(&o.word);
-        }
-    }
-
-    /// The adaptive parameters that are not counts: the learned state→probability maps, the mixer
-    /// weights and the three APM tables. Handed from the last chunk of one wave to every chunk of the next.
-    #[derive(Clone)]
-    struct Params {
-        smaps: Vec<StateMap>, // the ICM readouts — one learned state→prob map per count-based input
-        mixer: Vec<f64>,      // MIX_CTX × N_INPUTS, the learned logit weights
-        apm1: Vec<f64>,
-        apm2: Vec<f64>,
-        apm3: Vec<f64>,
-    }
-
-    impl Params {
-        fn new() -> Self {
-            Params {
-                smaps: (0..N_SM).map(|_| StateMap::new()).collect(),
-                mixer: vec![0.2; MIX_CTX * N_INPUTS], // a small positive prior on every model
-                apm1: apm_init(APM1_ROWS),
-                apm2: apm_init(APM2_ROWS),
-                apm3: apm_init(APM3_ROWS),
-            }
-        }
-    }
-
-    /// Sum of two counts cells (the chunk's own and the folded earlier ones), saturating at `u16`.
-    #[inline(always)]
-    fn plus(a: (u16, u16), b: (u16, u16)) -> (u16, u16) {
-        (a.0.saturating_add(b.0), a.1.saturating_add(b.1))
-    }
-
-    impl<'a> Model<'a> {
-        /// A model for one chunk of `nbytes` bytes, reading `base` and starting from `p`.
-        fn new(k: usize, nbytes: usize, base: &'a Counts, p: Params) -> Self {
-            // The two tuning knobs are read from the environment once per process, not once per
-            // coding pass (the stride search runs several passes).
-            static KNOBS: std::sync::OnceLock<(f64, f64)> = std::sync::OnceLock::new();
-            let (lr, gate) = *KNOBS.get_or_init(|| {
-                (
-                    std::env::var("MIX_LR")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(MIX_LR),
-                    std::env::var("GATE")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(1.0 / PROB_M as f64),
-                )
-            });
-            Model {
-                local: Counts::new(k, nbytes),
-                base,
-                p,
-                k,
-                mods: bin_mods(k),
-                lr,
-                gate,
-            }
-        }
-
-        /// The chunk's final counts and parameters, to be folded into the next wave's base.
-        fn into_parts(self) -> (Counts, Params) {
-            (self.local, self.p)
-        }
-
-        /// Predict `P(bit=1)`. THE MONAD GATE: mix the cheap cache-resident low orders (`0..=cheap`) plus
-        /// the match first; if that estimate is already within the coder's quantum `1/probM` of 0 or 1, the
-        /// bit is at the monad — the expensive DIFFUSE probes (high orders, hashed contexts, word) cannot
-        /// change the emitted rANS symbol — so carry it and SKIP them and the APM (ratio-neutral by the
-        /// quantum, big speed). Otherwise gather the expensive lanes, full mix, APM ensemble. The gate is a
-        /// function of the coded past, so encode and decode branch identically → lossless.
-        #[inline]
-        fn predict(
-            &mut self,
-            ctx: u64,
-            hc: &[u64; N_HI],
-            word_hash: u64,
-            nd: u64,
-            m_pb: i32,
-            m_phit: f64,
-        ) -> (f64, MixState) {
-            let mut inp = [0.0f64; N_INPUTS];
-            let mut states = [0usize; N_SM];
-            let mut locs = [usize::MAX; N_SM];
-            let cheap = GATE_CHEAP.min(self.k);
-            for o in 0..=cheap {
-                let base = if o == 0 { 0 } else { ctx % self.mods[o] };
-                let ((l0, l1), loc) = self.local.store[o].read(base, nd);
-                let (n0, n1) = plus((l0, l1), self.base.store[o].peek(base, nd));
-                let s = count_state(n0, n1);
-                states[o] = s;
-                locs[o] = loc;
-                inp[o] = stretch(self.p.smaps[o].prob(s));
-            }
-            inp[MATCH_IDX] = match_input(m_pb, m_phit, nd);
-            let sel = (nd as usize) % MIX_CTX;
-            let base = sel * N_INPUTS;
-            // the cheap mix — only the low orders + match are nonzero so far
-            let mut s = inp[MATCH_IDX] * self.p.mixer[base + MATCH_IDX];
-            for (o, &x) in inp[..=cheap].iter().enumerate() {
-                s += self.p.mixer[base + o] * x;
-            }
-            let p_cheap = squash(s);
-            if p_cheap <= self.gate || p_cheap >= 1.0 - self.gate {
-                let apm = [(0usize, 0.0f64); 3];
-                return (
-                    p_cheap,
-                    MixState {
-                        inp,
-                        sel,
-                        p_mix: p_cheap,
-                        locs,
-                        states,
-                        apm,
-                        gated: true,
-                        cheap,
-                    },
-                );
-            }
-            // off the monad — gather the expensive diffuse lanes and complete the mix
-            for o in cheap + 1..=self.k {
-                let key = ctx % self.mods[o];
-                let (lc, loc) = self.local.store[o].read(key, nd);
-                let (n0, n1) = plus(lc, self.base.store[o].peek(key, nd));
-                let st = count_state(n0, n1);
-                states[o] = st;
-                locs[o] = loc;
-                inp[o] = stretch(self.p.smaps[o].prob(st));
-            }
-            for j in 0..N_HI {
-                let loc = self.local.hi[j].locate(hc[j], nd);
-                let (n0, n1) = plus(self.local.hi[j].get(loc), self.base.hi[j].peek(hc[j], nd));
-                let st = count_state(n0, n1);
-                states[HI_BASE + j] = st;
-                locs[HI_BASE + j] = loc;
-                inp[HI_BASE + j] = stretch(self.p.smaps[HI_BASE + j].prob(st));
-            }
-            {
-                let loc = self.local.word.locate(word_hash, nd);
-                let (n0, n1) = plus(self.local.word.get(loc), self.base.word.peek(word_hash, nd));
-                let st = count_state(n0, n1);
-                states[WORD_IDX] = st;
-                locs[WORD_IDX] = loc;
-                inp[WORD_IDX] = stretch(self.p.smaps[WORD_IDX].prob(st));
-            }
-            let mut sfull = 0.0;
-            for (i, &x) in inp.iter().enumerate() {
-                sfull += self.p.mixer[base + i] * x;
-            }
-            let p_mix = squash(sfull);
-
-            let (r1, b1, w1) = apm_apply(&self.p.apm1, nd % APM1_ROWS, p_mix);
-            let q1 = (p_mix + 7.0 * r1) / 8.0;
-            let sel2 = ((ctx % 16_777_216) * 769 + nd) % APM2_ROWS;
-            let (r2, b2, w2) = apm_apply(&self.p.apm2, sel2, q1);
-            let sel3 = ((ctx % 256) * 769 + nd) % APM3_ROWS;
-            let (r3, b3, w3) = apm_apply(&self.p.apm3, sel3, q1);
-            let out = (q1 + 7.0 * f64::midpoint(r2, r3)) / 8.0;
-            (
-                out,
-                MixState {
-                    inp,
-                    sel,
-                    p_mix,
-                    locs,
-                    states,
-                    apm: [(b1, w1), (b2, w2), (b3, w3)],
-                    gated: false,
-                    cheap,
-                },
-            )
-        }
-
-        /// Train on the coded bit: the logistic gradient on the mixer weights (`err = bit − p_mix`), the
-        /// three APM bumps, and the order + word count bumps. Same on encode and decode → lossless.
-        #[inline]
-        fn update(&mut self, ctx: u64, nd: u64, st: &MixState, bit: u64) {
-            let err = bit as f64 - st.p_mix;
-            let base = st.sel * N_INPUTS;
-            let g = self.lr * err;
-            for i in 0..N_INPUTS {
-                self.p.mixer[base + i] += g * st.inp[i]; // gated: expensive inp are 0 → their weights untouched
-            }
-            // GATED: only the cheap lanes were read — bump just those, skip the expensive probes and APM
-            // (the same skip on both sides ⇒ stores stay bit-identical ⇒ lossless).
-            if st.gated {
-                for o in 0..=st.cheap {
-                    self.p.smaps[o].learn(st.states[o], bit);
-                    let b = if o == 0 { 0 } else { ctx % self.mods[o] };
-                    self.local.store[o].bump(b, nd, st.locs[o], bit);
-                }
-                return;
-            }
-            apm_bump(&mut self.p.apm1, st.apm[0].0, st.apm[0].1, bit);
-            apm_bump(&mut self.p.apm2, st.apm[1].0, st.apm[1].1, bit);
-            apm_bump(&mut self.p.apm3, st.apm[2].0, st.apm[2].1, bit);
-            // learn each StateMap readout at the state it was read from (pre-bump), then advance the
-            // bounded-count state that keys it.
-            for o in 0..=self.k {
-                self.p.smaps[o].learn(st.states[o], bit);
-            }
-            for j in 0..N_HI {
-                self.p.smaps[HI_BASE + j].learn(st.states[HI_BASE + j], bit);
-            }
-            self.p.smaps[WORD_IDX].learn(st.states[WORD_IDX], bit);
-            for o in 0..=self.k {
-                let b = if o == 0 { 0 } else { ctx % self.mods[o] };
-                self.local.store[o].bump(b, nd, st.locs[o], bit);
-            }
-            for j in 0..N_HI {
-                self.local.hi[j].bump(st.locs[HI_BASE + j], bit);
-            }
-            self.local.word.bump(st.locs[WORD_IDX], bit);
-        }
-    }
-
-    /// One lane of the binary KN backoff — the NB reserved-mass merge of an order's `(n0,n1)` into the
-    /// running `p1` (discount each nonzero count, reserve that mass for the lower lane).
-    #[inline]
-    fn p1_to_freq(p1: f64) -> (u64, u64) {
-        let raw = (p1 * PROB_M as f64) as u64;
-        let f1 = raw.clamp(1, PROB_M - 1);
-        (PROB_M - f1, f1)
-    }
-
-    fn apm_init(n_rows: u64) -> Vec<f64> {
-        let mut a = Vec::with_capacity(n_rows as usize * SSE_BINS);
-        for _ in 0..n_rows {
-            for b in 0..SSE_BINS {
-                let s = SSE_LO + (SSE_HI - SSE_LO) * b as f64 / (SSE_BINS - 1) as f64;
-                a.push(squash(s));
-            }
-        }
-        a
-    }
-
-    #[inline(always)]
-    fn apm_apply(apm: &[f64], sel: u64, p1: f64) -> (f64, usize, f64) {
-        let s = stretch(p1).clamp(SSE_LO, SSE_HI);
-        let pos = (s - SSE_LO) / (SSE_HI - SSE_LO) * (SSE_BINS - 1) as f64;
-        let lo = (pos as usize).min(SSE_BINS - 2);
-        let w = pos - lo as f64;
-        let base = sel as usize * SSE_BINS + lo;
-        let p_lo = apm[base];
-        let p_hi = apm[base + 1];
-        (p_lo + (p_hi - p_lo) * w, base, w)
-    }
-
-    #[inline]
-    fn apm_bump(apm: &mut [f64], base: usize, w: f64, bit: u64) {
-        let g = bit as f64;
-        let nearer = if w < 0.5 { base } else { base + 1 };
-        apm[nearer] += (g - apm[nearer]) * SSE_RATE;
-    }
-
-    #[inline]
-    fn roll_ctx(ctx: u64, s: u64, mod_k: u64) -> u64 {
-        if mod_k == 1 {
-            0
-        } else {
-            (ctx * 256 + s) % mod_k
-        }
-    }
-
-    /// The coding scalars of one chunk under `base` and `params`, with the counts and parameters the
-    /// chunk ends in. A chunk sees only its own bytes as history; what came before it is in `base`.
-    fn bin_model_scalars(
-        k: usize,
-        bytes: &[u8],
-        base: &Counts,
-        params: Params,
-    ) -> (Vec<u64>, Vec<u64>, Counts, Params) {
-        let mod_k = 256u64.pow(k as u32);
-        let mut model = Model::new(k, bytes.len(), base, params);
-        let mut mg = MatchGen::new(bytes.len());
-        let mut fs: Vec<u64> = Vec::with_capacity(bytes.len() * 8);
-        let mut cs: Vec<u64> = Vec::with_capacity(bytes.len() * 8);
-        let mut ctx: u64 = 0;
-        let mut word_hash: u64 = 0;
-        for (i, &byte) in bytes.iter().enumerate() {
-            mg.begin(bytes, i);
-            // THE GENERATOR FAST PATH: where a match is reliable (bypass), code one hit flag and skip the
-            // tree. Shorter/less-certain matches don't bypass — they feed the mixer as an input instead.
-            let mut literal = true;
-            if mg.has_pred() {
-                let (f_hit, f_miss) = mg.hit_freqs();
-                if i32::from(byte) == mg.pb {
-                    fs.push(f_hit);
-                    cs.push(f_miss);
-                    literal = false;
-                } else {
-                    fs.push(f_miss);
-                    cs.push(0);
-                }
-            }
-            if literal {
-                let (m_pb, m_phit) = (mg.pb, mg.phit_now());
-                let hc = high_ctx(bytes, i);
-                let mut nd: u64 = 1;
-                for bi in 0..8u32 {
-                    let bit = ((byte >> (7 - bi)) & 1) as u64;
-                    let (p1, st) = model.predict(ctx, &hc, word_hash, nd, m_pb, m_phit);
-                    let (f0, f1) = p1_to_freq(p1);
-                    if bit == 1 {
-                        fs.push(f1);
-                        cs.push(f0);
-                    } else {
-                        fs.push(f0);
-                        cs.push(0);
-                    }
-                    model.update(ctx, nd, &st, bit);
-                    nd = nd * 2 + bit;
-                }
-            }
-            mg.finish(bytes, i);
-            ctx = roll_ctx(ctx, byte as u64, mod_k);
-            word_hash = if byte.is_ascii_alphabetic() {
-                word_hash
-                    .wrapping_mul(WORD_MUL)
-                    .wrapping_add(u64::from(byte))
-            } else {
-                0
-            };
-        }
-        let (counts, params) = model.into_parts();
-        (fs, cs, counts, params)
-    }
-
-    #[inline(always)]
-    fn rans_encode_adaptive(fs: &[u64], cs: &[u64]) -> Vec<u8> {
-        let mut x = RANS_L;
-        let mut emit: Vec<u8> = Vec::new();
-        let n = fs.len();
-        for i in 0..n {
-            let j = n - 1 - i;
-            let f = fs[j];
-            let c = cs[j];
-            let xmax = ((RANS_L / PROB_M) << 8) * f;
-            while x >= xmax {
-                emit.push((x % 256) as u8);
-                x /= 256;
-            }
-            x = (x / f) * PROB_M + (x % f) + c;
-        }
-        let mut out = Vec::with_capacity(emit.len() + 4);
-        out.push((x % 256) as u8);
-        out.push((x / 256 % 256) as u8);
-        out.push((x / 65536 % 256) as u8);
-        out.push((x / 16_777_216 % 256) as u8);
-        for i in 0..emit.len() {
-            out.push(emit[emit.len() - 1 - i]);
-        }
-        out
-    }
-
-    /// Decode one chunk of `n` bytes; the mirror of [`bin_model_scalars`].
-    fn bin_decode(
-        k: usize,
-        stream: &[u8],
-        n: usize,
-        base: &Counts,
-        params: Params,
-    ) -> Result<(Vec<u8>, Counts, Params), DecodeError> {
-        let mod_k = 256u64.pow(k as u32);
-        let init = stream.get(..4).ok_or(DecodeError::Truncated)?;
-        let mut x = u64::from(init[0])
-            + u64::from(init[1]) * 256
-            + u64::from(init[2]) * 65536
-            + u64::from(init[3]) * 16_777_216;
-        let mut model = Model::new(k, n, base, params);
-        let mut mg = MatchGen::new(n);
-        let mut pos = 4usize;
-        let mut out: Vec<u8> = try_vec(n)?;
-        let mut ctx: u64 = 0;
-        let mut word_hash: u64 = 0;
-        for i in 0..n {
-            mg.begin(&out, i);
-            let mut byte = 0u8;
-            let mut literal = true;
-            if mg.has_pred() {
-                let (f_hit, f_miss) = mg.hit_freqs();
-                let sl = x % PROB_M;
-                let hit = sl >= f_miss; // symbol 1 = hit occupies [f_miss, probM)
-                let (f, cum) = if hit { (f_hit, f_miss) } else { (f_miss, 0) };
-                x = f * (x / PROB_M) + sl - cum;
-                while x < RANS_L {
-                    x = x * 256 + u64::from(*stream.get(pos).ok_or(DecodeError::Truncated)?);
-                    pos += 1;
-                }
-                if hit {
-                    byte = mg.pb as u8;
-                    literal = false;
-                }
-            }
-            if literal {
-                let (m_pb, m_phit) = (mg.pb, mg.phit_now());
-                let hc = high_ctx(&out, i);
-                let mut nd: u64 = 1;
-                for _ in 0..8 {
-                    let (p1, st) = model.predict(ctx, &hc, word_hash, nd, m_pb, m_phit);
-                    let (f0, f1) = p1_to_freq(p1);
-                    let sl = x % PROB_M;
-                    let bit: u64 = u64::from(sl >= f0);
-                    let (f, cum) = if bit == 1 { (f1, f0) } else { (f0, 0) };
-                    x = f * (x / PROB_M) + sl - cum;
-                    while x < RANS_L {
-                        x = x * 256 + u64::from(*stream.get(pos).ok_or(DecodeError::Truncated)?);
-                        pos += 1;
-                    }
-                    model.update(ctx, nd, &st, bit);
-                    nd = nd * 2 + bit;
-                }
-                byte = (nd - 256) as u8;
-            }
-            out.push(byte);
-            mg.finish(&out, i);
-            ctx = roll_ctx(ctx, byte as u64, mod_k);
-            word_hash = if byte.is_ascii_alphabetic() {
-                word_hash
-                    .wrapping_mul(WORD_MUL)
-                    .wrapping_add(u64::from(byte))
-            } else {
-                0
-            };
-        }
-        let (counts, params) = model.into_parts();
-        Ok((out, counts, params))
-    }
+    /// The highest context order: 0 is order-0 tANS, 1 the order-1 family. Higher requests are capped.
+    const MAX_ORDER: usize = 1;
 
     // ── varint header (LEB128, the operational Seed.serWord) ──
     fn put_varint(out: &mut Vec<u8>, mut n: u64) {
@@ -1295,120 +215,36 @@ pub mod cm {
         out
     }
 
-    /// Bytes per chunk. Each chunk is coded from its own bytes and the counts of earlier waves, so
-    /// the size trades the staleness of a wave's counts against the work per chunk; it is part of the
-    /// format.
-    pub(super) const CHUNK: usize = 1 << 15;
-    /// Chunks per wave: the chunks of a wave code at the same time, all reading the counts folded
-    /// from the waves before. Part of the format, so the stream decodes the same whatever the pool
-    /// width; the pool only decides how many of a wave's chunks run at once.
-    const WAVE: usize = 4;
-
-    /// What one wave hands the next: every earlier chunk's counts folded in chunk order, and the
-    /// adaptive parameters the last of them ended in.
-    struct Carry {
-        base: Counts,
-        params: Params,
-    }
-
-    /// Run `work(chunk index, base counts, starting parameters)` over `nchunks` chunks of an
-    /// `n`-byte stream, a wave at a time. The chunks of a wave run on the pool; the wave's counts are
-    /// then folded into the base in chunk order and its last chunk's parameters carried on. The base
-    /// and parameters a chunk sees depend only on the chunks of earlier waves, which is what makes
-    /// encode and decode, each running its chunks concurrently, agree. A wave is one step of a fold
-    /// over the waves (`try_fold`), not a loop with state outside it. O(n) time over the whole stream
-    /// plus O(waves · table size) for the folds.
-    fn fold_waves<T: Send>(
-        k: usize,
-        n: usize,
-        nchunks: usize,
-        work: impl Fn(usize, &Counts, Params) -> Result<(T, Counts, Params), DecodeError> + Sync,
-    ) -> Result<Vec<T>, DecodeError> {
-        type Slot<T> = std::sync::Mutex<Option<Result<(T, Counts, Params), DecodeError>>>;
-        let seed = Carry {
-            base: Counts::new(k, if nchunks > WAVE { n } else { 0 }),
-            params: Params::new(),
-        };
-        let (outs, _) = (0..nchunks).step_by(WAVE).try_fold(
-            (Vec::with_capacity(nchunks), seed),
-            |(mut outs, carry), first| {
-                let width = WAVE.min(nchunks - first);
-                let slots: Vec<Slot<T>> = (0..width).map(|_| std::sync::Mutex::new(None)).collect();
-                super::par_tasks(width, |t| {
-                    let r = work(first + t, &carry.base, carry.params.clone());
-                    *slots[t]
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(r);
-                });
-                let last_wave = first + width >= nchunks;
-                let Carry {
-                    mut base,
-                    mut params,
-                } = carry;
-                for slot in slots {
-                    let (out, local, p) = slot
-                        .into_inner()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .ok_or(DecodeError::Malformed)??;
-                    if !last_wave {
-                        base.merge_from(&local);
-                    }
-                    params = p;
-                    outs.push(out);
-                }
-                Ok::<_, DecodeError>((outs, Carry { base, params }))
-            },
-        )?;
-        Ok(outs)
-    }
-
-    /// rANS-code `stream` as one stream per chunk.
-    fn encode_chunks(k: usize, stream: &[u8]) -> Vec<Vec<u8>> {
-        let chunks: Vec<&[u8]> = stream.chunks(CHUNK).collect();
-        fold_waves(k, stream.len(), chunks.len(), |i, base, params| {
-            let (fs, cs, local, p) = bin_model_scalars(k, chunks[i], base, params);
-            Ok((rans_encode_adaptive(&fs, &cs), local, p))
-        })
-        .unwrap_or_default()
-    }
-
-    /// Decode `streams` (one per chunk) into the `n` bytes they code.
-    fn decode_chunks(k: usize, streams: &[&[u8]], n: usize) -> Result<Vec<u8>, DecodeError> {
-        let parts = fold_waves(k, n, streams.len(), |i, base, params| {
-            bin_decode(k, streams[i], CHUNK.min(n - i * CHUNK), base, params)
-        })?;
-        let mut out = try_vec(n)?;
-        for part in parts {
-            out.extend_from_slice(&part);
+    /// The tANS stream of `stream` under context order `k` (0 or 1).
+    fn code(k: usize, stream: &[u8]) -> Vec<u8> {
+        if k == 0 {
+            super::tans::compress4(stream)
+        } else {
+            super::tans::compress4_o1(stream)
         }
-        Ok(out)
     }
 
     /// The coded size of `stream` at order `k` — used to DECIDE the spatial transform by measuring, on a
     /// bounded sample, rather than trusting the order-0 proxy.
     fn coded_size(k: usize, stream: &[u8]) -> usize {
-        encode_chunks(k, stream).iter().map(Vec::len).sum()
+        code(k, stream).len()
     }
 
-    /// Order-`k` binary compress: `[byteLen][k][stride][chunk lengths][chunk rANS streams]`. `k` capped at 6. When a 2-D stride is
-    /// proposed AND actually codes smaller on a sample (the generator doesn't already win), the pixels
+    /// Context-order-`k` compress: `[byteLen][k][stride][tANS stream]`; `k` is capped at 1 (see
+    /// [`MAX_ORDER`]). When a 2-D stride is proposed AND actually codes smaller on a sample, the pixels
     /// are replaced by their MED spatial residual (the `encircle` floor) before coding — the byte coder
     /// then rides the residual `U`. Otherwise `stride = 0` and the raw stream is coded (never a regression).
     #[must_use]
     pub fn compress(k: usize, data: &[u8]) -> Vec<u8> {
         let k = k.min(MAX_ORDER);
         // settle the transform by CODING a bounded sample: raw vs MED at each proposed stride, smallest
-        // wins. A prefix sample, so `med_forward` on it matches the full transform's prefix. This is what
-        // makes the choice robust — the generator's exact-repeat wins keep stride 0, images take their
-        // spatial lag, video its motion-compensated temporal lag, all by measurement not proxy.
+        // wins. A prefix sample, so `med_forward` on it matches the full transform's prefix. The trials
+        // are independent coding passes, so they run as one static batch on the pool and the winner is
+        // picked in order (first strictly smallest).
         let mut stride = 0usize;
         let cands = propose_strides(data);
         if !cands.is_empty() {
             let s = &data[..data.len().min(1 << 16)];
-            // Each trial (the raw sample, then the sample under each proposed stride) is a whole
-            // coding pass and independent of the others, so they run as one static batch on the
-            // pool; the winner is then picked in the same order as before (first strictly
-            // smallest), so the choice, and the output, are identical.
             let sizes: Vec<std::sync::Mutex<usize>> = (0..=cands.len())
                 .map(|_| std::sync::Mutex::new(0))
                 .collect();
@@ -1442,17 +278,11 @@ pub mod cm {
         } else {
             data
         };
-        let streams = encode_chunks(k, stream);
         let mut out = Vec::new();
         put_varint(&mut out, data.len() as u64);
         put_varint(&mut out, k as u64);
         put_varint(&mut out, stride as u64);
-        for s in &streams {
-            put_varint(&mut out, s.len() as u64);
-        }
-        for s in &streams {
-            out.extend_from_slice(s);
-        }
+        out.extend_from_slice(&code(k, stream));
         out
     }
 
@@ -1465,14 +295,8 @@ pub mod cm {
         try_decompress(bs).unwrap_or_default()
     }
 
-    /// The most output bytes one coded byte can carry: every binary decision costs at least
-    /// `log2(PROB_M / (PROB_M - 1))` bits (the frequency clamp in `p1_to_freq`), and a byte is at
-    /// least one decision, so `n` output bytes need `n / (8 · PROB_M · ln 2)` stream bytes. The factor
-    /// below is that bound rounded up; a header that claims more cannot be a stream this coder wrote.
-    const MAX_EXPANSION: usize = 8 * PROB_M as usize;
-
-    /// Checked [`decompress`]: `Err` for truncated or inconsistent input. The declared output length
-    /// is bounded by the stream size ([`MAX_EXPANSION`]) before anything is allocated.
+    /// Checked [`decompress`]: `Err` for truncated or inconsistent input. The declared length is
+    /// bounded by [`super::DEFAULT_MAX_OUTPUT`] and must equal what the stream decodes to.
     pub fn try_decompress(bs: &[u8]) -> Result<Vec<u8>, DecodeError> {
         let mut p = 0usize;
         let n = get_varint(bs, &mut p)?;
@@ -1482,7 +306,7 @@ pub mod cm {
             return Ok(Vec::new());
         }
         let n = usize::try_from(n).map_err(|_| DecodeError::TooLarge)?;
-        if n > super::DEFAULT_MAX_OUTPUT || n > (bs.len() - p).saturating_mul(MAX_EXPANSION) {
+        if n > super::DEFAULT_MAX_OUTPUT {
             return Err(DecodeError::TooLarge);
         }
         let k = usize::try_from(k).map_err(|_| DecodeError::Malformed)?;
@@ -1490,26 +314,14 @@ pub mod cm {
             return Err(DecodeError::Malformed);
         }
         let stride = usize::try_from(stride).map_err(|_| DecodeError::Malformed)?;
-        let nchunks = n.div_ceil(CHUNK);
-        // each chunk length is at least one varint byte, so a count beyond the remaining input is a lie
-        if nchunks > bs.len() - p {
-            return Err(DecodeError::Truncated);
+        let stream = if k == 0 {
+            super::tans::try_decompress4(&bs[p..])?
+        } else {
+            super::tans::try_decompress4_o1(&bs[p..])?
+        };
+        if stream.len() != n {
+            return Err(DecodeError::Malformed);
         }
-        let mut lens: Vec<usize> = try_vec(nchunks)?;
-        for _ in 0..nchunks {
-            let l = get_varint(bs, &mut p)?;
-            lens.push(usize::try_from(l).map_err(|_| DecodeError::TooLarge)?);
-        }
-        let mut streams: Vec<&[u8]> = try_vec(nchunks)?;
-        for &l in &lens {
-            let end = p
-                .checked_add(l)
-                .filter(|&e| e <= bs.len())
-                .ok_or(DecodeError::Truncated)?;
-            streams.push(&bs[p..end]);
-            p = end;
-        }
-        let stream = decode_chunks(k, &streams, n)?;
         Ok(if stride > 0 {
             med_inverse(&stream, stride)
         } else {
@@ -1521,8 +333,7 @@ pub mod cm {
     mod tests {
         use super::*;
 
-        /// Telemetry-like bytes: a counter column and a small-domain column, enough structure for the
-        /// counts to matter and long enough to span several waves of chunks.
+        /// Telemetry-like bytes: a counter column and a small-domain column.
         fn structured(n: usize) -> Vec<u8> {
             let mut x = 0x2545_F491_4F6C_DD1Du64;
             (0..n)
@@ -1539,60 +350,11 @@ pub mod cm {
                 .collect()
         }
 
-        /// A stream of many waves round-trips, which exercises the fold of one wave's counts into the
-        /// next and the hand-over of the mixer parameters.
-        #[test]
-        fn many_waves_roundtrip() {
-            let data = structured(CHUNK * WAVE * 2 + CHUNK + 123);
-            let enc = compress(3, &data);
-            assert_eq!(decompress(&enc), data);
-        }
-
-        /// The stream does not depend on how the chunks of a wave are scheduled: coded from inside a
-        /// pool task (where the chunks run one after another) it equals the stream coded with the
-        /// chunks of each wave running concurrently.
-        #[test]
-        fn output_is_independent_of_schedule() {
-            let data = structured(CHUNK * WAVE + CHUNK / 2);
-            let concurrent = compress(3, &data);
-            let inline = std::sync::Mutex::new(Vec::new());
-            crate::codec::par_tasks(2, |t| {
-                if t == 0 {
-                    *inline.lock().unwrap() = compress(3, &data);
-                }
-            });
-            assert_eq!(concurrent, inline.into_inner().unwrap());
-        }
-
-        /// Counts folded from earlier waves are used: the same block repeated across waves codes in far
-        /// fewer bytes than the block's own size times its repeats. If the fold were dropped, every
-        /// wave would start from empty counts and the size would be close to the independent sum.
-        #[test]
-        fn earlier_waves_inform_later_ones() {
-            let block = structured(CHUNK);
-            let reps = WAVE * 3;
-            let one = compress(3, &block).len();
-            let data: Vec<u8> = block
-                .iter()
-                .copied()
-                .cycle()
-                .take(block.len() * reps)
-                .collect();
-            let all = compress(3, &data).len();
-            // the first wave codes WAVE fresh copies; each later copy must cost under half a fresh one
-            let bound = one * WAVE + (reps - WAVE) * one / 2;
-            assert!(
-                all < bound,
-                "{all} bytes for {reps} repeats of a {one}-byte block (bound {bound})"
-            );
-        }
-
         /// Damaged streams are refused or decode to something, never panic: flip bytes through the
-        /// header, the chunk lengths and the chunk bodies, and cut the stream at every depth.
+        /// header and the body, and cut the stream at every depth.
         #[test]
         fn damaged_streams_do_not_panic() {
-            let data = structured(CHUNK + 5000);
-            let enc = compress(3, &data);
+            let enc = compress(1, &structured(200_000));
             for at in (0..enc.len()).step_by(enc.len() / 97 + 1) {
                 let mut bad = enc.clone();
                 bad[at] ^= 0xA5;
@@ -1603,43 +365,34 @@ pub mod cm {
             }
         }
 
-        /// `NibbleTable` keeps each (context, node) in its own cell: a re-read finds what was bumped,
-        /// distinct nodes of one context and distinct contexts do not share counts, and every node
-        /// `1..=255` of a byte maps into its nibble's bucket without overlapping another node.
+        /// A chain where each byte follows its predecessor (`+1` mod 20 nine times in ten): every byte
+        /// value is equally likely overall, so order-0 sees almost nothing, while the order-1 counts
+        /// predict it. The order-1 model must code it smaller than order-0, and both must round-trip.
         #[test]
-        fn nibble_table_cells_are_distinct_and_stable() {
-            let mut t = NibbleTable::new(1 << 16);
-            let mut locs = std::collections::BTreeSet::new();
-            for nd in 1..=255u64 {
-                let loc = t.locate(7, nd);
-                assert!(
-                    locs.insert(loc),
-                    "node {nd} shares a cell with another node"
-                );
-                assert!(loc & 15 != 0, "cell 0 holds the tag, never a count");
-                assert_eq!(t.locate(7, nd), loc, "a re-locate must find the same cell");
-            }
-            for nd in 1..=255u64 {
-                let loc = t.locate(7, nd);
-                for _ in 0..=(nd % 5) {
-                    t.bump(loc, nd & 1);
-                }
-            }
-            for nd in 1..=255u64 {
-                let loc = t.locate(7, nd);
-                let (n0, n1) = t.get(loc);
-                let n = (nd % 5 + 1) as u16;
-                assert_eq!(
-                    (n0, n1),
-                    if nd & 1 == 1 { (0, n) } else { (n, 0) },
-                    "node {nd}"
-                );
-            }
-            // a different context starts empty and is unaffected by the first
-            let other = t.locate(8, 1);
-            assert_eq!(t.get(other), (0, 0));
-            let first = t.locate(7, 1);
-            assert_ne!(t.get(first), (0, 0));
+        fn order_one_beats_order_zero_on_dependent_bytes() {
+            let mut x = 0x9E37_79B9_7F4A_7C15u64;
+            let mut prev = 0u8;
+            let data: Vec<u8> = (0..100_000)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    prev = if x.is_multiple_of(10) {
+                        (x >> 8) as u8 % 20
+                    } else {
+                        (prev + 1) % 20
+                    };
+                    prev
+                })
+                .collect();
+            let o0 = compress(0, &data).len();
+            let o1 = compress(1, &data).len();
+            assert!(
+                o1 * 2 < o0,
+                "order-1 {o1} must be far smaller than order-0 {o0}"
+            );
+            assert_eq!(decompress(&compress(0, &data)), data);
+            assert_eq!(decompress(&compress(1, &data)), data);
         }
 
         /// The parallel stride search must pick exactly what a plain sequential scan picks. The
@@ -1655,15 +408,15 @@ pub mod cm {
                 let cands = propose_strides(&data);
                 let s = &data[..data.len().min(1 << 16)];
                 let mut want = 0usize;
-                let mut best = coded_size(3, s);
+                let mut best = coded_size(1, s);
                 for &c in &cands {
-                    let size = coded_size(3, &med_forward(s, c));
+                    let size = coded_size(1, &med_forward(s, c));
                     if size < best {
                         best = size;
                         want = c;
                     }
                 }
-                let enc = compress(3, &data);
+                let enc = compress(1, &data);
                 let mut at = 0;
                 let _len = get_varint(&enc, &mut at);
                 let _k = get_varint(&enc, &mut at);
@@ -1732,30 +485,6 @@ pub mod cm {
                 noise,
                 "noise round-trip failed"
             );
-        }
-
-        /// The generator (match) B-arm must stay lossless where it fires hardest — long exact repeats,
-        /// mixed with breaks. Both sides rebuild the match state from the coded prefix, so it round-trips.
-        #[test]
-        fn cm_generator_lossless() {
-            let mut rng = 0x2545_F491_4F6C_DD1Du64;
-            let block: Vec<u8> = (0..977).map(|i| (i * 31 % 251) as u8).collect();
-            let mut data = block.repeat(40); // deep repetition — the generator's domain
-            for _ in 0..3000 {
-                // splice in breaks so matches start/stop, exercising begin/after_byte re-find
-                rng ^= rng << 13;
-                rng ^= rng >> 7;
-                rng ^= rng << 17;
-                let p = (rng as usize) % data.len();
-                data[p] = (rng >> 33) as u8;
-            }
-            for k in [1usize, 3, 5, 6] {
-                assert_eq!(
-                    decompress(&compress(k, &data)),
-                    data,
-                    "generator round-trip failed at k={k}"
-                );
-            }
         }
     }
 }
@@ -9970,13 +8699,8 @@ fn face_bodies(sample: &[u8]) -> [Vec<u8>; 3] {
         1 => lz::compress(sample),
         _ => lz::compress_hybrid(sample),
     };
-    // A sample of two waves or more already spreads the cm face over the pool, so the faces run one
-    // after another. Below that the cm face is a few chunks on one core, and the three faces are
-    // independent whole coding passes: run them as one static batch. The bodies, and so the choice,
-    // are identical either way.
-    if sample.len() >= 2 * cm::CHUNK {
-        return [code(0), code(1), code(2)];
-    }
+    // The three faces are independent whole coding passes: run them as one static batch. The bodies,
+    // and so the choice, are identical to running them one after another.
     let slots: [std::sync::Mutex<Vec<u8>>; 3] = Default::default();
     par_tasks(3, |face| {
         *slots[face]

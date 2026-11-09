@@ -11,7 +11,7 @@ cargo run --release -- 20000       # records [and runs per cell]; default 20000 
 
 It prints markdown tables. Every encoder is round-trip checked before it is timed, and each cell runs in a fresh process and
 the table gives the mean of 3 runs with the range. Run it on an otherwise idle machine: other CPU work changes
-the numbers. The cm coder takes tens of seconds per dataset, so a full run takes about five minutes.
+the numbers. A full run takes about a minute.
 
 Parser speed for every text surface, with serde_json as the JSON reference:
 

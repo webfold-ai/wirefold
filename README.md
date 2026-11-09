@@ -1,6 +1,6 @@
 # wirefold
 
-A zero-copy wire format, a universal `Term`, an integer column codec, a context-mixing coder and
+A zero-copy wire format, a universal `Term`, an integer column codec, a static table-driven entropy coder and
 structured-text surfaces (JSON, YAML, TOON, POML, RDF and others), built on
 [apeiron](https://github.com/webfold-ai/apeiron). The only dependency is apeiron; the derive crate has none.
 
@@ -12,7 +12,7 @@ wirefold = { git = "https://github.com/webfold-ai/wirefold", features = ["derive
 | Feature | What it adds |
 |---------|-------------|
 | `codec` (default) | Zero-copy wire format (`codec::web`), universal Term, integer column codec |
-| `compress` | Context-mixing entropy coder (`codec::cm`) |
+| `compress` | Static table-driven entropy coder (`codec::cm`, tANS) |
 | `syntax` | Collapsed syntax AST (`codec::syntax`) for JSON, YAML, TOON, POML, RDF and other surfaces |
 | `derive` | `#[derive(Collapse)]` and `#[derive(Term)]` |
 | `error` | `Error`, `Result`, `Context` and `#[derive(Error)]` |

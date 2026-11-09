@@ -15,10 +15,9 @@ an application of one of them.
 2. **The associative fold.** If an operation is associative, a sequence of it can be split anywhere and the parts
    recombined. Anything that looks serial but is really an associative accumulation is a fold, and a fold is
    parallel by construction. A parser's state is the clearest example (below).
-3. **Coordinate tables** (`CoordMap`). Keys whose space is small enough to be mostly occupied get a direct
-   index. The context-mixing coder's low orders use it; its sparse high orders use a table of its own (below),
-   because apeiron's `FreqMap` has no slot handle and hashes per key, and the coder needs one cache line per
-   nibble. The shape is chosen per order from the input size.
+3. **Accumulating tables** (`CoordMap`, `FreqMap`). A table is a probe and a merge; counting is the merge that
+   is order-free, so a count table is built by splitting the stream, counting the parts and adding the tables.
+   The entropy coder's model is such a table (below).
 4. **An evidence standard.** A speed claim is a mean over at least three runs with its spread, and a change
    inside the spread seen on unchanged code is not a change. Instruction counts (callgrind) are used where
    wall-clock is too noisy to decide.
@@ -81,42 +80,28 @@ Documents under 512 KiB take the unchanged path.
 **Nested dispatch.** The pool's dispatch lock is not reentrant, so a task that itself dispatched would deadlock.
 `par_tasks` is the one entry point and runs inline when called from inside a task. A test exercises it nested.
 
-## The context-mixing coder
+## The entropy coder
 
-The `cm` coder predicts each bit from many contexts and mixes them. It is the slowest part of the crate on
-purpose and the benchmark says so: it is about 5 microseconds per byte on compress. It earns its place on size
-(telemetry records at 7.4 bytes each against 10.0 for zstd -19), and it chooses among three faces (cm, lz,
-hybrid) through `compress_shaped`.
+The entropy stage is a static model read out as a table, and it is fast because it does no work per bit that
+could be done once per stream.
 
-The coder is a fold over the stream, not a loop over its bits.
+A context's counts are an order-free accumulation: they add, they split across any partition of the stream and
+recombine to the same table, and the table is read back by its address (apeiron's tables are exactly that
+accumulation, with the address regenerating the key). So the model is the stream's counts, built once, and
+coding is a lookup against a fixed table: tANS (`codec::tans`) in order-0 and a class-shaped order-1 family,
+four interleaved streams, plus a 4-stream Huffman face (`codec::huf`). Nothing is carried from one symbol's
+prediction to the next, so there is no per-bit mixing, no adaptive state and no second pass to keep encode and
+decode in step. `cm::compress` is this coder preceded by the 2-D stride search (median-edge residual at the
+row stride that codes smallest on a sample; the trials run as one static batch on the pool).
+`compress_shaped` measures three faces on the input (order-1 tANS, lz, and the lz-plus-tANS hybrid) and takes
+the fastest within a size tolerance of the smallest; they run as one static batch too.
 
-- **Chunks in waves, counts as the state.** The stream is cut into fixed 32 KiB chunks, grouped four to a
-  wave (both constants are part of the format, so the stream decodes the same whatever the pool width). A chunk
-  is coded from its own bytes plus the counts folded from every earlier wave, read-only. After a wave its
-  chunks' counts are folded into that base in chunk order, and its last chunk's mixer, APM and state-map
-  parameters are handed on. The four chunks of a wave run concurrently on apeiron's pool in both encode and
-  decode, because the base a chunk reads depends only on earlier waves. There is no model restart: a chunk
-  that repeats earlier data is predicted from the counts of the earlier waves (a test codes twelve repeats of a
-  block in under 67% of twelve independent copies (54% measured), and fails if the fold is removed). The only loss is that
-  the chunks of one wave do not see each other's counts, measured at 3.9% of size on the telemetry data, the
-  price of coding four chunks at once; wave width 2 halves that and halves the speedup (measured, 2^15-byte
-  chunks: +3.9% at 2.2 s with four, +1.1% at 3.4 s with two).
-- **One cache-line bucket per context and nibble.** The sparse tables are `NibbleTable`s: the context and the
-  nibble's starting node pick one 64-byte bucket holding the 15 counts for that nibble, with a 32-bit tag. The
-  bucket index is a function of the tag, so tables of different sizes fold into one another. The read and the
-  later bump of a bit use the same cell and the four bits of a nibble share one cache miss. A tag collision
-  costs a hair of ratio, never correctness.
-- **Independent passes run as one static batch.** The stride search tries the raw stream and each proposed
-  stride, and `compress_shaped` measures the cm, lz and hybrid faces; each is an independent coding pass, so they
-  run on the pool and the winner is picked in the original order. The faces run concurrently only below two
-  chunks of sample; above that the cm face already uses the pool and the faces run in turn.
-
-What a chunk does not see: bytes of the sibling chunks in its own wave, so the match model, the rolling
-contexts and the hashed high-order contexts start empty at each chunk's first bytes. Decode could not have those
-bytes either. The numbers are in [BENCHMARKS.md](BENCHMARKS.md). The coder is still the slowest part of the
-crate: about 4,000 instructions per coded bit (twelve lanes of floating-point mixing, three APM stages, state
-maps), with no single hot spot left. The merge of a wave's tables into the base is sequential over the chunks
-of the wave.
+Measured on the telemetry records: encode 129 ms and decode 2.25 ms for 713 KB, against 249 ms and 0.81 ms for
+zstd -19 on the same bytes. What it gives up is density: it cannot track data that changes along the stream the
+way an adaptive context-mixing model does, and the order-1 table has a header. An adaptive context-mixing
+coder was used here before. It was 28% smaller on the telemetry data (174,810 against 243,202 bytes) and level
+on random data; it took 3.5 s to encode and 1.5 s to decode the same bytes after being made 5 to 7 times faster
+by caching and chunking, and was removed because that is 27 and 650 times slower than the static coder.
 
 ## Numbers: why not ryu and itoa
 
@@ -139,8 +124,8 @@ convert only at a boundary that needs text.
 ## What wirefold gives up
 
 - **Ecosystem.** Nothing outside wirefold understands its formats, and it does not implement serde's traits.
-- **cm speed.** Compress is about 14 times slower than zstd -19 and decompress over a thousand times slower, even
-  after the changes above.
+- **Density.** The static model cannot adapt along the stream, so `compress()` is larger than zstd -19 on
+  the structured telemetry data (17% larger) and about 2.8 times slower to decode.
 - **rkyv's validated column read** is faster in the measured case.
 - **MessagePack** encode and decode are slower than `rmp-serde`.
 - **Owned parsing** is sequential, as above.

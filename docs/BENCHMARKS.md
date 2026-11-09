@@ -16,15 +16,13 @@ from runs described there.
 - **Reading one column without decoding the rest:** wirefold's validated open plus a column read is about
   3 times faster than bincode or postcard (decode everything, then read) and slower than rkyv: 0.34 against
   0.22 ms on the telemetry data and 0.26 against 0.11 ms on the random data.
-- **Size with an entropy coder:** wirefold's context-mixing coder produced the smallest output on the telemetry
-  data, 10% below `postcard + zstd -19` and 16% below `Collapse + zstd -19` (8.7 against 10.4 bytes per record),
-  and 1% below `Collapse + zstd -19` on random data. It costs about 3.5 s to encode 20,000 telemetry records
-  (zstd -19: about 0.25 s) and 1.5 s to decode (zstd: about 1 ms), so about 5 and 2 microseconds per byte. Against
-  the first version measured on this page (17.7 s and 8.4 s) that is 5.0 times faster to encode and 5.8 times
-  faster to decode, for 3.9% larger output on the telemetry data (174,810 against 168,148 bytes) and 0.2% larger
-  on the random data (33.4 s to 5.1 s to encode, 10.5 s to 1.4 s to decode). It is still about 14 times slower than
-  zstd -19 to encode and over a thousand times slower to decode. Use it when ratio matters more than time, for
-  example archival. What changed is in [DESIGN.md](DESIGN.md#the-context-mixing-coder).
+- **Entropy coding:** `compress()` is a static, table-driven coder, so it runs at the speed class of zstd: on
+  the telemetry data it encodes in 129 ms against 249 ms for zstd -19, and decodes in 2.25 ms against 0.81 ms
+  (about 2.8 times slower to decode). It is larger: 243,202 bytes against 207,470 for `Collapse + zstd -19`
+  (17%), and level with it on random data (635,363 against 634,681). An earlier version of this page measured an
+  adaptive context-mixing coder that was 28% smaller on the telemetry data (174,810 bytes) and level on random
+  data, and took 3.5 s to encode and 1.5 s to decode (27 and 650 times slower). It was replaced because that
+  cost is not acceptable, and the size is what was given up.
 - **Parsing text into a generic tree:** wirefold's owned JSON parser is level with `serde_json::Value`, and
   `parse_surface_ref`, which borrows strings from the input, is about 1.8 times faster than it on one thread,
   and about 5 times faster on a pool of 4 for documents over 512 KiB (23 ms against about 110 ms for 100,000
@@ -53,54 +51,55 @@ writes JSON, YAML, TOON, POML, MessagePack and others, and an optional coder tha
 
 ## Results
 
-20,000 records, each row in a fresh process, mean of 3 runs with the range in brackets. The cm coder row is
-instead the mean and range over three whole processes, one run each, because a run takes tens of seconds.
+20,000 records, each row in a fresh process, mean of 3 runs with the range in brackets. The `compress()` row
+is the mean and range over three whole processes. `compress()` is wirefold's default entropy path (the face
+selector over order-1 tANS, lz and the lz-plus-tANS hybrid; see [DESIGN.md](DESIGN.md#the-entropy-coder)).
 
 #### Telemetry-shaped records (20000 records)
 
 | format | size (bytes) | bytes/record | encode (ms) | decode all (ms) |
 |---|---:|---:|---:|---:|
-| wirefold Collapse | 713116 | 35.7 | 0.15 (0.14 to 0.17) | 1.34 (1.14 to 1.67) |
-| wirefold Collapse + cm coder | 174810 | 8.7 | 3,544 (3,414 to 3,732) | 1,460 (1,405 to 1,490) |
-| wirefold Collapse + zstd -19 | 207470 | 10.4 | 258.61 (246.48 to 273.54) | 0.84 (0.75 to 0.94) |
-| bincode 1.3 | 713060 | 35.7 | 0.17 (0.15 to 0.18) | 0.74 (0.72 to 0.78) |
-| postcard | 492525 | 24.6 | 0.45 (0.44 to 0.46) | 0.91 (0.89 to 0.94) |
-| postcard + zstd -19 | 194386 | 9.7 | 177.88 (157.20 to 209.26) | 0.72 (0.69 to 0.78) |
-| rmp-serde (MessagePack) | 611506 | 30.6 | 0.65 (0.60 to 0.68) | 1.74 (1.52 to 2.19) |
-| rkyv 0.8 (validated) | 800008 | 40.0 | 0.22 (0.20 to 0.25) | 0.98 (0.90 to 1.10) |
-| serde_json | 1646252 | 82.3 | 2.09 (1.95 to 2.27) | 4.19 (3.97 to 4.40) |
+| wirefold Collapse | 713116 | 35.7 | 0.14 (0.14 to 0.14) | 1.12 (1.02 to 1.17) |
+| wirefold Collapse + compress() | 243202 | 12.2 | 129.1 (121.3 to 137.4) | 2.25 (1.95 to 3.09) |
+| wirefold Collapse + zstd -19 | 207470 | 10.4 | 278.72 (263.63 to 308.79) | 0.81 (0.77 to 0.84) |
+| bincode 1.3 | 713060 | 35.7 | 0.17 (0.16 to 0.18) | 0.79 (0.78 to 0.80) |
+| postcard | 492525 | 24.6 | 0.51 (0.41 to 0.56) | 1.10 (1.00 to 1.29) |
+| postcard + zstd -19 | 194386 | 9.7 | 177.61 (162.34 to 191.01) | 0.83 (0.74 to 0.97) |
+| rmp-serde (MessagePack) | 611506 | 30.6 | 0.68 (0.64 to 0.76) | 1.77 (1.50 to 2.29) |
+| rkyv 0.8 (validated) | 800008 | 40.0 | 0.22 (0.20 to 0.24) | 1.25 (0.94 to 1.47) |
+| serde_json | 1646252 | 82.3 | 2.01 (1.84 to 2.10) | 4.56 (4.38 to 4.83) |
 
 Sum one `f64` column of 20000 records (open + read, no full decode):
 
 | format | time (ms) |
 |---|---:|
-| wirefold view (open + column read) | 0.34 (0.31 to 0.41) |
-| rkyv 0.8 (validate + read) | 0.22 (0.22 to 0.23) |
-| bincode (decode all, then sum) | 1.02 (0.80 to 1.34) |
-| postcard (decode all, then sum) | 1.28 (0.99 to 1.65) |
+| wirefold view (open + column read) | 0.28 (0.27 to 0.29) |
+| rkyv 0.8 (validate + read) | 0.21 (0.20 to 0.23) |
+| bincode (decode all, then sum) | 0.82 (0.79 to 0.87) |
+| postcard (decode all, then sum) | 0.94 (0.88 to 0.98) |
 
 #### Random records (worst case for a columnar model) (20000 records)
 
 | format | size (bytes) | bytes/record | encode (ms) | decode all (ms) |
 |---|---:|---:|---:|---:|
-| wirefold Collapse | 918696 | 45.9 | 0.16 (0.13 to 0.17) | 1.23 (1.01 to 1.55) |
-| wirefold Collapse + cm coder | 627409 | 31.4 | 5,076 (4,934 to 5,163) | 1,387 (1,326 to 1,453) |
-| wirefold Collapse + zstd -19 | 634681 | 31.7 | 185.42 (163.17 to 223.57) | 1.74 (1.26 to 2.14) |
-| bincode 1.3 | 918640 | 45.9 | 0.17 (0.16 to 0.18) | 0.82 (0.64 to 1.15) |
-| postcard | 827235 | 41.4 | 0.67 (0.54 to 0.79) | 1.06 (1.00 to 1.16) |
-| postcard + zstd -19 | 692567 | 34.6 | 168.40 (155.34 to 191.49) | 1.60 (1.34 to 1.97) |
-| rmp-serde (MessagePack) | 868558 | 43.4 | 0.72 (0.71 to 0.72) | 1.53 (1.50 to 1.56) |
-| rkyv 0.8 (validated) | 1118640 | 55.9 | 0.28 (0.26 to 0.29) | 0.76 (0.59 to 0.92) |
-| serde_json | 2461362 | 123.1 | 3.02 (2.30 to 3.73) | 6.94 (5.47 to 9.09) |
+| wirefold Collapse | 918696 | 45.9 | 0.11 (0.11 to 0.11) | 0.82 (0.81 to 0.85) |
+| wirefold Collapse + compress() | 635363 | 31.8 | 149.5 (143.6 to 162.7) | 3.56 (2.90 to 5.13) |
+| wirefold Collapse + zstd -19 | 634681 | 31.7 | 181.88 (166.49 to 210.21) | 1.36 (1.29 to 1.48) |
+| bincode 1.3 | 918640 | 45.9 | 0.17 (0.17 to 0.18) | 0.64 (0.63 to 0.65) |
+| postcard | 827235 | 41.4 | 0.53 (0.52 to 0.54) | 1.18 (1.12 to 1.24) |
+| postcard + zstd -19 | 692567 | 34.6 | 177.96 (160.04 to 194.32) | 1.49 (1.35 to 1.62) |
+| rmp-serde (MessagePack) | 868558 | 43.4 | 0.74 (0.72 to 0.75) | 1.54 (1.53 to 1.55) |
+| rkyv 0.8 (validated) | 1118640 | 55.9 | 0.26 (0.25 to 0.27) | 0.58 (0.55 to 0.61) |
+| serde_json | 2461362 | 123.1 | 2.26 (2.11 to 2.37) | 5.85 (5.75 to 5.97) |
 
 Sum one `f64` column of 20000 records (open + read, no full decode):
 
 | format | time (ms) |
 |---|---:|
-| wirefold view (open + column read) | 0.26 (0.22 to 0.34) |
-| rkyv 0.8 (validate + read) | 0.11 (0.07 to 0.13) |
-| bincode (decode all, then sum) | 0.90 (0.83 to 0.94) |
-| postcard (decode all, then sum) | 1.29 (0.96 to 1.55) |
+| wirefold view (open + column read) | 0.26 (0.25 to 0.26) |
+| rkyv 0.8 (validate + read) | 0.11 (0.09 to 0.14) |
+| bincode (decode all, then sum) | 0.64 (0.59 to 0.67) |
+| postcard (decode all, then sum) | 1.00 (0.93 to 1.07) |
 
 ## Parsing
 

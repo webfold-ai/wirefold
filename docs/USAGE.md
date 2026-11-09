@@ -106,8 +106,9 @@ let z = wirefold::codec::compress(&bytes);
 let same = wirefold::codec::decompress(&z);
 ```
 
-`compress` is a context-mixing coder. It gives much smaller output than the usual compressors on
-structured data and is much slower; the numbers are in [BENCHMARKS.md](BENCHMARKS.md). For bytes you did
+`compress` is a static, table-driven coder (tANS, with lz and a hybrid chosen by measurement). It encodes
+faster than zstd -19 and decodes within a small factor of it, with larger output on structured data; the
+numbers are in [BENCHMARKS.md](BENCHMARKS.md). For bytes you did
 not produce yourself, use `codec::try_decompress_framed`, which returns an error on malformed input.
 
 ## MessagePack

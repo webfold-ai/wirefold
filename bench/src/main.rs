@@ -123,11 +123,11 @@ fn serialize_row(dataset: &str, n: usize, row: &str, op: &str) {
             let z = wirefold::codec::compress(&wf);
             assert!(wirefold::codec::decompress(&z) == wf);
             let t = if op == "encode" {
-                ms(1, || wirefold::codec::compress(&wf))
+                ms(5, || wirefold::codec::compress(&wf))
             } else {
-                ms(1, || wirefold::codec::decompress(&z))
+                ms(5, || wirefold::codec::decompress(&z))
             };
-            ("wirefold Collapse + cm coder", z.len(), t)
+            ("wirefold Collapse + compress()", z.len(), t)
         }
         ("collapse-zstd", _) => {
             let z = zstd::encode_all(&wf[..], 19).unwrap();
@@ -317,10 +317,8 @@ fn serialize_tables(n: usize, runs: usize) {
             "rkyv",
             "json",
         ] {
-            // the context-mixing coder takes seconds per run: one run per cell
-            let r = if row == "collapse-cm" { 1 } else { runs };
-            let (name, size, enc) = collect_row(dataset, n, row, "encode", r);
-            let (_, _, dec) = collect_row(dataset, n, row, "decode", r);
+            let (name, size, enc) = collect_row(dataset, n, row, "encode", runs);
+            let (_, _, dec) = collect_row(dataset, n, row, "decode", runs);
             println!(
                 "| {name} | {size} | {:.1} | {} | {} |",
                 size as f64 / n as f64,
