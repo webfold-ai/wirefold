@@ -82,4 +82,5 @@ for N in (10_000_000, 100_000_000):
             ram, ssd, cpu, tot, cores = cost(N, qps, name, rerank)
             table.append((tot, name + (" +rerank" if rerank else ""), ram, ssd, cpu, cores, med(name, 3)))
         for tot, name, ram, ssd, cpu, cores, rec in sorted(table):
+            name += " (recall < 0.95)" if rec < 0.95 else ""
             print(f"| {N//1_000_000}M | {qps} | {name} | {rec:.2f} | {ram:,.0f} | {ssd:,.0f} | {cpu:,.0f} | {tot:,.0f} | {cores:,.1f} |")
