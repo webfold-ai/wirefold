@@ -897,3 +897,354 @@ ex:alice ex:greeting "hello"@en .
         assert!(found_owl_class, "expected implicit rdf:type owl:Class");
     }
 }
+
+/// The parallel JSON and YAML parses against the sequential ones. The claim it checks is the one the
+/// implementation rests on: the parallel parse either declines (`None`) or returns exactly the
+/// sequential result, and never returns a value where the sequential parser reports an error.
+#[cfg(test)]
+mod parallel_parse {
+    use super::surfaces::{parse_json_parallel, Borrowed, JsonParser, Owned};
+    use super::yaml::{parse_yaml_parallel, parse_yaml_with};
+    use super::{render_surface, Surface};
+
+    /// A small xorshift generator, so the cases are the same on every run.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// Strings chosen to confuse a cut-finder: commas, brackets, quotes and escapes inside text.
+    const TEXTS: &[&str] = &[
+        "plain",
+        "a,b",
+        "x]y",
+        "[,]",
+        "{\"k\":1}",
+        "q\\\"uote",
+        "back\\slash",
+        "new\\nline",
+        "caf\u{e9}",
+        "日本語",
+        "😀",
+        ",",
+        "],[",
+        "\\\\",
+        "",
+    ];
+
+    fn json_string(text: &str) -> String {
+        let mut out = String::from("\"");
+        for c in text.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    fn value(r: &mut Rng, depth: usize) -> String {
+        match if depth > 3 { r.below(5) } else { r.below(8) } {
+            0 => "null".into(),
+            1 => "true".into(),
+            2 => format!("{}", r.next() as i64 % 100_000),
+            3 => ["1.5", "-0", "1e5", "2.50", "123456789012345678901234567890"][r.below(5)].into(),
+            4 => json_string(TEXTS[r.below(TEXTS.len())]),
+            5 | 6 => {
+                let n = r.below(5);
+                let fields: Vec<String> = (0..n)
+                    .map(|i| format!("{}:{}", json_string(&format!("k{i}")), value(r, depth + 1)))
+                    .collect();
+                format!("{{{}}}", fields.join(","))
+            }
+            _ => {
+                let n = r.below(5);
+                let items: Vec<String> = (0..n).map(|_| value(r, depth + 1)).collect();
+                format!("[{}]", items.join(","))
+            }
+        }
+    }
+
+    fn document(r: &mut Rng) -> String {
+        let n = 2 + r.below(40);
+        let items: Vec<String> = (0..n).map(|_| value(r, 1)).collect();
+        let sep = [",", ", ", " ,\n"][r.below(3)];
+        format!(
+            "{}[{}]{}",
+            [" ", "", "\n"][r.below(3)],
+            items.join(sep),
+            [" ", "", "\n"][r.below(3)]
+        )
+    }
+
+    fn mutate(r: &mut Rng, text: &str) -> String {
+        let mut bytes = text.as_bytes().to_vec();
+        let inserts: &[&str] = &[
+            "\"", "\\", ",", ":", "{", "}", "[", "]", " ", ",,", "\u{a0}", "e",
+        ];
+        for _ in 0..=r.below(3) {
+            if bytes.is_empty() {
+                break;
+            }
+            let at = r.below(bytes.len());
+            match r.below(4) {
+                0 => {
+                    bytes.remove(at);
+                }
+                1 => {
+                    for (k, b) in inserts[r.below(inserts.len())].bytes().enumerate() {
+                        bytes.insert(at + k, b);
+                    }
+                }
+                2 => bytes.truncate(at),
+                _ => bytes[at] = inserts[r.below(inserts.len())].as_bytes()[0],
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[test]
+    fn parallel_parse_declines_or_agrees_with_the_sequential_parse() {
+        let mut r = Rng(0x5EED_1234_ABCD_9876);
+        let (mut taken, mut valid, mut total) = (0usize, 0usize, 0usize);
+        for _ in 0..4000 {
+            let doc = document(&mut r);
+            let mut texts = vec![doc.clone()];
+            for _ in 0..6 {
+                texts.push(mutate(&mut r, &doc));
+            }
+            for text in texts {
+                total += 1;
+                let sequential = JsonParser::<Owned>::new(&text, false).parse();
+                // a chunk floor of one byte: cut wherever the pool has room
+                let owned = parse_json_parallel::<Owned>(&text, 1);
+                let borrowed = parse_json_parallel::<Borrowed>(&text, 1);
+                if sequential.is_ok() {
+                    valid += 1;
+                }
+                match (&sequential, owned) {
+                    (_, None) => {}
+                    (Ok(want), Some(Ok(got))) => {
+                        taken += 1;
+                        assert_eq!(want, &got, "owned parallel parse differs on {text:?}");
+                    }
+                    (sequential, other) => {
+                        panic!("parallel parse gave {other:?} where sequential gave {sequential:?} on {text:?}")
+                    }
+                }
+                match (&sequential, borrowed) {
+                    (_, None) => {}
+                    (Ok(want), Some(Ok(got))) => {
+                        assert_eq!(want, &got.into_owned(), "borrowed parallel parse differs on {text:?}");
+                    }
+                    (sequential, other) => panic!(
+                        "borrowed parallel parse gave {other:?} where sequential gave {sequential:?} on {text:?}"
+                    ),
+                }
+            }
+        }
+        // The test has teeth only if the parallel path actually ran: with a pool of one worker it
+        // always declines, and then there is nothing to compare.
+        if crate::par::Pool::global().width() >= 2 {
+            assert!(
+                taken * 4 >= valid,
+                "the parallel path ran on only {taken} of {valid} valid documents ({total} inputs)"
+            );
+        }
+    }
+
+    /// The cut finder, not just the parser, has to be right: on a valid array of small elements whose
+    /// strings are full of commas, brackets, quotes and backslash runs, accurate cuts mean every
+    /// piece parses, so the parallel path must be taken every time. A wrong cut (a string state lost
+    /// across a chunk, a depth miscounted, an escaped quote taken for a delimiter) only makes a piece
+    /// fail and the call decline, which the decline-or-equal test above cannot see.
+    #[test]
+    fn parallel_json_cuts_land_on_top_level_commas_despite_nasty_strings() {
+        if crate::par::Pool::global().width() < 2 {
+            return;
+        }
+        const NASTY: &[&str] = &[
+            "a,b",
+            "x]y",
+            "[,]",
+            "{\"k\":1}",
+            "q\"uote",
+            "q\"uote,",
+            "back\\slash",
+            "ends\\",
+            "\\\\",
+            "\\\"",
+            "\"\"",
+            ",",
+            "],[",
+            "}{",
+            "[[[",
+            "]]]",
+            "{\"a\":[1,2,{\"b\":\"c,d\"}]}",
+            "日本,語",
+            "\\u0022,",
+            // an odd number of escaped quotes followed by closers and commas: a quote wrongly taken
+            // for a delimiter would flip the string state and expose them as structure
+            "a\"]]",
+            "a\"[[,",
+            "x\",\"y",
+            "}\"{,",
+            "\"}]",
+        ];
+        let mut r = Rng(0xA11C_E5EE_D0DE_F00D);
+        let mut declined = 0usize;
+        for _ in 0..3000 {
+            let n = 16 + r.below(45);
+            let items: Vec<String> = (0..n)
+                .map(|_| {
+                    let fields: Vec<String> = (0..=r.below(4))
+                        .map(|i| {
+                            let text = NASTY[r.below(NASTY.len())];
+                            format!("{}:{}", json_string(&format!("k{i}")), json_string(text))
+                        })
+                        .collect();
+                    format!("{{{}}}", fields.join(","))
+                })
+                .collect();
+            let text = format!("[{}]", items.join(","));
+            let sequential = JsonParser::<Owned>::new(&text, false)
+                .parse()
+                .expect("the generated document is valid JSON");
+            match parse_json_parallel::<Owned>(&text, 1) {
+                Some(Ok(got)) => assert_eq!(sequential, got, "differs on {text:?}"),
+                Some(Err(e)) => panic!("error {e:?} on a valid document {text:?}"),
+                None => declined += 1,
+            }
+        }
+        assert_eq!(
+            declined, 0,
+            "the parallel path declined {declined} valid documents: a cut missed"
+        );
+    }
+
+    /// Line-level edits for YAML: delete, duplicate, insert margin and indented lines, shift
+    /// indentation, and the occasional byte edit.
+    fn mutate_yaml(r: &mut Rng, text: &str) -> String {
+        const LINES: &[&str] = &[
+            "foo: bar",
+            "- x",
+            "  - y",
+            "# comment",
+            "",
+            "---",
+            "\t",
+            "-",
+            "- ",
+            " - z",
+            "key:",
+            "  k: |",
+            "    text",
+            "\u{a0}",
+            "...",
+            "  nested: {a: 1, b: [2, 3]}",
+            "-x",
+            "  - - deep",
+        ];
+        let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+        for _ in 0..=r.below(3) {
+            if lines.is_empty() {
+                break;
+            }
+            let at = r.below(lines.len());
+            match r.below(6) {
+                0 => {
+                    lines.remove(at);
+                }
+                1 => {
+                    let copy = lines[at].clone();
+                    lines.insert(at, copy);
+                }
+                2 => lines.insert(at, LINES[r.below(LINES.len())].to_owned()),
+                3 => lines[at].insert_str(0, "  "),
+                4 => {
+                    let trimmed = lines[at].trim_start().to_owned();
+                    lines[at] = trimmed;
+                }
+                _ => {
+                    let mut chars: Vec<char> = lines[at].chars().collect();
+                    if !chars.is_empty() {
+                        let c = r.below(chars.len());
+                        chars[c] = ['日', ':', '\'', '"', '#', '|', ' '][r.below(7)];
+                    }
+                    lines[at] = chars.into_iter().collect();
+                }
+            }
+        }
+        let mut out = lines.join("\n");
+        if r.below(2) == 0 {
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn parallel_yaml_parse_declines_or_agrees_with_the_sequential_parse() {
+        let mut r = Rng(0x7A31_C0DE_55AA_1357);
+        let (mut taken, mut valid, mut total) = (0usize, 0usize, 0usize);
+        for _ in 0..3000 {
+            let json = document(&mut r);
+            let Ok(term) = JsonParser::<Owned>::new(&json, false).parse() else {
+                continue;
+            };
+            let yaml = render_surface(&term, Surface::Yaml);
+            let mut texts = vec![yaml.clone()];
+            for _ in 0..8 {
+                texts.push(mutate_yaml(&mut r, &yaml));
+            }
+            for text in texts {
+                total += 1;
+                let sequential = parse_yaml_with::<Owned>(&text);
+                let owned = parse_yaml_parallel::<Owned>(&text, 1);
+                let borrowed = parse_yaml_parallel::<Borrowed>(&text, 1);
+                if sequential.is_ok() {
+                    valid += 1;
+                }
+                match (&sequential, owned) {
+                    (_, None) => {}
+                    (Ok(want), Some(Ok(got))) => {
+                        taken += 1;
+                        assert_eq!(want, &got, "owned parallel YAML parse differs on {text:?}");
+                    }
+                    (sequential, other) => panic!(
+                        "parallel YAML parse gave {other:?} where sequential gave {sequential:?} on {text:?}"
+                    ),
+                }
+                match (&sequential, borrowed) {
+                    (_, None) => {}
+                    (Ok(want), Some(Ok(got))) => assert_eq!(
+                        want,
+                        &got.into_owned(),
+                        "borrowed parallel YAML parse differs on {text:?}"
+                    ),
+                    (sequential, other) => panic!(
+                        "borrowed parallel YAML parse gave {other:?} where sequential gave {sequential:?} on {text:?}"
+                    ),
+                }
+            }
+        }
+        if crate::par::Pool::global().width() >= 2 {
+            // Many generated documents legitimately decline (a string with a newline renders to a
+            // margin line that is not a dash), so the guard is an absolute floor, not a ratio.
+            assert!(
+                taken >= 500,
+                "the parallel YAML path ran on only {taken} of {valid} valid documents ({total} inputs)"
+            );
+        }
+    }
+}

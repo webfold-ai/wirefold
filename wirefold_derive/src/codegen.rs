@@ -71,44 +71,120 @@ pub(crate) fn derive_struct(name: &Ident, fields: &[Field]) -> proc_masq::TokenS
         );
         quote_tokens! { 0usize #sums }
     };
-    let offsets: Vec<proc_masq::TokenStream> = (0..scalars.len())
-        .map(|s| off_expr(&scalars[..s].iter().map(|(_, t, _)| t).collect::<Vec<_>>()))
-        .collect();
 
-    // One emit path for every shape (no has_vec/fast-path branch): the record table is the section
-    // layout §0 = scalar Wire, §1.. = one column per variable field. `col_size_lets` measure each
+    // The record table is a section table: one section per SCALAR FIELD (a `Wire<T>` column, `bool`
+    // stored as `u8`), then one section per variable-length field (`Ragged` / `Sections`). Each scalar
+    // field is therefore a contiguous run of bytes: `*_column()` is a zero-copy `&[T]`, and a field can be
+    // read, summed or compressed without touching the others. A record with no scalar field keeps one
+    // empty count section so the record count stays readable. `col_size_lets` measure each variable
     // column (pure arithmetic, no alloc). The whole table — and recursively the whole nested tree — is
     // ONE allocation (CollapseElem::collapse_pack), never a Seed per node.
     //
-    // SERIALIZE is ONE pass over the source: `String` columns write their offset + bytes inline during
-    // the single record loop (str_scatter), so the source `Vec<Record>` is streamed ONCE, not re-scanned
-    // per column (the streaming law). `Vec<Collapse>` columns recurse and so emit after the loop
-    // (vec_emits). No `__refs` Vec, no per-column re-traversal of the source.
-    let block_writes: Vec<proc_masq::TokenStream> = scalars
+    // SERIALIZE is ONE pass over the source: every scalar column and every `String` column is written in
+    // place during the single record loop (str_scatter), so the source `Vec<Record>` is streamed ONCE.
+    // `Vec<Collapse>` columns recurse and so emit after the loop (vec_emits).
+    let field_names_early: Vec<String> = fields
         .iter()
-        .zip(&offsets)
-        .map(|((fname, ty, is_bool), off)| {
-            if *is_bool {
-                quote_tokens! { __b[#off] = it.#fname as u8; }
-            } else {
-                quote_tokens! { { let __o = #off; __b[__o..__o + ::core::mem::size_of::<#ty>()]
-                .copy_from_slice(::wirefold::codec::web::pod_bytes(&it.#fname)); } }
-            }
-        })
+        .filter_map(|f| f.ident.as_ref().map(|i| i.sym.to_string()))
         .collect();
-    let scalar_acc: Vec<proc_masq::TokenStream> = scalars
-        .iter()
-        .zip(&offsets)
-        .map(|((fname, ty, is_bool), off)| {
-            if *is_bool {
-                quote_tokens! { pub fn #fname(&self, i: usize) -> bool { self.__scalars.get(i)[#off] != 0 } }
-            } else {
-                quote_tokens! { pub fn #fname(&self, i: usize) -> #ty {
-                    let b = self.__scalars.get(i); let __o = #off;
-                    ::wirefold::codec::web::pod_read::<#ty>(&b[__o..__o + ::core::mem::size_of::<#ty>()]) } }
-            }
-        })
-        .collect();
+    let nscal = scalars.len().max(1);
+    let mut f_size_lets: Vec<proc_masq::TokenStream> = Vec::new();
+    let mut f_size_ids: Vec<Ident> = Vec::new();
+    let mut f_inits: Vec<proc_masq::TokenStream> = Vec::new();
+    let mut f_writes: Vec<proc_masq::TokenStream> = Vec::new();
+    let mut f_view_fields: Vec<proc_masq::TokenStream> = Vec::new();
+    let mut f_opens: Vec<proc_masq::TokenStream> = Vec::new();
+    let mut f_checks: Vec<proc_masq::TokenStream> = Vec::new();
+    let mut f_view_inits: Vec<proc_masq::TokenStream> = Vec::new();
+    let mut f_accs: Vec<proc_masq::TokenStream> = Vec::new();
+    let mut f_asserts: Vec<proc_masq::TokenStream> = Vec::new();
+    // `collapse_to_vec` reads every column once: the slices are taken out of the loop, and a record's
+    // scalar fields are plain indexes into them, so no accessor re-slices a column per record.
+    let mut f_slices: Vec<proc_masq::TokenStream> = Vec::new();
+    let mut f_vec_fields: Vec<proc_masq::TokenStream> = Vec::new();
+    if scalars.is_empty() {
+        let fid = fmt_ident(format_args!("__f0"));
+        let szid = fmt_ident(format_args!("__fsz0"));
+        let stid = fmt_ident(format_args!("__fs0"));
+        f_size_lets.push(quote_tokens! { let #szid: usize = 8usize; });
+        f_inits.push(quote_tokens! {
+            let #stid = __starts[0];
+            __dst[#stid..#stid + 8].copy_from_slice(&(__n as u64).to_le_bytes());
+        });
+        f_view_fields.push(quote_tokens! { #fid: ::wirefold::codec::web::Wire<'a, [u8; 0]>, });
+        f_opens.push(quote_tokens! { let #fid = ::wirefold::codec::web::Wire::<[u8; 0]>::open(s.section(0))?; });
+        f_view_inits.push(quote_tokens! { #fid, });
+        f_size_ids.push(szid);
+    }
+    for (j, (fname, ty, is_bool)) in scalars.iter().enumerate() {
+        let fid = fmt_ident(format_args!("__f{j}"));
+        let szid = fmt_ident(format_args!("__fsz{j}"));
+        let stid = fmt_ident(format_args!("__fs{j}"));
+        let cty: proc_masq::TokenStream = if *is_bool {
+            quote_tokens! { u8 }
+        } else {
+            ty.clone()
+        };
+        f_size_lets.push(quote_tokens! {
+            let #szid: usize = 8usize + __n * ::core::mem::size_of::<#cty>();
+        });
+        f_inits.push(quote_tokens! {
+            let #stid = __starts[#j];
+            __dst[#stid..#stid + 8].copy_from_slice(&(__n as u64).to_le_bytes());
+        });
+        if *is_bool {
+            f_writes.push(quote_tokens! { __dst[#stid + 8 + __i] = it.#fname as u8; });
+        } else {
+            f_writes.push(quote_tokens! { {
+                let __o = #stid + 8 + __i * ::core::mem::size_of::<#ty>();
+                __dst[__o..__o + ::core::mem::size_of::<#ty>()]
+                    .copy_from_slice(::wirefold::codec::web::pod_bytes(&it.#fname));
+            } });
+        }
+        f_view_fields.push(quote_tokens! { #fid: ::wirefold::codec::web::Wire<'a, #cty>, });
+        f_opens.push(quote_tokens! { let #fid = ::wirefold::codec::web::Wire::<#cty>::open(s.section(#j))?; });
+        if j > 0 {
+            f_checks.push(quote_tokens! {
+                if #fid.len() != __n {
+                    return ::core::result::Result::Err(::wirefold::codec::web::WireErr::BadLength);
+                }
+            });
+        }
+        f_view_inits.push(quote_tokens! { #fid, });
+        // A column is a typed slice only where its alignment divides 8 (what `Wire` requires); say so at
+        // compile time rather than failing every `open`.
+        f_asserts.push(quote_tokens! {
+            const _: () = assert!(
+                ::core::mem::align_of::<#cty>() <= 8 && 8 % ::core::mem::align_of::<#cty>() == 0,
+                "a Collapse scalar field's alignment must divide 8"
+            );
+        });
+        let cslice = fmt_ident(format_args!("__c{j}"));
+        f_slices.push(quote_tokens! { let #cslice = self.#fid.as_slice(); });
+        f_vec_fields.push(if *is_bool {
+            quote_tokens! { #fname: #cslice[i] != 0 }
+        } else {
+            quote_tokens! { #fname: #cslice[i] }
+        });
+        if *is_bool {
+            f_accs.push(quote_tokens! { pub fn #fname(&self, i: usize) -> bool { self.#fid.as_slice()[i] != 0 } });
+        } else {
+            f_accs.push(
+                quote_tokens! { pub fn #fname(&self, i: usize) -> #ty { self.#fid.as_slice()[i] } },
+            );
+        }
+        let colname = fmt_ident(format_args!("{}_column", fname.sym));
+        if !field_names_early
+            .iter()
+            .any(|n| n == &colname.sym.to_string())
+        {
+            f_accs.push(quote_tokens! {
+                /// The whole column as a zero-copy slice (`bool` fields are `0`/`1` bytes).
+                #[must_use] pub fn #colname(&self) -> &'a [#cty] { self.#fid.as_slice() }
+            });
+        }
+        f_size_ids.push(szid);
+    }
 
     let col_ids: Vec<Ident> = (0..nonscalars.len())
         .map(|k| fmt_ident(format_args!("__c{k}")))
@@ -126,7 +202,7 @@ pub(crate) fn derive_struct(name: &Ident, fields: &[Field]) -> proc_masq::TokenS
     for (k, ns) in nonscalars.iter().enumerate() {
         let cid = &col_ids[k];
         let szid = &sz_ids[k];
-        let sec = k + 1;
+        let sec = nscal + k;
         match ns {
             NonScalar::Str(fname) => {
                 let csid = fmt_ident(format_args!("__cs{sec}"));
@@ -226,19 +302,20 @@ pub(crate) fn derive_struct(name: &Ident, fields: &[Field]) -> proc_masq::TokenS
 
     // Owned reconstruct (the serde-style deserialize): per field, scalars by value, String/Vec allocated.
     let mut owned_fields: Vec<proc_masq::TokenStream> = Vec::new();
+    let mut vec_owned_fields: Vec<proc_masq::TokenStream> = f_vec_fields.clone();
     for (fname, _ty, _is_bool) in &scalars {
         owned_fields.push(quote_tokens! { #fname: self.#fname(i) });
     }
     for ns in &nonscalars {
-        match ns {
-            NonScalar::Str(fname) => owned_fields.push(quote_tokens! {
+        let field = match ns {
+            NonScalar::Str(fname) => quote_tokens! {
                 #fname: ::std::string::String::from_utf8(self.#fname(i).to_vec())
                     .expect("cerealize: String field is not valid UTF-8")
-            }),
-            NonScalar::Vec(fname, _) => {
-                owned_fields.push(quote_tokens! { #fname: self.#fname(i).to_vec() })
-            }
-        }
+            },
+            NonScalar::Vec(fname, _) => quote_tokens! { #fname: self.#fname(i).to_vec() },
+        };
+        owned_fields.push(field.clone());
+        vec_owned_fields.push(field);
     }
 
     // Borrowed record (serde `#[serde(borrow)]` analog): String → &'a str into the seed, ZERO alloc;
@@ -289,14 +366,24 @@ pub(crate) fn derive_struct(name: &Ident, fields: &[Field]) -> proc_masq::TokenS
     let col_opens_j = concat_tokens(col_opens);
     let col_checks_j = concat_tokens(col_checks);
     let view_inits_j = concat_tokens(view_inits);
-    let nsections = nonscalars.len() + 1;
-    let scalar_acc_j = concat_tokens(scalar_acc);
+    let nsections = nonscalars.len() + nscal;
+    let f_size_lets_j = concat_tokens(f_size_lets);
+    let f_size_ids_j = join_comma(&f_size_ids);
+    let f_inits_j = concat_tokens(f_inits);
+    let f_writes_j = concat_tokens(f_writes);
+    let f_view_fields_j = concat_tokens(f_view_fields);
+    let f_opens_j = concat_tokens(f_opens);
+    let f_checks_j = concat_tokens(f_checks);
+    let f_view_inits_j = concat_tokens(f_view_inits);
+    let f_accs_j = concat_tokens(f_accs);
+    let f_asserts_j = concat_tokens(f_asserts);
     let col_accs_j = concat_tokens(col_accs);
     let owned_fields_j = join_comma(owned_fields);
+    let vec_owned_fields_j = join_comma(vec_owned_fields);
+    let f_slices_j = concat_tokens(f_slices);
     let col_size_lets_j = concat_tokens(col_size_lets);
     let sz_ids_j = join_comma(&sz_ids);
     let str_inits_j = concat_tokens(str_inits);
-    let block_writes_j = concat_tokens(block_writes);
     let str_scatters_j = concat_tokens(str_scatters);
     let str_finals_j = concat_tokens(str_finals);
     let vec_emits_j = concat_tokens(vec_emits);
@@ -360,8 +447,9 @@ pub(crate) fn derive_struct(name: &Ident, fields: &[Field]) -> proc_masq::TokenS
                 ::core::result::Result::Ok(#view::collapse_open(bytes)?.collapse_to_vec())
             }
         }
+        #f_asserts_j
         pub struct #view<'a> {
-            __scalars: ::wirefold::codec::web::Wire<'a, [u8; #name::COLLAPSE_SCALAR_BYTES]>,
+            #f_view_fields_j
             #view_fields_j
         }
         #ref_struct
@@ -377,23 +465,25 @@ pub(crate) fn derive_struct(name: &Ident, fields: &[Field]) -> proc_masq::TokenS
                 if s.len() != #nsections {
                     return ::core::result::Result::Err(::wirefold::codec::web::WireErr::BadLength);
                 }
-                let __scalars = ::wirefold::codec::web::Wire::open(s.section(0))?;
-                let __n = __scalars.len();
+                #f_opens_j
+                let __n = __f0.len();
+                #f_checks_j
                 #col_opens_j
                 #col_checks_j
                 let _ = __n;
-                ::core::result::Result::Ok(#view { __scalars, #view_inits_j })
+                ::core::result::Result::Ok(#view { #f_view_inits_j #view_inits_j })
             }
-            #[must_use] pub fn collapse_len(&self) -> usize { self.__scalars.len() }
+            #[must_use] pub fn collapse_len(&self) -> usize { self.__f0.len() }
             #[must_use] pub fn collapse_is_empty(&self) -> bool { self.collapse_len() == 0 }
             /// Reconstruct OWNED record `i` (serde-style): scalars by value, String/Vec allocated.
             #[must_use] pub fn collapse_get(&self, i: usize) -> #name { #name { #owned_fields_j } }
             /// Deserialize the whole table to owned records — the serde `Vec<T>` round-trip.
             #[must_use] pub fn collapse_to_vec(&self) -> ::std::vec::Vec<#name> {
-                (0..self.collapse_len()).map(|i| self.collapse_get(i)).collect()
+                #f_slices_j
+                (0..self.collapse_len()).map(|i| #name { #vec_owned_fields_j }).collect()
             }
             #aliases_j
-            #scalar_acc_j
+            #f_accs_j
             #col_accs_j
             #get_ref_method
         }
@@ -401,27 +491,22 @@ pub(crate) fn derive_struct(name: &Ident, fields: &[Field]) -> proc_masq::TokenS
             type View<'a> = #view<'a>;
             fn collapse_size(items: &[#name]) -> usize {
                 let __n = items.len();
-                let __scalar_sz: usize = 8usize + __n * #name::COLLAPSE_SCALAR_BYTES;
+                #f_size_lets_j
                 #col_size_lets_j
-                ::wirefold::codec::web::sections_size(&[__scalar_sz, #sz_ids_j])
+                ::wirefold::codec::web::sections_size(&[#f_size_ids_j, #sz_ids_j])
             }
             fn collapse_emit(items: &[#name], __dst: &mut [u8]) {
                 let __n = items.len();
-                let __scalar_sz: usize = 8usize + __n * #name::COLLAPSE_SCALAR_BYTES;
+                #f_size_lets_j
                 #col_size_lets_j
-                let __sizes = [__scalar_sz, #sz_ids_j];
+                let __sizes = [#f_size_ids_j, #sz_ids_j];
                 let __starts = ::wirefold::codec::web::emit_sections_header(__dst, &__sizes);
-                // §0 scalar count + each String column's count/leaf-cursor — then ONE pass over the
-                // source writes every record's scalar block AND its String fields in place (no re-scan).
-                let __s0 = __starts[0];
-                __dst[__s0..__s0 + 8].copy_from_slice(&(__n as u64).to_le_bytes());
+                // every scalar column's count and each String column's count/leaf-cursor — then ONE pass
+                // over the source writes every record's scalar fields AND its String fields in place.
+                #f_inits_j
                 #str_inits_j
                 for (__i, it) in items.iter().enumerate() {
-                    {
-                        let __base = __s0 + 8 + __i * #name::COLLAPSE_SCALAR_BYTES;
-                        let __b = &mut __dst[__base..__base + #name::COLLAPSE_SCALAR_BYTES];
-                        #block_writes_j
-                    }
+                    #f_writes_j
                     #str_scatters_j
                 }
                 #str_finals_j

@@ -1,14 +1,14 @@
 //! wirefold: a zero-copy wire format, a universal `Term`, an integer column codec, a
-//! context-mixing coder and structured-text surfaces, built on [apeiron](https://github.com/webfold-ai/apeiron).
+//! static table-driven entropy coder and structured-text surfaces, built on [apeiron](https://github.com/webfold-ai/apeiron).
 //!
 //! ## Feature flags
 //!
 //! | Feature | What it adds |
 //! |---------|-------------|
 //! | `codec` (default) | Zero-copy wire format ([`codec::web`]), universal Term, integer column codec |
-//! | `compress` | Context-mixing entropy coder ([`codec::cm`]) |
+//! | `compress` | Experimental dependency-free entropy coder ([`codec::cm`], tANS) |
 //! | `syntax` | Collapsed syntax AST ([`codec::syntax`]): JSON, YAML, TOON, POML, RDF and other surfaces |
-//! | `derive` | `#[derive(Collapse)]` and `#[derive(Term)]` for columnar zero-copy serialization |
+//! | `derive` | `#[derive(Collapse)]` and `#[derive(Term)]` for zero-copy record serialization |
 //! | `error` | `Error`, `Result` and `Context`, plus `#[derive(Error)]` |
 //! | `validate` | `Validate` trait plus `#[derive(Validate)]` |
 

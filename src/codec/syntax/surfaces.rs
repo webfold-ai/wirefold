@@ -812,6 +812,201 @@ impl<'a> Build<'a> for Borrowed {
     }
 }
 
+/// Smallest chunk, in bytes, worth a task: below this the pool's dispatch costs more than parsing.
+pub(super) const PAR_JSON_CHUNK: usize = 256 * 1024;
+
+/// Deepest nesting the cut finder tells apart (commas deeper than this are never cut points).
+const CUT_DEPTH: usize = MAX_NESTING_DEPTH;
+
+/// What a stretch of a JSON body says about its own structure, for both states it could be entered
+/// in (outside a string, or inside one). These summaries combine associatively: chaining them left
+/// to right, the exit state and depth of one are the entry state and depth of the next.
+///
+/// Whether a `"` opens or closes a string depends only on the backslashes immediately before it
+/// (an even number means it is a real quote), so a chunk can classify its own quotes with no state
+/// from the chunk before it. What it cannot know is whether it starts inside a string, hence the
+/// two columns.
+struct ChunkSummary {
+    /// Whether the number of real quotes is odd: the string state flips across the chunk.
+    flips: bool,
+    /// Net change in bracket depth over the chunk, entered outside (`[0]`) or inside (`[1]`) a string.
+    delta: [i64; 2],
+    /// The first comma at within-chunk depth `-k` (index `k`), under each entry state, or
+    /// `usize::MAX`. A chunk that starts `k` containers deep has its top-level commas at depth `-k`.
+    first_comma: [[usize; CUT_DEPTH + 1]; 2],
+}
+
+impl ChunkSummary {
+    /// Summarise `bytes[a..b]`: one pass, O(b - a), tracking both entry hypotheses at once (they
+    /// differ only in which side of the string state a character falls on).
+    fn of(bytes: &[u8], a: usize, b: usize) -> Self {
+        let mut odd = false; // real quotes seen so far in this chunk, mod 2
+        let mut depth = [0i64; 2];
+        let mut first_comma = [[usize::MAX; CUT_DEPTH + 1]; 2];
+        for (offset, &byte) in bytes[a..b].iter().enumerate() {
+            let i = a + offset;
+            // Entry outside a string is outside now when `odd` is false; entry inside, when true.
+            let side = usize::from(odd);
+            match byte {
+                b'"' => {
+                    let mut run = 0;
+                    while i > run && bytes[i - 1 - run] == b'\\' {
+                        run += 1;
+                    }
+                    if run % 2 == 0 {
+                        odd = !odd;
+                    }
+                }
+                b'[' | b'{' => depth[side] += 1,
+                b']' | b'}' => depth[side] -= 1,
+                b',' => {
+                    let d = depth[side];
+                    if (-(CUT_DEPTH as i64)..=0).contains(&d) {
+                        let slot = &mut first_comma[side][(-d) as usize];
+                        if *slot == usize::MAX {
+                            *slot = i;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Self {
+            flips: odd,
+            delta: depth,
+            first_comma,
+        }
+    }
+}
+
+/// Parse a JSON document whose top level is an array as a fold over its elements on the shared
+/// worker pool, or `None` if the document should be parsed the ordinary way.
+///
+/// An array is the concatenation of its elements and list concatenation is associative, so the
+/// body can be cut at commas, each piece parsed on its own, and the results joined in piece order
+/// (the pool's static partition is schedule-free, so the answer cannot depend on which core ran
+/// which piece). The result is exactly what [`JsonParser::parse`] returns, by this argument: the
+/// document is `[` body `]`, and if every piece is a valid comma-separated run of values then the
+/// body is one, and the sequential parser reads it as those values in that order. That holds
+/// wherever the cuts fall, so a cut in the wrong place (inside a string or a nested container, say)
+/// makes a piece fail to parse, never a different result. `None` is returned for anything not
+/// settled by the argument: not an array, too small, a piece that fails (the sequential parser then
+/// produces the error, so messages are unchanged), or a pool of one.
+///
+/// Cost: one pass over the bytes to place the cuts, O(n) and sequential, then the parse of n/w bytes
+/// per worker for a pool of width w, then O(items) to join. Extra space: the joined item list.
+pub(super) fn parse_json_parallel<'a, B>(
+    input: &'a str,
+    min_chunk: usize,
+) -> Option<Result<B::Term, SyntaxError>>
+where
+    B: Build<'a>,
+    B::Term: Send,
+    B::Text: Send,
+{
+    use std::sync::Mutex;
+    // Too small for two pieces: decline before touching the pool, so a small input never pays to
+    // start its workers.
+    if input.len() / min_chunk.max(1) < 2 {
+        return None;
+    }
+    let pool = crate::par::Pool::global();
+    let bytes = input.as_bytes();
+    let first = bytes.iter().position(|b| !b.is_ascii_whitespace())?;
+    let last = bytes.iter().rposition(|b| !b.is_ascii_whitespace())?;
+    if bytes[first] != b'[' || bytes[last] != b']' || first == last {
+        return None;
+    }
+    // The body, between the brackets.
+    let (lo, hi) = (first + 1, last);
+    let width = pool.width();
+    let pieces = (hi - lo) / min_chunk.max(1);
+    let pieces = pieces.min(width);
+    if pieces < 2 {
+        return None;
+    }
+    // The cuts: the first top-level comma in each chunk after the first. Which commas are top level
+    // is a fold over the body (see `ChunkSummary`), so every chunk summarises itself in parallel
+    // and the summaries combine associatively; only the combine over `pieces` entries is serial.
+    // Correctness does not rest on the cuts being right, only the speed does.
+    let share = (hi - lo) / pieces;
+    let chunk_of = |k: usize| {
+        (
+            lo + k * share,
+            if k + 1 == pieces {
+                hi
+            } else {
+                lo + (k + 1) * share
+            },
+        )
+    };
+    let summaries: Vec<Mutex<Option<ChunkSummary>>> =
+        (0..pieces).map(|_| Mutex::new(None)).collect();
+    crate::codec::par_tasks(pieces, |k| {
+        let (a, b) = chunk_of(k);
+        *summaries[k]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(ChunkSummary::of(bytes, a, b));
+    });
+    let mut cuts: Vec<usize> = Vec::with_capacity(pieces - 1);
+    let (mut inside, mut depth) = (false, 0i64);
+    for (k, slot) in summaries.into_iter().enumerate() {
+        let summary = slot
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)?;
+        let entry = usize::from(inside);
+        // A comma is top level when the depth at the chunk's start plus its depth within the chunk
+        // is zero, so it is the one recorded at within-chunk depth `-depth`.
+        if k > 0 && (0..=CUT_DEPTH as i64).contains(&depth) {
+            let comma = summary.first_comma[entry][depth as usize];
+            if comma != usize::MAX {
+                cuts.push(comma);
+            }
+        }
+        depth += summary.delta[entry];
+        inside ^= summary.flips;
+    }
+    if cuts.is_empty() {
+        return None;
+    }
+    // Piece k is body[start_k .. cut_k), the last piece running to `hi`; each cut comma is dropped.
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(cuts.len() + 1);
+    let mut start = lo;
+    for &c in &cuts {
+        ranges.push((start, c));
+        start = c + 1;
+    }
+    ranges.push((start, hi));
+    let slots: Vec<Mutex<Option<Result<Vec<B::Term>, SyntaxError>>>> =
+        ranges.iter().map(|_| Mutex::new(None)).collect();
+    crate::codec::par_tasks(ranges.len(), |t| {
+        let (a, b) = ranges[t];
+        let parsed = JsonParser::<B>::new(&input[a..b], false)
+            .starting_at_depth(1)
+            .array_body();
+        *slots[t]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(parsed);
+    });
+    let mut parts: Vec<Vec<B::Term>> = Vec::with_capacity(slots.len());
+    for slot in slots {
+        match slot
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            Some(Ok(items)) => parts.push(items),
+            // A failed or missing piece: let the sequential parser decide, and word the error.
+            _ => return None,
+        }
+    }
+    let mut all = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+    for part in parts {
+        all.extend(part);
+    }
+    Some(Ok(B::list(all)))
+}
+
 /// `loose == false` is the strict RFC 8259 grammar (what [`Surface::Json`](super::Surface::Json)
 /// uses): no control characters in strings, only the escapes the RFC defines, no leading zeros,
 /// no trailing commas, and a repeated object key is an error (the RFC leaves duplicates to the
@@ -845,6 +1040,29 @@ impl<'a, B: Build<'a>> JsonParser<'a, B> {
             fields: Vec::new(),
             items: Vec::new(),
         }
+    }
+
+    /// Start with `depth` containers already open, for a parser handed the inside of one.
+    fn starting_at_depth(mut self, depth: usize) -> Self {
+        self.depth = depth;
+        self
+    }
+
+    /// The elements of an array whose brackets are not in the text: `value (, value)*` to the end.
+    /// Any deviation (an empty text, a missing or trailing comma, leftover input) is an error, so a
+    /// text that is not exactly a comma-separated run of values never parses.
+    fn array_body(mut self) -> Result<Vec<B::Term>, SyntaxError> {
+        let base = self.items.len();
+        loop {
+            let item = self.value()?;
+            self.items.push(item);
+            self.ws();
+            if self.pos == self.s.len() {
+                break;
+            }
+            self.expect(b',')?;
+        }
+        Ok(self.items.drain(base..).collect())
     }
 
     /// Override the nesting limit (default [`MAX_NESTING_DEPTH`]).

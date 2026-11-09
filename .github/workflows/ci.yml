@@ -41,3 +41,24 @@ jobs:
         run: rustup toolchain install 1.89.0 --profile minimal
       - name: Check
         run: cargo +1.89.0 check --locked --all-features
+
+  sanitizers:
+    name: Sanitizers (${{ matrix.sanitizer }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, thread]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install nightly with rust-src
+        run: rustup toolchain install nightly --profile minimal --component rust-src
+      # AddressSanitizer runs with its leak check on for every test.
+      - name: Tests under the sanitizer
+        run: >
+          cargo +nightly test --locked --all-features --tests
+          --target x86_64-unknown-linux-gnu -Zbuild-std
+        env:
+          RUSTFLAGS: -Zsanitizer=${{ matrix.sanitizer }}

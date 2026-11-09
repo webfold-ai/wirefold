@@ -109,8 +109,10 @@ fn rdfxml_nested_parse_type_resource_errors() {
 }
 
 /// A chain `n` levels deep, built iteratively. Terms built in memory (not by a parser) can be
-/// deeper than any parser allows, so the renderers must not recurse per level. The terms are leaked:
-/// the derived recursive `Drop` of `SyntaxTerm` lives in `codec.rs` and is not what is under test.
+/// deeper than any parser allows, so the renderers must not recurse per level. Dropping one recurses per
+/// level in the derived `Drop` of `SyntaxTerm` (which is not what is under test), so it is dropped on a
+/// thread with a stack large enough for that, rather than leaked: a leak would hide real ones from a
+/// sanitizer's leak check.
 fn deep_chain(n: usize, objects: bool) -> wirefold::codec::syntax::SyntaxTerm {
     use wirefold::codec::syntax::{Atom, SyntaxTerm};
     let mut t = SyntaxTerm::B(Atom::Num("1".into()));
@@ -127,7 +129,12 @@ fn deep_chain(n: usize, objects: bool) -> wirefold::codec::syntax::SyntaxTerm {
 fn render_deep(surface: Surface, n: usize, objects: bool) -> String {
     let t = deep_chain(n, objects);
     let out = wirefold::codec::syntax::render_surface(&t, surface);
-    std::mem::forget(t);
+    std::thread::Builder::new()
+        .stack_size(1 << 30)
+        .spawn(move || drop(t))
+        .expect("spawn the dropping thread")
+        .join()
+        .expect("a deep term drops without overflowing the stack");
     out
 }
 

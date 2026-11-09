@@ -274,7 +274,7 @@ macro_rules! fuzz_bytes {
 // ── byte-stream decoders (Vec<u8> out) ─────────────────────────────────────────────────────────
 fuzz_bytes!(
     fuzz_cm_decompress,
-    |s| codec::cm::compress(3, s),
+    |s| codec::cm::compress(codec::cm::Order::One, s),
     codec::cm::decompress
 );
 fuzz_bytes!(
@@ -318,7 +318,7 @@ fuzz_bytes!(
 fuzz_bytes!(fuzz_decompress, codec::compress, codec::decompress);
 fuzz_bytes!(
     fuzz_decompress_framed,
-    |s| codec::compress_at(3, s),
+    |s| codec::compress_at(codec::cm::Order::One, s),
     codec::decompress_framed
 );
 fuzz_bytes!(
@@ -430,11 +430,14 @@ fn fuzz_msgpack_decode() {
 
 #[test]
 fn msgpack_deep_nesting_is_an_error_not_a_stack_overflow() {
-    // 200_000 nested one-element arrays: recursion depth must be bounded.
+    // 200_000 nested one-element arrays: recursion depth must be bounded. The decoder stops at depth 128,
+    // which needs about 95 KiB in a release build and about 0.9 MiB in a debug build (more under a
+    // sanitizer), while 200,000 unbounded levels would need over 150 MB, so 8 MiB separates the two
+    // with room on both sides.
     let mut bytes = vec![0x91u8; 200_000];
     bytes.push(0xc0);
     let h = std::thread::Builder::new()
-        .stack_size(1 << 20)
+        .stack_size(8 << 20)
         .spawn(move || codec::msgpack::decode(&bytes).is_err())
         .unwrap();
     assert!(h.join().expect("decode must not overflow the stack"));
@@ -566,12 +569,14 @@ fn mem03_decompress4_into_does_not_expose_unwritten_bytes_after_a_panic() {
 
 #[test]
 fn mem04_hostile_length_prefixes_return_instead_of_aborting() {
-    // framed: nch = 2^40
-    let mut framed = uvarint(1 << 40);
+    // framed: n = 2^40, order 0, stride 0
+    let mut framed = vec![codec::cm::VERSION];
+    framed.extend(uvarint(1 << 40));
     framed.extend([0, 0, 0, 0]);
     assert!(codec::decompress_framed(&framed).is_empty());
-    // cm: n = 2^40, k = 1, stride = 0, 8 stream bytes
-    let mut cm = uvarint(1 << 40);
+    // cm: n = 2^40, order 1, stride = 0, 8 stream bytes
+    let mut cm = vec![codec::cm::VERSION];
+    cm.extend(uvarint(1 << 40));
     cm.extend([1, 0, 1, 2, 3, 4, 5, 6, 7, 8]);
     assert!(codec::cm::decompress(&cm).is_empty());
     // decode_i64 EXACT: len = 2^40
@@ -622,7 +627,7 @@ fn mem06_constant_size_input_cannot_demand_unbounded_output() {
 fn try_variants_round_trip_valid_input() {
     let data = b"the quick brown fox jumps over the lazy dog. ".repeat(60);
     assert_eq!(
-        codec::cm::try_decompress(&codec::cm::compress(3, &data)).unwrap(),
+        codec::cm::try_decompress(&codec::cm::compress(codec::cm::Order::One, &data)).unwrap(),
         data
     );
     assert_eq!(
@@ -662,7 +667,7 @@ fn try_variants_round_trip_valid_input() {
         data
     );
     assert_eq!(
-        codec::try_decompress_framed(&codec::compress_at(3, &data)).unwrap(),
+        codec::try_decompress_framed(&codec::compress_at(codec::cm::Order::One, &data)).unwrap(),
         data
     );
     let col: Vec<i64> = (0..300).map(|i| i * 7 - 40).collect();
@@ -681,12 +686,13 @@ fn try_variants_round_trip_valid_input() {
 fn try_variants_report_malformed_input() {
     use codec::DecodeError;
     let data = b"the quick brown fox jumps over the lazy dog. ".repeat(60);
-    let enc = codec::cm::compress(3, &data);
+    let enc = codec::cm::compress(codec::cm::Order::One, &data);
     assert_eq!(
         codec::cm::try_decompress(&enc[..enc.len() / 2]).unwrap_err(),
         DecodeError::Truncated
     );
-    let mut huge = uvarint(1 << 40);
+    let mut huge = vec![codec::cm::VERSION];
+    huge.extend(uvarint(1 << 40));
     huge.extend([1, 0, 1, 2, 3, 4, 5, 6, 7, 8]);
     assert_eq!(
         codec::cm::try_decompress(&huge).unwrap_err(),
@@ -821,5 +827,50 @@ mod derived {
         assert_eq!(Ev::collapse_decode(seed.as_bytes()).unwrap(), evs());
         assert!(Row::collapse_decode(&[]).is_err());
         assert!(Ev::collapse_decode(&[1, 2, 3]).is_err());
+    }
+}
+
+#[test]
+fn cm_stream_version_order_and_header_are_checked() {
+    use codec::cm::{self, Order, VERSION};
+    use codec::DecodeError;
+    let data = b"the quick brown fox jumps over the lazy dog. ".repeat(60);
+    // every supported order round-trips, and the stream begins with the version byte
+    for order in [Order::Zero, Order::One] {
+        let enc = cm::compress(order, &data);
+        assert_eq!(enc[0], VERSION);
+        assert_eq!(cm::try_decompress(&enc).unwrap(), data, "{order:?}");
+    }
+    let enc = cm::compress(Order::One, &data);
+    // an unknown version is refused by name, whatever follows
+    for v in [0u8, VERSION + 1, 0xFF] {
+        let mut other = enc.clone();
+        other[0] = v;
+        assert_eq!(
+            cm::try_decompress(&other).unwrap_err(),
+            DecodeError::UnsupportedVersion(v)
+        );
+    }
+    // a stream written before the version byte existed (it began with the length) is not read
+    assert!(cm::try_decompress(&enc[1..]).is_err());
+    // truncated headers: nothing, the version only, then each header varint cut short
+    assert_eq!(cm::try_decompress(&[]).unwrap_err(), DecodeError::Truncated);
+    assert_eq!(
+        cm::try_decompress(&[VERSION]).unwrap_err(),
+        DecodeError::Truncated
+    );
+    assert!(cm::try_decompress(&[VERSION, 5]).is_err());
+    assert!(cm::try_decompress(&[VERSION, 5, 1]).is_err());
+    // an order value outside the enum is malformed, never silently mapped to another order: take a
+    // valid stream (a short input, so the length is one varint byte and the order byte is at 2) and
+    // change only that byte
+    let short = b"abcabcabcabcabc".repeat(6);
+    let valid = cm::compress(Order::One, &short);
+    assert_eq!((valid[1], valid[2]), (short.len() as u8, 1));
+    assert_eq!(cm::try_decompress(&valid).unwrap(), short);
+    for bad in [2u8, 3, 5, 127] {
+        let mut b = valid.clone();
+        b[2] = bad;
+        assert_eq!(cm::try_decompress(&b).unwrap_err(), DecodeError::Malformed);
     }
 }

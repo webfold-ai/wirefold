@@ -13,10 +13,11 @@ wirefold = { git = "https://github.com/webfold-ai/wirefold", features = ["derive
 Pick only the features you need (see the table in the [README](../README.md)). The library depends on
 apeiron and nothing else; the derive crate depends on nothing.
 
-## Columnar zero-copy records: `#[derive(Collapse)]`
+## Zero-copy records: `#[derive(Collapse)]`
 
-`Collapse` stores a slice of records column by column. Opening the bytes checks the layout once; it
-does not walk the rows, so reading one field of one row costs the read, not a decode.
+`Collapse` stores a slice of records as a section table with one contiguous column per scalar field and one column
+per variable-length field (strings, vectors). Opening the bytes checks the layout once; it does not walk the rows, so
+reading one field of one row costs the read, not a decode, and a whole column is available as a zero-copy slice.
 
 ```rust
 use wirefold::codec::web::CollapseElem;
@@ -34,6 +35,7 @@ let packed = Reading::collapse_pack(&readings);      // Vec<Reading> -> Seed
 let bytes = packed.as_bytes();                       // store or send these
 let view = ReadingView::collapse_open(bytes)?;       // validates the layout, no row walk
 let one = view.celsius(7);                           // one field of row 7, in place
+let temps: &[f64] = view.celsius_column();           // the whole column, a slice of the buffer
 let all = view.collapse_to_vec();                    // or materialise every record
 ```
 
@@ -42,7 +44,16 @@ Supported field types: the primitive integers and floats, `bool`, nested `Collap
 `to_vec` is fine: your field wins its own name and the derive's methods are always available under the
 `collapse_*` prefix.
 
-Opening a truncated or corrupt buffer returns an error. It does not panic.
+A scalar field's `_column()` accessor (`celsius_column()`) is omitted if another field of the record has that name;
+`bool` columns are `0`/`1` bytes. Opening a truncated or corrupt buffer, or one whose columns disagree about the
+record count, returns an error. It does not panic.
+
+Every table starts with a header word: the section count in the low 32 bits, then the bytes `W`, `C`, the layout
+version (`codec::web::TABLE_VERSION`, now 1) and a zero. A reader accepts exactly its own version and returns
+`WireErr::UnsupportedVersion(v)` for another, and `WireErr::BadMagic` for bytes that are not a table or that were
+written before tables carried a version (including every buffer from before the per-field column layout). Nested
+record tables carry their own header. A flat array of plain values (`Wire<T>`, what a `Vec<u64>` packs to) is not a
+table and has no header.
 
 ## Structs to and from text: `#[derive(Term)]`
 
@@ -92,6 +103,11 @@ other surfaces are parsed as usual and converted, so they work with the same cal
 JSON about twice as fast as `parse_surface` and faster than `serde_json::Value`; see
 [BENCHMARKS.md](BENCHMARKS.md).
 
+For a JSON or YAML document of 512 KiB or more whose top level is an array or a margin-level sequence, it
+parses the elements in parallel on apeiron's worker pool (set `HASHTRINITY_POOL_WIDTH=1` for one thread). The
+result is identical; see [BENCHMARKS.md](BENCHMARKS.md#parallel-parsing-of-the-borrowed-term) for when and why
+that is sound. `parse_surface` itself stays on one thread.
+
 Rendering takes the owned `SyntaxTerm`; call `into_owned` first.
 
 ## Compression
@@ -101,8 +117,26 @@ let z = wirefold::codec::compress(&bytes);
 let same = wirefold::codec::decompress(&z);
 ```
 
-`compress` is a context-mixing coder. It gives much smaller output than the usual compressors on
-structured data and is much slower; the numbers are in [BENCHMARKS.md](BENCHMARKS.md). For bytes you did
+`compress` is an experimental, dependency-free coder (tANS, with lz and a hybrid chosen by measurement). It is
+not faster or smaller than zstd on the benchmark data (numbers in [BENCHMARKS.md](BENCHMARKS.md)), so if you
+need compression, compress the bytes `Collapse` gives you with zstd; the serialization formats do not depend on
+`compress`.
+
+To compress `Collapse` output with zstd, add `zstd` to your own `Cargo.toml` (wirefold does not depend on it).
+The packed bytes are plain bytes; these are the same calls the benchmark pipelines time, and they are
+not part of `examples/usage.rs` because they need that dependency:
+
+```rust
+let bytes = Event::collapse_pack(&records).as_bytes().to_vec();
+let packed = zstd::encode_all(&bytes[..], 3)?;           // level 3: about 2.5 ms for 20,000 records
+let bytes = zstd::decode_all(&packed[..])?;
+let records = EventView::collapse_open(&bytes)?.collapse_to_vec();
+```
+
+The raw coder is `codec::compress_at(codec::cm::Order::One, &bytes)` (or `Order::Zero`). Its stream starts with
+a version byte (`codec::cm::VERSION`); a reader accepts exactly that version and returns
+`DecodeError::UnsupportedVersion` for any other, so streams from a different version, including those written
+before the byte existed, are refused rather than misread. For bytes you did
 not produce yourself, use `codec::try_decompress_framed`, which returns an error on malformed input.
 
 ## MessagePack

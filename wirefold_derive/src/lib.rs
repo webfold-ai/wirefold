@@ -1,6 +1,7 @@
-//! `#[derive(Collapse)]` — the columnar zero-copy bridge.
+//! `#[derive(Collapse)]` — the zero-copy bridge.
 //!
-//! **Structs** → a columnar record table + zero-copy `TView`: scalar fields (primitives AND nested
+//! **Structs** → a record table + zero-copy `TView`: the scalar fields are one row-major array of packed records,
+//! and each variable-length field is a column of its own. Scalar fields (primitives AND nested
 //! `Pod` structs) packed into one `Wire<[u8; N]>`; `String` → a `Ragged`; `Vec<U>` → a
 //! `Sections`-of-sub-buffers, dispatched through `CollapseElem` (so `U` may be `Pod` OR itself a
 //! `Collapse` record — nesting recurses to any depth).

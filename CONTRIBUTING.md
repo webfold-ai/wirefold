@@ -25,6 +25,17 @@ cargo check --locked --no-default-features
 
 The minimum supported Rust version is 1.89. CI checks it.
 
+Changes to `unsafe` code, the pool or the parallel parsers also run under the sanitizers (nightly, with
+`rust-src`). AddressSanitizer's leak check is on for every test:
+
+```sh
+RUSTFLAGS="-Zsanitizer=address" cargo +nightly test --all-features --tests --target x86_64-unknown-linux-gnu
+RUSTFLAGS="-Zsanitizer=thread" cargo +nightly test -Zbuild-std --all-features --tests --target x86_64-unknown-linux-gnu
+cargo +nightly miri test --all-features --lib -- tans::tests::tans_roundtrip huf:: codec::web::tests
+```
+
+Miri is slow (the tANS and Huffman round trips take about 8 minutes), so it is run on the `unsafe` modules and not in CI.
+
 ## Benchmarks
 
 Benchmarks live in `bench/`, outside the library workspace, so the library stays dependency-free. See
