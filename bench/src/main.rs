@@ -52,7 +52,7 @@ fn ordered(n: usize) -> Vec<Event> {
                 user: (r.next() % 5000) as u32,
                 kind: (r.next() % 6) as u8,
                 value: (r.next() % 100_000) as f64 / 100.0,
-                ok: r.next() % 10 != 0,
+                ok: !r.next().is_multiple_of(10),
                 name: names[(r.next() % 6) as usize].to_string(),
             }
         })
@@ -303,44 +303,84 @@ fn json_values(data: &[Event]) {
 
 /// Parse speed of every text surface on the same records, with serde_json as the JSON reference.
 /// Each surface is timed from the same rendered document; run one surface per process if you need
-/// to rule out heap-layout effects between surfaces (`cargo run --release -- parse json`, and `parse serde` for the serde_json reference alone; a third argument sets the record count).
+/// to rule out heap-layout effects between surfaces (`cargo run --release -- parse json`, and `parse serde` for the serde_json reference alone; a third argument sets the record count). With no surface it does exactly that for you, one child process per surface.
 fn parse_surfaces(n: usize, only: Option<&str>) {
-    let data = ordered(n);
-    let json = String::from_utf8(serde_json::to_vec(&data).unwrap()).unwrap();
-    let serde_only = only.is_some_and(|o| o.eq_ignore_ascii_case("serde"));
-    let term = if serde_only {
-        wirefold::codec::syntax::SyntaxTerm::Nb
-    } else {
-        parse_surface(Surface::Json, &json).unwrap()
+    // No surface given: run each one in its own process and gather the rows, because the heap state
+    // one parse leaves behind changes the speed of the next by 10 to 20%.
+    let Some(only) = only else {
+        println!("\n### Parsing {n} records into a generic tree (one process per surface)\n");
+        println!("| surface | size (bytes) | parse (ms) | MB/s |");
+        println!("|---|---:|---:|---:|");
+        let exe = std::env::current_exe().expect("own path");
+        for name in [
+            "json", "json-ref", "serde", "yaml", "yaml-ref", "toon", "poml", "csv", "baml",
+        ] {
+            let out = std::process::Command::new(&exe)
+                .args(["parse", name, &n.to_string()])
+                .output()
+                .expect("child run");
+            assert!(out.status.success(), "{name} child failed");
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                if line.starts_with("| ") && !line.starts_with("| surface") {
+                    println!("{line}");
+                }
+            }
+        }
+        return;
+    };
+    let serde_only = only.eq_ignore_ascii_case("serde");
+    let json = {
+        let data = ordered(n);
+        String::from_utf8(serde_json::to_vec(&data).unwrap()).unwrap()
+    };
+    let text_for = |sf: Surface| {
+        let term = parse_surface(Surface::Json, &json).unwrap();
+        wirefold::codec::syntax::render_surface(&term, sf)
     };
     println!("\n### Parsing {n} records into a generic tree\n");
     println!("| surface | size (bytes) | parse (ms) | MB/s |");
     println!("|---|---:|---:|---:|");
-    for (name, sf) in [
-        ("JSON", Surface::Json),
-        ("YAML", Surface::Yaml),
-        ("TOON", Surface::Toon),
-        ("POML", Surface::Poml),
-        ("CSV", Surface::Csv),
-        ("BAML", Surface::Baml),
-    ] {
-        if only.is_some_and(|o| !name.eq_ignore_ascii_case(o)) || serde_only {
-            continue;
+    if !serde_only {
+        for (name, sf, borrowed) in [
+            ("JSON", Surface::Json, false),
+            ("JSON (borrowed)", Surface::Json, true),
+            ("YAML", Surface::Yaml, false),
+            ("YAML (borrowed)", Surface::Yaml, true),
+            ("TOON", Surface::Toon, false),
+            ("POML", Surface::Poml, false),
+            ("CSV", Surface::Csv, false),
+            ("BAML", Surface::Baml, false),
+        ] {
+            // `json-ref` selects the borrowed JSON row, `json` the owned one, and so on.
+            let selector = name.to_lowercase().replace(" (borrowed)", "-ref");
+            if selector != only.to_lowercase() {
+                continue;
+            }
+            let text = text_for(sf);
+            let t = if borrowed {
+                assert!(
+                    wirefold::codec::syntax::parse_surface_ref(sf, &text).is_ok(),
+                    "{name} parses its own render"
+                );
+                ms(15, || {
+                    wirefold::codec::syntax::parse_surface_ref(sf, &text).unwrap()
+                })
+            } else {
+                assert!(
+                    parse_surface(sf, &text).is_ok(),
+                    "{name} parses its own render"
+                );
+                ms(15, || parse_surface(sf, &text).unwrap())
+            };
+            println!(
+                "| {name} | {} | {:.1} | {:.0} |",
+                text.len(),
+                t,
+                text.len() as f64 / 1e6 / (t / 1e3)
+            );
         }
-        let text = wirefold::codec::syntax::render_surface(&term, sf);
-        assert!(
-            parse_surface(sf, &text).is_ok(),
-            "{name} parses its own render"
-        );
-        let t = ms(15, || parse_surface(sf, &text).unwrap());
-        println!(
-            "| {name} | {} | {:.1} | {:.0} |",
-            text.len(),
-            t,
-            text.len() as f64 / 1e6 / (t / 1e3)
-        );
     }
-    if only.is_none_or(|o| o.eq_ignore_ascii_case("json") || o.eq_ignore_ascii_case("serde")) {
+    if only.eq_ignore_ascii_case("serde") {
         let t = ms(15, || {
             serde_json::from_str::<serde_json::Value>(&json).unwrap()
         });
@@ -353,7 +393,177 @@ fn parse_surfaces(n: usize, only: Option<&str>) {
     }
 }
 
+/// Run each of `names` as `<mode> <name> <n>` in its own child process and relay the table rows, so
+/// no measurement inherits another's heap state.
+fn run_children(mode: &str, names: &[&str], n: usize) {
+    let exe = std::env::current_exe().expect("own path");
+    for name in names {
+        let out = std::process::Command::new(&exe)
+            .args([mode, name, &n.to_string()])
+            .output()
+            .expect("child run");
+        assert!(out.status.success(), "{mode} {name} child failed");
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if line.starts_with("| ")
+                && !line.starts_with("| surface")
+                && !line.starts_with("| operation")
+            {
+                println!("{line}");
+            }
+        }
+    }
+}
+
+/// Render speed of every text surface from the same term.
+fn render_surfaces(n: usize, only: Option<&str>) {
+    let Some(only) = only else {
+        println!("\n### Rendering {n} records from a generic tree (one process per surface)\n");
+        println!("| surface | size (bytes) | render (ms) | MB/s |");
+        println!("|---|---:|---:|---:|");
+        run_children(
+            "render",
+            &["json", "yaml", "toon", "poml", "csv", "baml"],
+            n,
+        );
+        return;
+    };
+    let term = {
+        let data = ordered(n);
+        let json = String::from_utf8(serde_json::to_vec(&data).unwrap()).unwrap();
+        parse_surface(Surface::Json, &json).unwrap()
+    };
+    for (name, sf) in [
+        ("JSON", Surface::Json),
+        ("YAML", Surface::Yaml),
+        ("TOON", Surface::Toon),
+        ("POML", Surface::Poml),
+        ("CSV", Surface::Csv),
+        ("BAML", Surface::Baml),
+    ] {
+        if !name.eq_ignore_ascii_case(only) {
+            continue;
+        }
+        let size = wirefold::codec::syntax::render_surface(&term, sf).len();
+        let t = ms(15, || wirefold::codec::syntax::render_surface(&term, sf));
+        println!(
+            "| {name} | {size} | {t:.2} | {:.0} |",
+            size as f64 / 1e6 / (t / 1e3)
+        );
+    }
+}
+
+/// MessagePack and protobuf encode and decode of the same records as a generic tree. rmp-serde
+/// (through `serde_json::Value`, also a generic tree) is the MessagePack reference.
+fn binary_codecs(n: usize, only: Option<&str>) {
+    let Some(only) = only else {
+        println!("\n### Binary codecs, {n} records as a generic tree (one process per row)\n");
+        println!("| operation | size (bytes) | time (ms) | MB/s |");
+        println!("|---|---:|---:|---:|");
+        run_children(
+            "binary",
+            &[
+                "wf-msgpack-encode",
+                "rmp-msgpack-encode",
+                "wf-msgpack-decode",
+                "rmp-msgpack-decode",
+                "wf-proto-encode",
+                "wf-proto-decode",
+            ],
+            n,
+        );
+        return;
+    };
+    use wirefold::codec::proto::{ProtoRegistry, ProtoSchema};
+    use wirefold::codec::syntax::{Atom, SyntaxTerm};
+    // The protobuf schema keeps the integer, bool and string fields (this codec models no floats).
+    const SRC: &str = "message Event {\n  optional uint64 ts = 1;\n  optional uint32 user = 2;\n  optional uint32 kind = 3;\n  optional bool ok = 5;\n  optional string name = 6;\n}\nmessage Batch {\n  repeated Event events = 1;\n}\n";
+    let (term, value, batch, wf_mp, rmp, pb) = {
+        let data = ordered(n);
+        let json = serde_json::to_vec(&data).unwrap();
+        let term = parse_surface(Surface::Json, std::str::from_utf8(&json).unwrap()).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        let reg = ProtoRegistry::parse_messages(SRC, &["Event", "Batch"]);
+        let schema = ProtoSchema::parse(SRC, "Batch").unwrap();
+        let events: Vec<SyntaxTerm> = data
+            .iter()
+            .map(|e| {
+                SyntaxTerm::Bu(vec![
+                    ("ts".into(), SyntaxTerm::B(Atom::Num(e.ts.to_string()))),
+                    ("user".into(), SyntaxTerm::B(Atom::Num(e.user.to_string()))),
+                    ("kind".into(), SyntaxTerm::B(Atom::Num(e.kind.to_string()))),
+                    ("ok".into(), SyntaxTerm::B(Atom::Bool(e.ok))),
+                    ("name".into(), SyntaxTerm::B(Atom::Str(e.name.clone()))),
+                ])
+            })
+            .collect();
+        let batch = SyntaxTerm::Bu(vec![("events".into(), SyntaxTerm::Fourth(events))]);
+        let wf_mp = wirefold::codec::msgpack::encode(&term);
+        let rmp = rmp_serde::to_vec(&value).unwrap();
+        let pb = wirefold::codec::proto::encode(&batch, &schema, &reg);
+        (term, value, batch, wf_mp, rmp, pb)
+    };
+    let reg = ProtoRegistry::parse_messages(SRC, &["Event", "Batch"]);
+    let schema = ProtoSchema::parse(SRC, "Batch").unwrap();
+    let (label, size, t) = match only {
+        "wf-msgpack-encode" => (
+            "wirefold msgpack encode",
+            wf_mp.len(),
+            ms(15, || wirefold::codec::msgpack::encode(&term)),
+        ),
+        "rmp-msgpack-encode" => (
+            "rmp-serde encode (`Value`)",
+            rmp.len(),
+            ms(15, || rmp_serde::to_vec(&value).unwrap()),
+        ),
+        "wf-msgpack-decode" => (
+            "wirefold msgpack decode",
+            wf_mp.len(),
+            ms(15, || wirefold::codec::msgpack::decode(&wf_mp).unwrap()),
+        ),
+        "rmp-msgpack-decode" => (
+            "rmp-serde decode (`Value`)",
+            rmp.len(),
+            ms(15, || {
+                rmp_serde::from_slice::<serde_json::Value>(&rmp).unwrap()
+            }),
+        ),
+        "wf-proto-encode" => (
+            "wirefold protobuf encode",
+            pb.len(),
+            ms(15, || wirefold::codec::proto::encode(&batch, &schema, &reg)),
+        ),
+        "wf-proto-decode" => (
+            "wirefold protobuf decode",
+            pb.len(),
+            ms(15, || {
+                wirefold::codec::proto::decode(&pb, &schema, &reg).unwrap()
+            }),
+        ),
+        other => panic!("unknown binary row {other}"),
+    };
+    println!(
+        "| {label} | {size} | {t:.2} | {:.0} |",
+        size as f64 / 1e6 / (t / 1e3)
+    );
+}
+
 fn main() {
+    if let Some(mode) = std::env::args()
+        .nth(1)
+        .filter(|m| m == "render" || m == "binary")
+    {
+        let only = std::env::args().nth(2);
+        let n = std::env::args()
+            .nth(3)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20_000);
+        if mode == "render" {
+            render_surfaces(n, only.as_deref());
+        } else {
+            binary_codecs(n, only.as_deref());
+        }
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("parse") {
         let only = std::env::args().nth(2);
         let n = std::env::args()

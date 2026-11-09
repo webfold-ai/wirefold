@@ -2,7 +2,9 @@
 //!
 //! Run: `cargo run --example usage --all-features`
 
-use wirefold::codec::syntax::{parse_surface, render_surface, translate, Surface};
+use wirefold::codec::syntax::{
+    parse_surface, parse_surface_ref, render_surface, translate, Surface,
+};
 use wirefold::codec::web::CollapseElem;
 use wirefold::{codec, Collapse, Term};
 
@@ -63,14 +65,24 @@ fn main() {
     let yaml = translate(&json, Surface::Json, Surface::Yaml).unwrap();
     println!("yaml:\n{yaml}");
 
-    // 5. Entropy-coded compression of any byte buffer.
+    // 5. Parse without copying: a term whose keys and scalars borrow from the input text. Strings
+    // with no escapes, numbers and plain YAML scalars are slices of `json`, so no allocation.
+    let borrowed = parse_surface_ref(Surface::Json, &json).unwrap();
+    assert_eq!(
+        borrowed.clone().into_owned(),
+        parse_surface(Surface::Json, &json).unwrap()
+    );
+    let owned = borrowed.into_owned(); // copy the strings when the term must outlive `json`
+    assert_eq!(Person::from_term(&owned).unwrap(), p);
+
+    // 6. Entropy-coded compression of any byte buffer.
     let packed_z = codec::compress(bytes);
     assert_eq!(codec::decompress(&packed_z), bytes);
     println!("compress: {} -> {} bytes", bytes.len(), packed_z.len());
     // Untrusted input: the framed decoder returns an error instead of panicking.
     assert!(codec::try_decompress_framed(&[0xFF; 16]).is_err());
 
-    // 6. MessagePack through the same universal term.
+    // 7. MessagePack through the same universal term.
     // Object keys come back in sorted order, so compare through the struct, not the raw term.
     let mp = codec::msgpack::encode(&p.to_term());
     assert_eq!(

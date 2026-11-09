@@ -15,8 +15,24 @@ All notable changes to this crate are documented in this file. The format follow
 - cargo-fuzz targets for the decoders and parsers, a supply-chain workflow (audit, deny, SBOM) and a signed
   release workflow with SLSA provenance.
 
+### Added
+
+- `codec::syntax::SyntaxTermRef`, `AtomRef` and `parse_surface_ref`: parse JSON and YAML into a term whose keys
+  and scalars borrow from the input where the input already holds the exact text. About twice as fast as
+  `parse_surface` and faster than `serde_json::Value`; `into_owned` converts back. Other surfaces work with the
+  same call but save nothing.
+
+### Fixed
+
+- The YAML parser panicked on a block scalar (`|` or `>`) when a later line, indented less than the block's
+  margin, had a multi-byte character where the margin falls (slicing inside the character). Untrusted YAML could
+  crash the process. It now returns a result.
+
 ### Changed
 
+- Rendering is much faster for YAML (-90% instructions), TOON (-85%), POML (-79%), CSV (-77%) and BAML (-36%);
+  JSON was already tight. MessagePack encode is 1.9 times faster and protobuf encode 1.7 times; decoders are
+  unchanged to within noise. Output is byte-identical.
 - Faster parsers for every text surface, with identical results: JSON −18%, YAML −16%, TOON −16%, POML −44%,
   CSV −24%, BAML −5% wall-clock on 20,000 records (instruction counts down 38%, 13%, 28%, 47% and 39% for JSON,
   YAML, TOON, POML and CSV). JSON parsing is now level with `serde_json::Value`. See `docs/BENCHMARKS.md`.

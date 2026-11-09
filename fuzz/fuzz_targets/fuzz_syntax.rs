@@ -1,8 +1,9 @@
-//! Hostile text into every structured-text surface. The first byte picks the surface.
+//! Hostile text into every structured-text surface. The first byte picks the surface. Also checks
+//! that the borrowing parse agrees with the owned one.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use wirefold::codec::syntax::{parse_surface, Surface};
+use wirefold::codec::syntax::{parse_surface, parse_surface_ref, Surface};
 
 fuzz_target!(|data: &[u8]| {
     let Some((&sel, rest)) = data.split_first() else {
@@ -20,5 +21,9 @@ fuzz_target!(|data: &[u8]| {
         5 => Surface::Baml,
         _ => Surface::RdfXml,
     };
-    let _ = parse_surface(surface, text);
+    let owned = parse_surface(surface, text);
+    // The borrowing parser must agree with the owned one: same success or failure, same term.
+    let borrowed =
+        parse_surface_ref(surface, text).map(wirefold::codec::syntax::SyntaxTermRef::into_owned);
+    assert_eq!(owned, borrowed);
 });

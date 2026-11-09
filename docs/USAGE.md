@@ -72,6 +72,28 @@ Scope to know about: the YAML surface is a wide subset of YAML 1.2, not the whol
 JSON path produces a generic tree rather than deserialising straight into your type. See the doc comments
 on `parse_yaml` and `parse_turtle` for the exact scope of each surface.
 
+## Parsing without copying
+
+`parse_surface` returns a `SyntaxTerm` that owns a `String` for every key and scalar. When you read the
+tree and drop it, or keep it no longer than the input, `parse_surface_ref` returns a `SyntaxTermRef` whose
+text borrows from the input instead:
+
+```rust
+use wirefold::codec::syntax::{parse_surface_ref, Surface};
+
+let term = parse_surface_ref(Surface::Json, &text)?;   // borrows from `text`
+let owned = term.into_owned();                          // copies, when it must outlive `text`
+```
+
+JSON and YAML parse straight into the borrowing form: a string with no escapes, a number, a plain YAML scalar
+or an unquoted key is a slice of the input and costs no allocation. A string that had to be unescaped is built,
+so the result is always equal to what `parse_surface` returns (`SyntaxTermRef::into_owned` gives it back). The
+other surfaces are parsed as usual and converted, so they work with the same call but save nothing. It parses
+JSON about twice as fast as `parse_surface` and faster than `serde_json::Value`; see
+[BENCHMARKS.md](BENCHMARKS.md).
+
+Rendering takes the owned `SyntaxTerm`; call `into_owned` first.
+
 ## Compression
 
 ```rust
