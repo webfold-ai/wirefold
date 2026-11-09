@@ -815,6 +815,70 @@ impl<'a> Build<'a> for Borrowed {
 /// Smallest chunk, in bytes, worth a task: below this the pool's dispatch costs more than parsing.
 pub(super) const PAR_JSON_CHUNK: usize = 256 * 1024;
 
+/// Deepest nesting the cut finder tells apart (commas deeper than this are never cut points).
+const CUT_DEPTH: usize = MAX_NESTING_DEPTH;
+
+/// What a stretch of a JSON body says about its own structure, for both states it could be entered
+/// in (outside a string, or inside one). These summaries combine associatively: chaining them left
+/// to right, the exit state and depth of one are the entry state and depth of the next.
+///
+/// Whether a `"` opens or closes a string depends only on the backslashes immediately before it
+/// (an even number means it is a real quote), so a chunk can classify its own quotes with no state
+/// from the chunk before it. What it cannot know is whether it starts inside a string, hence the
+/// two columns.
+struct ChunkSummary {
+    /// Whether the number of real quotes is odd: the string state flips across the chunk.
+    flips: bool,
+    /// Net change in bracket depth over the chunk, entered outside (`[0]`) or inside (`[1]`) a string.
+    delta: [i64; 2],
+    /// The first comma at within-chunk depth `-k` (index `k`), under each entry state, or
+    /// `usize::MAX`. A chunk that starts `k` containers deep has its top-level commas at depth `-k`.
+    first_comma: [[usize; CUT_DEPTH + 1]; 2],
+}
+
+impl ChunkSummary {
+    /// Summarise `bytes[a..b]`: one pass, O(b - a), tracking both entry hypotheses at once (they
+    /// differ only in which side of the string state a character falls on).
+    fn of(bytes: &[u8], a: usize, b: usize) -> Self {
+        let mut odd = false; // real quotes seen so far in this chunk, mod 2
+        let mut depth = [0i64; 2];
+        let mut first_comma = [[usize::MAX; CUT_DEPTH + 1]; 2];
+        for (offset, &byte) in bytes[a..b].iter().enumerate() {
+            let i = a + offset;
+            // Entry outside a string is outside now when `odd` is false; entry inside, when true.
+            let side = usize::from(odd);
+            match byte {
+                b'"' => {
+                    let mut run = 0;
+                    while i > run && bytes[i - 1 - run] == b'\\' {
+                        run += 1;
+                    }
+                    if run % 2 == 0 {
+                        odd = !odd;
+                    }
+                }
+                b'[' | b'{' => depth[side] += 1,
+                b']' | b'}' => depth[side] -= 1,
+                b',' => {
+                    let d = depth[side];
+                    if (-(CUT_DEPTH as i64)..=0).contains(&d) {
+                        let slot = &mut first_comma[side][(-d) as usize];
+                        if *slot == usize::MAX {
+                            *slot = i;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Self {
+            flips: odd,
+            delta: depth,
+            first_comma,
+        }
+    }
+}
+
 /// Parse a JSON document whose top level is an array as a fold over its elements on the shared
 /// worker pool, or `None` if the document should be parsed the ordinary way.
 ///
@@ -861,35 +925,49 @@ where
     if pieces < 2 {
         return None;
     }
-    // Cut at the first top-level comma at or after each equal share of the body. "Top level" is the
-    // scan's best guess (outside strings, one container deep); correctness does not rest on it.
+    // The cuts: the first top-level comma in each chunk after the first. Which commas are top level
+    // is a fold over the body (see `ChunkSummary`), so every chunk summarises itself in parallel
+    // and the summaries combine associatively; only the combine over `pieces` entries is serial.
+    // Correctness does not rest on the cuts being right, only the speed does.
     let share = (hi - lo) / pieces;
+    let chunk_of = |k: usize| {
+        (
+            lo + k * share,
+            if k + 1 == pieces {
+                hi
+            } else {
+                lo + (k + 1) * share
+            },
+        )
+    };
+    let summaries: Vec<Mutex<Option<ChunkSummary>>> =
+        (0..pieces).map(|_| Mutex::new(None)).collect();
+    pool.dispatch(pieces, |k| {
+        let (a, b) = chunk_of(k);
+        *summaries[k]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(ChunkSummary::of(bytes, a, b));
+    });
     let mut cuts: Vec<usize> = Vec::with_capacity(pieces - 1);
-    let mut next_target = lo + share;
-    let (mut i, mut depth) = (lo, 0usize);
-    while i < hi && cuts.len() < pieces - 1 {
-        match bytes[i] {
-            b'"' => {
-                i += 1;
-                loop {
-                    match bytes.get(i)? {
-                        b'"' => break,
-                        b'\\' => i += 2,
-                        _ => i += 1,
-                    }
-                }
+    let (mut inside, mut depth) = (false, 0i64);
+    for (k, slot) in summaries.into_iter().enumerate() {
+        let summary = slot
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)?;
+        let entry = usize::from(inside);
+        // A comma is top level when the depth at the chunk's start plus its depth within the chunk
+        // is zero, so it is the one recorded at within-chunk depth `-depth`.
+        if k > 0 && (0..=CUT_DEPTH as i64).contains(&depth) {
+            let comma = summary.first_comma[entry][depth as usize];
+            if comma != usize::MAX {
+                cuts.push(comma);
             }
-            b'[' | b'{' => depth += 1,
-            b']' | b'}' => depth = depth.saturating_sub(1),
-            b',' if depth == 0 && i >= next_target => {
-                cuts.push(i);
-                next_target = i + share;
-            }
-            _ => {}
         }
-        i += 1;
+        depth += summary.delta[entry];
+        inside ^= summary.flips;
     }
-    if cuts.len() + 1 < 2 {
+    if cuts.is_empty() {
         return None;
     }
     // Piece k is body[start_k .. cut_k), the last piece running to `hi`; each cut comma is dropped.

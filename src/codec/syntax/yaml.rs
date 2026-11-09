@@ -87,41 +87,30 @@ where
     if pieces < 2 {
         return None;
     }
-    let bytes = input.as_bytes();
+    // Piece k runs from `margin_dash_at_or_after(k * share)` to the same for piece k + 1: each
+    // boundary is a pure function of its byte offset, found by looking forward only as far as the
+    // next margin dash (about one item), so there is no pass over the document to place the cuts.
     let share = input.len() / pieces;
-    let mut cuts: Vec<usize> = Vec::with_capacity(pieces - 1);
-    let mut next_target = share;
-    let mut start = 0;
-    while start < bytes.len() {
-        let end = bytes[start..]
-            .iter()
-            .position(|&b| b == b'\n')
-            .map_or(bytes.len(), |i| start + i);
-        // a line the way `str::lines` sees it: without its newline or a carriage return before it
-        let line = input[start..end]
-            .strip_suffix('\r')
-            .unwrap_or(&input[start..end]);
-        let is_margin_dash = line == "-" || line.starts_with("- ");
-        if is_margin_dash && start >= next_target && cuts.len() + 1 < pieces {
-            cuts.push(start);
-            next_target = start + share;
-        }
-        start = (end + 1).min(bytes.len());
-    }
-    if cuts.is_empty() {
+    let mut starts: Vec<usize> = Vec::with_capacity(pieces + 1);
+    starts.push(0);
+    starts.extend((1..pieces).map(|k| margin_dash_at_or_after(input, k * share)));
+    starts.push(input.len());
+    if starts[1] == input.len() {
+        // no margin dash after the first share: one piece would do all the work
         return None;
     }
-    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(cuts.len() + 1);
-    let mut from = 0;
-    for &c in &cuts {
-        ranges.push((from, c));
-        from = c;
-    }
-    ranges.push((from, input.len()));
+    let ranges: Vec<(usize, usize)> = starts.windows(2).map(|w| (w[0], w[1])).collect();
     let slots: Vec<Mutex<Option<Result<Vec<B::Term>, SyntaxError>>>> =
         ranges.iter().map(|_| Mutex::new(None)).collect();
     pool.dispatch(ranges.len(), |t| {
         let (a, b) = ranges[t];
+        if a == b {
+            // a share that held no margin dash: this piece is empty
+            *slots[t]
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Ok(Vec::new()));
+            return;
+        }
         let lines: Vec<&'a str> = input[a..b].lines().collect();
         let mut p = YamlParser::<B> {
             lines,
@@ -160,6 +149,35 @@ where
         all.extend(part);
     }
     Some(Ok(B::list(all)))
+}
+
+/// The start of the first margin dash line (`-` or `- ...` with no indent) that begins at or after
+/// byte `t`, or the end of the input if there is none. Looks forward only as far as that line.
+fn margin_dash_at_or_after(input: &str, t: usize) -> usize {
+    let bytes = input.as_bytes();
+    let mut start = if t == 0 || bytes.get(t - 1) == Some(&b'\n') {
+        t
+    } else {
+        match bytes[t.min(bytes.len())..].iter().position(|&b| b == b'\n') {
+            Some(i) => t + i + 1,
+            None => return bytes.len(),
+        }
+    };
+    while start < bytes.len() {
+        let end = bytes[start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(bytes.len(), |i| start + i);
+        // a line the way `str::lines` sees it: without its newline or a carriage return before it
+        let line = input[start..end]
+            .strip_suffix('\r')
+            .unwrap_or(&input[start..end]);
+        if line == "-" || line.starts_with("- ") {
+            return start;
+        }
+        start = end + 1;
+    }
+    bytes.len()
 }
 
 fn line_indent(line: &str) -> usize {

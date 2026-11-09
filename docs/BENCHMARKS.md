@@ -21,7 +21,7 @@ from runs described there.
   time, for example archival.
 - **Parsing text into a generic tree:** wirefold's owned JSON parser is level with `serde_json::Value`, and
   `parse_surface_ref`, which borrows strings from the input, is about 1.8 times faster than it on one thread,
-  and about 3 times faster on a pool of 4 for documents over 512 KiB (26 ms against about 110 ms for 100,000
+  and about 5 times faster on a pool of 4 for documents over 512 KiB (23 ms against about 110 ms for 100,000
   records). The other surfaces parse at 74 to 130 MB/s. See [Parsing](#parsing).
 - **Rendering a tree to text:** YAML, TOON, CSV and POML render 3 to 7 times faster than they did, and JSON
   rendering was already tight. See [Rendering](#rendering).
@@ -130,15 +130,27 @@ An array is the concatenation of its elements, and list concatenation is associa
 level is an array (JSON) or a block sequence at the left margin (YAML) is a fold over its elements.
 `parse_surface_ref` cuts such a document at element boundaries, parses the pieces on apeiron's `Pool` (a static,
 schedule-free partition: the answer cannot depend on which core ran which piece), and joins the results in piece
-order. It applies from 512 KiB up; below that the path is unchanged.
+order. It applies from 512 KiB up; below that the path is unchanged. Finding the cuts is also a fold, so no
+pass over the document is serial:
 
-100,000 records (8.2 MB JSON, 8.4 MB YAML), `cargo run --release -- parse json-ref 100000`, mean of 5 runs with
+- JSON: whether a `"` is a real delimiter depends only on the backslashes immediately before it, so each chunk
+  classifies its own quotes. A chunk summarises itself under both possible entry states (outside or inside a
+  string) in one pass: the net bracket depth, whether the string state flips, and the first comma at each depth.
+  Those summaries combine associatively, and the combine over the chunk count is the only serial step.
+- YAML: each cut is a pure function of its byte offset, the first margin dash line at or after it, found by looking
+  forward only as far as that line. Each piece's start and end are computed from its index alone.
+
+100,000 records (8.2 MB JSON, 8.4 MB YAML), `cargo run --release -- parse json-ref 100000`, mean of 6 runs with
 the observed range, on 4 cores. One thread is `HASHTRINITY_POOL_WIDTH=1`.
 
 | document | one thread (ms) | pool of 4 (ms) | change |
 |---|---:|---:|---:|
-| JSON, borrowed | 43.7 (41.8 to 48.1) | 26.0 (22.9 to 29.8) | -40% |
-| YAML, borrowed | 82.5 (78.1 to 95.2) | 42.3 (40.5 to 43.8) | -49% |
+| JSON, borrowed | 44.7 (41.5 to 48.7) | 22.9 (22.2 to 24.5) | -49% |
+| YAML, borrowed | 78.2 (76.0 to 82.3) | 28.5 (25.8 to 34.5) | -64% |
+
+An earlier version found the cuts with one serial scan over the document. Replacing it with the folds above
+took JSON from 35.0 (sd 2.5) to 29.6 (sd 1.8) ms on the 8 MB document in 15 paired runs, every pair favouring the
+new version, and YAML from 40.7 to 33.5 ms in 6 runs with non-overlapping ranges.
 
 For reference the owned parsers take 90.8 ms (JSON) and 139.9 ms (YAML) on the same documents, and they are not
 parallel: the owned term allocates a `String` per key and scalar on the worker threads and then frees them from
@@ -159,13 +171,17 @@ Why the result is the same as the sequential parse:
   for the end of a piece alike means "no more of this item".
 - Checked by `parallel_parse` in `src/codec/syntax/tests.rs`: tens of thousands of generated and mutated
   documents with a one-byte chunk floor, requiring that the parallel parse either declines or equals the
-  sequential one, and never returns a value where the sequential parser reports an error. Mutating the
-  implementation (accepting trailing garbage in a piece, ignoring unread lines, cutting mid-line) turns the test
-  red, and restoring it turns it green. On the 8 MB documents the result equals the owned parse at pool widths 1,
+  sequential one, and never returns a value where the sequential parser reports an error; and a separate test
+  that on valid documents full of commas, brackets, quotes and backslash runs the cuts land on top-level commas,
+  so the parallel path is always taken (a wrong cut only makes a piece fail, which the first test cannot see).
+  Mutating the implementation (accepting trailing garbage in a piece, ignoring unread lines, cutting mid-line,
+  losing the string state or the depth across chunks, taking every quote for a delimiter) turns a test red, and
+  restoring it turns it green. On the 8 MB documents the result equals the owned parse at pool widths 1,
   2 and 4.
 
-Not covered: the cut-finding pass is sequential (about 7.6 ms of the 26 ms for JSON), and the gain depends on the
-machine having idle cores. The pool's workers spin briefly between dispatches, as documented in apeiron.
+Not covered: the combine over the chunk summaries (a handful of entries) and the final join of the pieces' item
+lists (a memmove of the parsed items) are serial, and the gain depends on the machine having idle cores. The pool's
+workers spin briefly between dispatches, as documented in apeiron.
 
 How to read these numbers:
 

@@ -1064,6 +1064,75 @@ mod parallel_parse {
         }
     }
 
+    /// The cut finder, not just the parser, has to be right: on a valid array of small elements whose
+    /// strings are full of commas, brackets, quotes and backslash runs, accurate cuts mean every
+    /// piece parses, so the parallel path must be taken every time. A wrong cut (a string state lost
+    /// across a chunk, a depth miscounted, an escaped quote taken for a delimiter) only makes a piece
+    /// fail and the call decline, which the decline-or-equal test above cannot see.
+    #[test]
+    fn parallel_json_cuts_land_on_top_level_commas_despite_nasty_strings() {
+        if crate::par::Pool::global().width() < 2 {
+            return;
+        }
+        const NASTY: &[&str] = &[
+            "a,b",
+            "x]y",
+            "[,]",
+            "{\"k\":1}",
+            "q\"uote",
+            "q\"uote,",
+            "back\\slash",
+            "ends\\",
+            "\\\\",
+            "\\\"",
+            "\"\"",
+            ",",
+            "],[",
+            "}{",
+            "[[[",
+            "]]]",
+            "{\"a\":[1,2,{\"b\":\"c,d\"}]}",
+            "日本,語",
+            "\\u0022,",
+            // an odd number of escaped quotes followed by closers and commas: a quote wrongly taken
+            // for a delimiter would flip the string state and expose them as structure
+            "a\"]]",
+            "a\"[[,",
+            "x\",\"y",
+            "}\"{,",
+            "\"}]",
+        ];
+        let mut r = Rng(0xA11C_E5EE_D0DE_F00D);
+        let mut declined = 0usize;
+        for _ in 0..3000 {
+            let n = 16 + r.below(45);
+            let items: Vec<String> = (0..n)
+                .map(|_| {
+                    let fields: Vec<String> = (0..=r.below(4))
+                        .map(|i| {
+                            let text = NASTY[r.below(NASTY.len())];
+                            format!("{}:{}", json_string(&format!("k{i}")), json_string(text))
+                        })
+                        .collect();
+                    format!("{{{}}}", fields.join(","))
+                })
+                .collect();
+            let text = format!("[{}]", items.join(","));
+            let sequential = JsonParser::<Owned>::new(&text, false)
+                .parse()
+                .expect("the generated document is valid JSON");
+            match parse_json_parallel::<Owned>(&text, 1) {
+                Some(Ok(got)) => assert_eq!(sequential, got, "differs on {text:?}"),
+                Some(Err(e)) => panic!("error {e:?} on a valid document {text:?}"),
+                None => declined += 1,
+            }
+        }
+        assert_eq!(
+            declined, 0,
+            "the parallel path declined {declined} valid documents: a cut missed"
+        );
+    }
+
     /// Line-level edits for YAML: delete, duplicate, insert margin and indented lines, shift
     /// indentation, and the occasional byte edit.
     fn mutate_yaml(r: &mut Rng, text: &str) -> String {
