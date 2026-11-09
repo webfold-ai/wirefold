@@ -20,7 +20,9 @@ All notable changes to this crate are documented in this file. The format follow
 - `codec::syntax::SyntaxTermRef`, `AtomRef` and `parse_surface_ref`: parse JSON and YAML into a term whose keys
   and scalars borrow from the input where the input already holds the exact text. About twice as fast as
   `parse_surface` and faster than `serde_json::Value`; `into_owned` converts back. Other surfaces work with the
-  same call but save nothing.
+  same call but save nothing. For JSON and YAML documents of 512 KiB or more whose top level is an array or a
+  margin-level block sequence, `parse_surface_ref` parses the elements in parallel on apeiron's worker pool, with
+  an identical result (-40% JSON, -49% YAML on 100,000 records with 4 cores).
 
 ### Fixed
 

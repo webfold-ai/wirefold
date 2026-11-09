@@ -812,6 +812,123 @@ impl<'a> Build<'a> for Borrowed {
     }
 }
 
+/// Smallest chunk, in bytes, worth a task: below this the pool's dispatch costs more than parsing.
+pub(super) const PAR_JSON_CHUNK: usize = 256 * 1024;
+
+/// Parse a JSON document whose top level is an array as a fold over its elements on the shared
+/// worker pool, or `None` if the document should be parsed the ordinary way.
+///
+/// An array is the concatenation of its elements and list concatenation is associative, so the
+/// body can be cut at commas, each piece parsed on its own, and the results joined in piece order
+/// (the pool's static partition is schedule-free, so the answer cannot depend on which core ran
+/// which piece). The result is exactly what [`JsonParser::parse`] returns, by this argument: the
+/// document is `[` body `]`, and if every piece is a valid comma-separated run of values then the
+/// body is one, and the sequential parser reads it as those values in that order. That holds
+/// wherever the cuts fall, so a cut in the wrong place (inside a string or a nested container, say)
+/// makes a piece fail to parse, never a different result. `None` is returned for anything not
+/// settled by the argument: not an array, too small, a piece that fails (the sequential parser then
+/// produces the error, so messages are unchanged), or a pool of one.
+///
+/// Cost: one pass over the bytes to place the cuts, O(n) and sequential, then the parse of n/w bytes
+/// per worker for a pool of width w, then O(items) to join. Extra space: the joined item list.
+pub(super) fn parse_json_parallel<'a, B>(
+    input: &'a str,
+    min_chunk: usize,
+) -> Option<Result<B::Term, SyntaxError>>
+where
+    B: Build<'a>,
+    B::Term: Send,
+    B::Text: Send,
+{
+    use std::sync::Mutex;
+    // Too small for two pieces: decline before touching the pool, so a small input never pays to
+    // start its workers.
+    if input.len() / min_chunk.max(1) < 2 {
+        return None;
+    }
+    let pool = crate::par::Pool::global();
+    let bytes = input.as_bytes();
+    let first = bytes.iter().position(|b| !b.is_ascii_whitespace())?;
+    let last = bytes.iter().rposition(|b| !b.is_ascii_whitespace())?;
+    if bytes[first] != b'[' || bytes[last] != b']' || first == last {
+        return None;
+    }
+    // The body, between the brackets.
+    let (lo, hi) = (first + 1, last);
+    let width = pool.width();
+    let pieces = (hi - lo) / min_chunk.max(1);
+    let pieces = pieces.min(width);
+    if pieces < 2 {
+        return None;
+    }
+    // Cut at the first top-level comma at or after each equal share of the body. "Top level" is the
+    // scan's best guess (outside strings, one container deep); correctness does not rest on it.
+    let share = (hi - lo) / pieces;
+    let mut cuts: Vec<usize> = Vec::with_capacity(pieces - 1);
+    let mut next_target = lo + share;
+    let (mut i, mut depth) = (lo, 0usize);
+    while i < hi && cuts.len() < pieces - 1 {
+        match bytes[i] {
+            b'"' => {
+                i += 1;
+                loop {
+                    match bytes.get(i)? {
+                        b'"' => break,
+                        b'\\' => i += 2,
+                        _ => i += 1,
+                    }
+                }
+            }
+            b'[' | b'{' => depth += 1,
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 && i >= next_target => {
+                cuts.push(i);
+                next_target = i + share;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if cuts.len() + 1 < 2 {
+        return None;
+    }
+    // Piece k is body[start_k .. cut_k), the last piece running to `hi`; each cut comma is dropped.
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(cuts.len() + 1);
+    let mut start = lo;
+    for &c in &cuts {
+        ranges.push((start, c));
+        start = c + 1;
+    }
+    ranges.push((start, hi));
+    let slots: Vec<Mutex<Option<Result<Vec<B::Term>, SyntaxError>>>> =
+        ranges.iter().map(|_| Mutex::new(None)).collect();
+    pool.dispatch(ranges.len(), |t| {
+        let (a, b) = ranges[t];
+        let parsed = JsonParser::<B>::new(&input[a..b], false)
+            .starting_at_depth(1)
+            .array_body();
+        *slots[t]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(parsed);
+    });
+    let mut parts: Vec<Vec<B::Term>> = Vec::with_capacity(slots.len());
+    for slot in slots {
+        match slot
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            Some(Ok(items)) => parts.push(items),
+            // A failed or missing piece: let the sequential parser decide, and word the error.
+            _ => return None,
+        }
+    }
+    let mut all = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+    for part in parts {
+        all.extend(part);
+    }
+    Some(Ok(B::list(all)))
+}
+
 /// `loose == false` is the strict RFC 8259 grammar (what [`Surface::Json`](super::Surface::Json)
 /// uses): no control characters in strings, only the escapes the RFC defines, no leading zeros,
 /// no trailing commas, and a repeated object key is an error (the RFC leaves duplicates to the
@@ -845,6 +962,29 @@ impl<'a, B: Build<'a>> JsonParser<'a, B> {
             fields: Vec::new(),
             items: Vec::new(),
         }
+    }
+
+    /// Start with `depth` containers already open, for a parser handed the inside of one.
+    fn starting_at_depth(mut self, depth: usize) -> Self {
+        self.depth = depth;
+        self
+    }
+
+    /// The elements of an array whose brackets are not in the text: `value (, value)*` to the end.
+    /// Any deviation (an empty text, a missing or trailing comma, leftover input) is an error, so a
+    /// text that is not exactly a comma-separated run of values never parses.
+    fn array_body(mut self) -> Result<Vec<B::Term>, SyntaxError> {
+        let base = self.items.len();
+        loop {
+            let item = self.value()?;
+            self.items.push(item);
+            self.ws();
+            if self.pos == self.s.len() {
+                break;
+            }
+            self.expect(b',')?;
+        }
+        Ok(self.items.drain(base..).collect())
     }
 
     /// Override the nesting limit (default [`MAX_NESTING_DEPTH`]).

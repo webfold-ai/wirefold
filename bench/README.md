@@ -18,7 +18,8 @@ Parser speed for every text surface, with serde_json as the JSON reference:
 ```bash
 cargo run --release -- parse            # all surfaces, each in its own process, 20000 records
 cargo run --release -- parse yaml       # just one surface
-cargo run --release -- parse json-ref   # the borrowing parser (also yaml-ref)
+cargo run --release -- parse json-ref   # the borrowing parser (also yaml-ref); parallel over 512 KiB
+HASHTRINITY_POOL_WIDTH=1 cargo run --release -- parse json-ref 100000   # the same on one thread
 cargo run --release -- parse serde 100000   # the serde_json reference alone, any record count
 ```
 

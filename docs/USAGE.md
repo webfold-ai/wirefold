@@ -92,6 +92,11 @@ other surfaces are parsed as usual and converted, so they work with the same cal
 JSON about twice as fast as `parse_surface` and faster than `serde_json::Value`; see
 [BENCHMARKS.md](BENCHMARKS.md).
 
+For a JSON or YAML document of 512 KiB or more whose top level is an array or a margin-level sequence, it
+parses the elements in parallel on apeiron's worker pool (set `HASHTRINITY_POOL_WIDTH=1` for one thread). The
+result is identical; see [BENCHMARKS.md](BENCHMARKS.md#parallel-parsing-of-the-borrowed-term) for when and why
+that is sound. `parse_surface` itself stays on one thread.
+
 Rendering takes the owned `SyntaxTerm`; call `into_owned` first.
 
 ## Compression

@@ -5999,13 +5999,14 @@ pub mod syntax {
 
     pub use rdf::{parse_rdfxml, parse_turtle, render_rdfxml, render_turtle};
     pub use yaml::parse_yaml;
-    use yaml::parse_yaml_with;
+    use yaml::{parse_yaml_parallel, parse_yaml_with, PAR_YAML_CHUNK};
 
     use super::{compress, decompress};
     use surfaces::{
         parse_baml, parse_csv, parse_poml, parse_toon, render_baml_term, render_csv, render_json,
         render_poml, render_toon, Borrowed, JsonParser, Owned,
     };
+    use surfaces::{parse_json_parallel, PAR_JSON_CHUNK};
     use yaml::render_yaml;
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6493,8 +6494,14 @@ pub mod syntax {
         input: &str,
     ) -> Result<SyntaxTermRef<'_>, SyntaxError> {
         match surface {
-            Surface::Json => JsonParser::<Borrowed>::new(input, false).parse(),
-            Surface::Yaml => parse_yaml_with::<Borrowed>(input),
+            Surface::Json => match parse_json_parallel::<Borrowed>(input, PAR_JSON_CHUNK) {
+                Some(parsed) => parsed,
+                None => JsonParser::<Borrowed>::new(input, false).parse(),
+            },
+            Surface::Yaml => match parse_yaml_parallel::<Borrowed>(input, PAR_YAML_CHUNK) {
+                Some(parsed) => parsed,
+                None => parse_yaml_with::<Borrowed>(input),
+            },
             other => parse_surface(other, input).map(SyntaxTermRef::from_owned),
         }
     }

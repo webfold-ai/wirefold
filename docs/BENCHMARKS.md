@@ -20,8 +20,9 @@ from runs described there.
   about 1 second) and 16 to 24 seconds to decode (zstd: about 4 to 8 ms). Use it when ratio matters more than
   time, for example archival.
 - **Parsing text into a generic tree:** wirefold's owned JSON parser is level with `serde_json::Value`, and
-  `parse_surface_ref`, which borrows strings from the input, is about 1.8 times faster than it (8 to 9 ms
-  against 16 ms for 20,000 records). The other surfaces parse at 74 to 130 MB/s. See [Parsing](#parsing).
+  `parse_surface_ref`, which borrows strings from the input, is about 1.8 times faster than it on one thread,
+  and about 3 times faster on a pool of 4 for documents over 512 KiB (26 ms against about 110 ms for 100,000
+  records). The other surfaces parse at 74 to 130 MB/s. See [Parsing](#parsing).
 - **Rendering a tree to text:** YAML, TOON, CSV and POML render 3 to 7 times faster than they did, and JSON
   rendering was already tight. See [Rendering](#rendering).
 - **Binary codecs:** MessagePack encoding is about 1.9 times faster and protobuf encoding about 1.7 times;
@@ -122,6 +123,49 @@ byte by byte, and not allocating for the CSV columns and TOON path segments.
 The owned term still owns a `String` for every key and scalar, which is most of what is left. The borrowed term
 (`SyntaxTermRef`) removes it: a string with no escapes, a number, a plain YAML scalar or an unquoted key is a
 slice of the input. Use it when the tree is read and dropped, or kept no longer than the input.
+
+### Parallel parsing of the borrowed term
+
+An array is the concatenation of its elements, and list concatenation is associative, so a document whose top
+level is an array (JSON) or a block sequence at the left margin (YAML) is a fold over its elements.
+`parse_surface_ref` cuts such a document at element boundaries, parses the pieces on apeiron's `Pool` (a static,
+schedule-free partition: the answer cannot depend on which core ran which piece), and joins the results in piece
+order. It applies from 512 KiB up; below that the path is unchanged.
+
+100,000 records (8.2 MB JSON, 8.4 MB YAML), `cargo run --release -- parse json-ref 100000`, mean of 5 runs with
+the observed range, on 4 cores. One thread is `HASHTRINITY_POOL_WIDTH=1`.
+
+| document | one thread (ms) | pool of 4 (ms) | change |
+|---|---:|---:|---:|
+| JSON, borrowed | 43.7 (41.8 to 48.1) | 26.0 (22.9 to 29.8) | -40% |
+| YAML, borrowed | 82.5 (78.1 to 95.2) | 42.3 (40.5 to 43.8) | -49% |
+
+For reference the owned parsers take 90.8 ms (JSON) and 139.9 ms (YAML) on the same documents, and they are not
+parallel: the owned term allocates a `String` per key and scalar on the worker threads and then frees them from
+the thread that drops the tree, and dropping got slower by about as much as parsing got faster (parse 57 to 69
+ms down to 38 to 42 ms, drop 32 to 36 ms up to 38 to 45 ms, net 79.9 ms to 76.9 ms, inside the spread). A change
+inside the spread is not a change, so `parse_surface` stays sequential.
+
+Why the result is the same as the sequential parse:
+
+- JSON: the document is `[` body `]`. If every piece is a valid comma-separated run of values, the body is one,
+  and the sequential parser reads it as exactly those values in that order, wherever the cuts fell. A cut in the
+  wrong place (inside a string or a nested container) makes a piece fail, never a different result. Any failing
+  piece makes the call decline, and the sequential parser then produces the result or the error, so messages are
+  unchanged.
+- YAML: the cuts are at margin dash lines, and a piece must parse as a sequence and leave no line unread. An item
+  the sequential parser would stop inside (after which it ignores everything) leaves lines unread, so such a
+  document is declined. What an item looks ahead to at its end is the next margin dash line, which for an item and
+  for the end of a piece alike means "no more of this item".
+- Checked by `parallel_parse` in `src/codec/syntax/tests.rs`: tens of thousands of generated and mutated
+  documents with a one-byte chunk floor, requiring that the parallel parse either declines or equals the
+  sequential one, and never returns a value where the sequential parser reports an error. Mutating the
+  implementation (accepting trailing garbage in a piece, ignoring unread lines, cutting mid-line) turns the test
+  red, and restoring it turns it green. On the 8 MB documents the result equals the owned parse at pool widths 1,
+  2 and 4.
+
+Not covered: the cut-finding pass is sequential (about 7.6 ms of the 26 ms for JSON), and the gain depends on the
+machine having idle cores. The pool's workers spin briefly between dispatches, as documented in apeiron.
 
 How to read these numbers:
 

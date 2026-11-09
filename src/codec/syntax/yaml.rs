@@ -43,6 +43,125 @@ pub(super) fn parse_yaml_with<'a, B: Build<'a>>(input: &'a str) -> Result<B::Ter
     }
 }
 
+/// Smallest chunk, in bytes, worth a task for a YAML document.
+pub(super) const PAR_YAML_CHUNK: usize = 256 * 1024;
+
+/// Parse a YAML document that is a block sequence at the left margin as a fold over its items on the
+/// shared worker pool, or `None` if it should be parsed the ordinary way.
+///
+/// The document is the concatenation of its items, and each item runs from one margin dash to the
+/// next. The document is cut at the start of margin dash lines (`-` or `- ...` with no indent), so
+/// each piece is whole lines, and each piece is parsed as a sequence. The result equals
+/// [`parse_yaml_with`]'s when every piece parses *and leaves no line unread*; otherwise `None` is
+/// returned, and the sequential parser produces the result or the error, so messages are unchanged.
+/// The unread-lines condition is what makes this sound: an item the sequential parser would have
+/// stopped inside (a margin line that is not a dash, or over-indented text), after which it ignores
+/// everything, leaves lines unread in its piece, so a document with one is declined rather than
+/// parsed past it.
+///
+/// With that, the sequential parse reads each item exactly as its piece does. What an item looks
+/// ahead to at its end is the next margin dash line, which for an item and for the end of a piece
+/// alike means "no more of this item": a key with nothing after it is null, a block scalar ends, a
+/// nested block ends. A cut in the wrong place cannot yield a different result, only a failing
+/// piece.
+///
+/// Cost: one pass over the lines to find the margin dashes, O(n); then the parse of n/w bytes per
+/// worker for a pool of width w; then O(items) to join.
+pub(super) fn parse_yaml_parallel<'a, B>(
+    input: &'a str,
+    min_chunk: usize,
+) -> Option<Result<B::Term, SyntaxError>>
+where
+    B: Build<'a>,
+    B::Term: Send,
+    B::Text: Send,
+{
+    use std::sync::Mutex;
+    // Too small for two pieces: decline before touching the pool, so a small input never pays to
+    // start its workers.
+    if input.len() / min_chunk.max(1) < 2 {
+        return None;
+    }
+    let pool = crate::par::Pool::global();
+    let pieces = (input.len() / min_chunk.max(1)).min(pool.width());
+    if pieces < 2 {
+        return None;
+    }
+    let bytes = input.as_bytes();
+    let share = input.len() / pieces;
+    let mut cuts: Vec<usize> = Vec::with_capacity(pieces - 1);
+    let mut next_target = share;
+    let mut start = 0;
+    while start < bytes.len() {
+        let end = bytes[start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(bytes.len(), |i| start + i);
+        // a line the way `str::lines` sees it: without its newline or a carriage return before it
+        let line = input[start..end]
+            .strip_suffix('\r')
+            .unwrap_or(&input[start..end]);
+        let is_margin_dash = line == "-" || line.starts_with("- ");
+        if is_margin_dash && start >= next_target && cuts.len() + 1 < pieces {
+            cuts.push(start);
+            next_target = start + share;
+        }
+        start = (end + 1).min(bytes.len());
+    }
+    if cuts.is_empty() {
+        return None;
+    }
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(cuts.len() + 1);
+    let mut from = 0;
+    for &c in &cuts {
+        ranges.push((from, c));
+        from = c;
+    }
+    ranges.push((from, input.len()));
+    let slots: Vec<Mutex<Option<Result<Vec<B::Term>, SyntaxError>>>> =
+        ranges.iter().map(|_| Mutex::new(None)).collect();
+    pool.dispatch(ranges.len(), |t| {
+        let (a, b) = ranges[t];
+        let lines: Vec<&'a str> = input[a..b].lines().collect();
+        let mut p = YamlParser::<B> {
+            lines,
+            pos: 0,
+            // one block (the sequence) is open, as `parse_block` would have counted it
+            depth: 1,
+            fields: Vec::new(),
+            items: Vec::new(),
+        };
+        let parsed = match p.peek_indent() {
+            Some(0) => p.sequence_items(0).and_then(|items| {
+                if p.peek_indent().is_some() {
+                    Err(SyntaxError::new("lines left unread"))
+                } else {
+                    Ok(items)
+                }
+            }),
+            _ => Err(SyntaxError::new("not a sequence at the margin")),
+        };
+        *slots[t]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(parsed);
+    });
+    let mut parts: Vec<Vec<B::Term>> = Vec::with_capacity(slots.len());
+    for slot in slots {
+        match slot
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            Some(Ok(items)) => parts.push(items),
+            _ => return None,
+        }
+    }
+    let mut all = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+    for part in parts {
+        all.extend(part);
+    }
+    Some(Ok(B::list(all)))
+}
+
 fn line_indent(line: &str) -> usize {
     line.bytes().take_while(|&b| b == b' ').count()
 }
@@ -269,6 +388,11 @@ impl<'a, B: Build<'a>> YamlParser<'a, B> {
     }
 
     fn parse_sequence(&mut self, indent: usize) -> Result<B::Term, SyntaxError> {
+        Ok(B::list(self.sequence_items(indent)?))
+    }
+
+    /// The items of the block sequence whose dashes sit at `indent`.
+    fn sequence_items(&mut self, indent: usize) -> Result<Vec<B::Term>, SyntaxError> {
         let base = self.items.len();
         while let Some(cur) = self.peek_indent() {
             if cur != indent {
@@ -298,7 +422,7 @@ impl<'a, B: Build<'a>> YamlParser<'a, B> {
             };
             self.items.push(item);
         }
-        Ok(B::list(self.items.drain(base..).collect()))
+        Ok(self.items.drain(base..).collect())
     }
 
     fn parse_mapping(&mut self, indent: usize) -> Result<B::Term, SyntaxError> {
