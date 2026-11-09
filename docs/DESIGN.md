@@ -50,8 +50,10 @@ on the serde ecosystem, serde is the right choice.
 These are row-wise (bincode, postcard) or archive-in-place (rkyv). They are fast and small, and the benchmark
 shows them winning some rows: bincode and rkyv decode a full vector of records as fast as or faster than
 wirefold, and rkyv's validated column read beats wirefold's. What columnar layout buys is the case those formats
-cannot serve cheaply, reading one field of many records without touching the rest, and a layout that a
-byte-oriented coder compresses better because like values sit together (the compressed telemetry row).
+cannot serve cheaply: reading one field of many records without touching the rest. It does not buy smaller
+compressed output on the benchmark data: after zstd -19 the telemetry records are 207,470 bytes as `Collapse`
+against 199,079 for bincode and 194,386 for postcard, because the varint and in-place encodings of those
+formats leave less for the compressor to remove than fixed-width columns do.
 
 ## Parsing as a fold
 

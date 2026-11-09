@@ -15,6 +15,10 @@ All notable changes to this crate are documented in this file. The format follow
   encodes the telemetry benchmark in 127 ms (was 3.5 s) and decodes it in 2.0 ms (was 1.5 s), at 39% larger
   output on that data. zstd -1 does the same in 2.0 ms and 1.2 ms with 237,083 bytes, so compress with zstd when
   compression matters. `Collapse` serialization is unchanged and independent of it.
+- The benchmark harness now measures pipelines: each serializer raw and followed by zstd (levels 1, 3, 6, 19) and
+  by `compress()`, with serialize/compress and decompress/deserialize timed separately and Rust-side allocations
+  counted, replacing rows that timed a compressor on bytes serialized outside the timer. The docs no longer claim
+  the columnar layout compresses smaller: after zstd -19 `Collapse` is larger than bincode and postcard.
 - Breaking, `compress` feature: the stream begins with a version byte (`cm::VERSION`, now 1) and a reader refuses any
   other version with `DecodeError::UnsupportedVersion`. Streams from the previous coder, which had no version byte,
   are intentionally not supported. The `k: usize` argument is replaced by `cm::Order::{Zero, One}` (`compress_at`

@@ -1,17 +1,20 @@
 # wirefold-bench
 
-wirefold against serde_json, bincode, postcard, rmp-serde and rkyv on the same records, plus zstd -19 as
-the usual "serialize, then compress" baseline. It lives outside the library workspace (it has its own
-`[workspace]`) so the library stays dependency-free.
+wirefold against serde_json, bincode, postcard, rmp-serde and rkyv on the same records, as pipelines: each
+serializer on its own and followed by zstd (levels 1, 3, 6 and 19) and by wirefold's own `compress()`. It lives
+outside the library workspace (it has its own `[workspace]`) so the library stays dependency-free, and zstd is
+here only as a baseline.
 
 ```bash
 cd bench
 cargo run --release -- 20000       # records [and runs per cell]; default 20000 records, 3 runs
 ```
 
-It prints markdown tables. Every encoder is round-trip checked before it is timed, and each cell runs in a fresh process and
-the table gives the mean of 3 runs with the range. Run it on an otherwise idle machine: other CPU work changes
-the numbers. A full run takes about a minute.
+It prints markdown tables. Every pipeline is round-trip checked before it is timed and runs in a fresh process;
+the table gives the mean of 3 runs with the range. Encode is serialize then compress and decode is decompress
+then deserialize, with each stage timed on its own, and the Rust-side allocations of one encode and one decode
+are counted. Run it on an otherwise idle machine: other CPU work changes the numbers. A full run takes about two
+minutes.
 
 Parser speed for every text surface, with serde_json as the JSON reference:
 
@@ -39,10 +42,11 @@ Results and how to read them: [`../docs/BENCHMARKS.md`](../docs/BENCHMARKS.md).
 
 - **Two datasets.** Telemetry-shaped records (increasing timestamps, small domains, repeated names) and
   random records, the worst case for a columnar model.
-- **Encode, decode all, size**, for each format.
+- **Pipelines**: size, encode (serialize + compress) and decode (decompress + deserialize) with the stages timed
+  separately, and allocation counts, for each serializer raw and with each compressor.
 - **Reading one column** of a packed buffer without decoding the rest (wirefold and rkyv read in place;
   the serde formats decode everything first).
-- **JSON text into a generic tree**: wirefold's `parse_surface(Json)` against `serde_json::Value`.
+- **JSON text into a generic tree** (`parse` mode): wirefold's `parse_surface(Json)` against `serde_json::Value`.
 
 ## What it does not measure
 
