@@ -15,6 +15,12 @@ All notable changes to this crate are documented in this file. The format follow
   encodes the telemetry benchmark in 127 ms (was 3.5 s) and decodes it in 2.0 ms (was 1.5 s), at 39% larger
   output on that data. zstd -1 does the same in 2.0 ms and 1.2 ms with 237,083 bytes, so compress with zstd when
   compression matters. `Collapse` serialization is unchanged and independent of it.
+- Fixed: `ValidationErrors::merge_nested` leaked a `String` for every nested failing field on every call. Field
+  names are now `Cow<'static, str>`, so nested names are freed with the error set. Found by AddressSanitizer's
+  leak check on the library tests.
+- CI gains AddressSanitizer and ThreadSanitizer jobs. Locally, the library and integration tests pass under both,
+  Miri finds no undefined behaviour in the tANS, Huffman and `web` module tests or the derive tests, and each fuzz
+  target ran 4 minutes without a crash.
 - Documentation correction: `Collapse` stores the scalar fields of a record slice as one row-major array of packed
   records and only variable-length fields as columns; earlier text called the whole layout columnar. The
   benchmarks now include compressing the scalar fields plane by plane (a bench-only split): 166,713 bytes against
