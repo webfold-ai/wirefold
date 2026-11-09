@@ -63,10 +63,12 @@ impl fmt::Display for ValidationError {
 /// The collected validation failures for one value — the `validator::ValidationErrors`
 /// masquerade. Keyed by field name; each field can carry more than one failure (matching the
 /// real crate's `HashMap<&'static str, Vec<ValidationError>>` shape via a `BTreeMap` instead, for
-/// deterministic `Debug` output — nothing here relies on hash order).
+/// deterministic `Debug` output — nothing here relies on hash order). A field name is borrowed when it
+/// is a literal and owned when it was built by [`merge_nested`](Self::merge_nested), so nested names
+/// are freed with the error set rather than leaked.
 #[derive(Clone, Debug, Default)]
 pub struct ValidationErrors {
-    errors: BTreeMap<&'static str, Vec<ValidationError>>,
+    errors: BTreeMap<Cow<'static, str>, Vec<ValidationError>>,
 }
 
 impl ValidationErrors {
@@ -78,15 +80,17 @@ impl ValidationErrors {
 
     /// Record one field's failure.
     pub fn add(&mut self, field: &'static str, error: ValidationError) {
-        self.errors.entry(field).or_default().push(error);
+        self.errors
+            .entry(Cow::Borrowed(field))
+            .or_default()
+            .push(error);
     }
 
     /// Merge in a nested value's own `ValidationErrors`, prefixing each field name with
     /// `parent_field.` (matching `validator`'s own nested-error field naming).
     pub fn merge_nested(&mut self, parent_field: &'static str, nested: ValidationErrors) {
         for (field, errs) in nested.errors {
-            let combined: &'static str =
-                Box::leak(format!("{parent_field}.{field}").into_boxed_str());
+            let combined = Cow::Owned(format!("{parent_field}.{field}"));
             self.errors.entry(combined).or_default().extend(errs);
         }
     }

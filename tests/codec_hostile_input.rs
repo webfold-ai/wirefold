@@ -430,11 +430,14 @@ fn fuzz_msgpack_decode() {
 
 #[test]
 fn msgpack_deep_nesting_is_an_error_not_a_stack_overflow() {
-    // 200_000 nested one-element arrays: recursion depth must be bounded.
+    // 200_000 nested one-element arrays: recursion depth must be bounded. The decoder stops at depth 128,
+    // which needs about 95 KiB in a release build and about 0.9 MiB in a debug build (more under a
+    // sanitizer), while 200,000 unbounded levels would need over 150 MB, so 8 MiB separates the two
+    // with room on both sides.
     let mut bytes = vec![0x91u8; 200_000];
     bytes.push(0xc0);
     let h = std::thread::Builder::new()
-        .stack_size(1 << 20)
+        .stack_size(8 << 20)
         .spawn(move || codec::msgpack::decode(&bytes).is_err())
         .unwrap();
     assert!(h.join().expect("decode must not overflow the stack"));
