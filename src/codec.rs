@@ -50,18 +50,13 @@ pub mod cm {
     //! selected per order by occupancy ([`OrderStore`]). Each order's `(n0,n1)` counter is a coordinate
     //! key `(ctx % 256ᵒ)·256 + nd`; where the coordinate space `S_o` is small enough to be ~fully
     //! occupied (`S_o ≤ 8n`) it rides an exact [`CoordMap`] (the **B** face, worst-probe-1, no fold),
-    //! and where it is a high-entropy sparse space it rides a [`FreqMap`] (the **NB** fold, `2⁻⁶⁴`
-    //! false-positive, load-managed growth). The exact-sparse `Table`/`Stored` (B/U) face is unused: the
-    //! codec never reads a key back and a `2⁻⁶⁴` mis-blend only costs a hair of ratio.
-    //!
-    //! This REPLACES the old fixed `2²²`-cap dense array: because [`FreqMap`] grows to hold the distinct
-    //! contexts (bounded by the buffer, not the alphabet) it de-collides the high orders the cap forced
-    //! to blend — a measured +6% (C4) / +9% (Lean) ratio. Lossless by construction: the maps are
-    //! seedless-deterministic (no `SipHash`, no random seed), so the identical encode/decode key streams // LOOP-EXEMPT: prose reference
+    //! and where it is a high-entropy sparse space it rides a nibble-bucket hash table (`NibbleTable`:
+    //! one cache-line bucket per context and nibble, checked by a 32-bit tag, sized from the buffer).
+    //! Lossless by construction: the tables are seedless-deterministic (no `SipHash`, no random seed), so the identical encode/decode key streams // LOOP-EXEMPT: prose reference
     //! grow byte-identical stores, and the count updates match.
 
     use super::{read_uvarint, try_vec, DecodeError};
-    use crate::{CoordMap, FreqMap};
+    use crate::CoordMap;
 
     const PROB_M: u64 = 16384; // 1<<14 — the rANS frequency total
     const RANS_L: u64 = 8_388_608; // 1<<23 — the rANS renorm floor
@@ -150,12 +145,11 @@ pub mod cm {
     /// reads a key back and a `2⁻⁶⁴` mis-blend only costs a hair of ratio, so per the library's own
     /// guidance it never reaches for the key-storing table.
     ///   * `Dense` (**B**, a [`CoordMap`]) — the coordinate space is small enough to be ~fully occupied    ///     (`S_o ≤ 8n`, ≥ one bit-event per coordinate on average); every key has an exact home, no fold.
-    ///   * `Diffuse` (**NB**, [`FreqMap`]) — a high-entropy sparse space; the growing, load-managed fold
-    ///     (`2⁻⁶⁴` false-positive). It resizes to keep load ~0.5 — that is what de-collides the high
-    ///     orders the old fixed `2²²` cap forced to blend (the measured +6–9% ratio).
+    ///   * `Diffuse` (a [`NibbleTable`]) — a high-entropy sparse space: one cache-line bucket per
+    ///     context and nibble, found once and indexed by the partial-nibble path.
     enum OrderStore {
         Dense(CoordMap<u64, (u16, u16)>),
-        Diffuse(FreqMap<u64, (u16, u16)>),
+        Diffuse(NibbleTable),
     }
 
     /// The per-bit count merge — add the incoming `(n0,n1)` event into the cell, halving both on the
@@ -174,37 +168,126 @@ pub mod cm {
         (n0 as u16, n1 as u16)
     }
 
+    /// One 64-byte bucket: the counts for the 15 nodes of one nibble of the coded byte (cell `1..=15`,
+    /// indexed by the partial-nibble path) and, in cell 0, a 32-bit check of the context that owns it.
+    #[derive(Clone, Copy)]
+    #[repr(C, align(64))]
+    struct Bucket([(u16, u16); 16]);
+
+    /// A diffuse count store keyed per NIBBLE, not per bit. The old layout hashed `(context, node)` for
+    /// every bit, so each of the 8 bits of a byte was a separate random probe (a cache miss each, twice:
+    /// once to read the counts and once to bump them). Here the context and the nibble's starting node
+    /// pick one cache-line bucket, found once per nibble and then indexed by the partial-nibble path, so
+    /// the read and the later bump of a bit hit the same line and the four bits of a nibble share one
+    /// miss. A context is identified by a 32-bit check; two adjacent buckets are tried and, on a miss,
+    /// the one whose root node has seen fewer events is replaced (a false match, 2⁻³² per probe, costs a
+    /// hair of ratio and never correctness: encode and decode build the same table from the same
+    /// coded prefix). Probe cost is O(1): one hash and at most two bucket checks.
+    struct NibbleTable {
+        buckets: Vec<Bucket>,
+        mask: usize,
+    }
+
+    impl NibbleTable {
+        /// Sized from the buffer: about half a bucket per byte (a byte touches two), at least 2¹⁰ and at
+        /// most 2¹⁸ buckets (16 MiB), a power of two so the index is a mask.
+        fn new(nbytes: usize) -> Self {
+            let n = (nbytes.max(1).next_power_of_two() / 2).clamp(1 << 10, 1 << 18);
+            NibbleTable {
+                buckets: vec![Bucket([(0, 0); 16]); n],
+                mask: n - 1,
+            }
+        }
+
+        /// The cell for tree node `nd` (`1..=255`, the partial byte) under context hash `base`:
+        /// returns `bucket * 16 + cell`. Claims (replaces) a bucket on a miss.
+        #[inline]
+        fn locate(&mut self, base: u64, nd: u64) -> usize {
+            let bi = nd.ilog2(); // bits of this byte coded so far, 0..=7
+            let (start, cell) = if bi < 4 {
+                (1u64, nd)
+            } else {
+                let j = bi - 4;
+                (nd >> j, (1u64 << j) | (nd & ((1u64 << j) - 1)))
+            };
+            let mut h = (base ^ start.wrapping_mul(0xD6E8_FEB8_6659_FD93)).wrapping_mul(GOLD);
+            h ^= h >> 32;
+            h = h.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+            h ^= h >> 29;
+            let chk = (h as u32) | 1; // never 0, so an empty bucket never matches
+            let i0 = (h >> 40) as usize & self.mask;
+            let want = ((chk & 0xFFFF) as u16, (chk >> 16) as u16);
+            let i1 = i0 ^ 1;
+            let slot = if self.buckets[i0].0[0] == want {
+                i0
+            } else if self.buckets[i1].0[0] == want {
+                i1
+            } else {
+                let pri = |b: &Bucket| u32::from(b.0[1].0) + u32::from(b.0[1].1);
+                let v = if pri(&self.buckets[i0]) <= pri(&self.buckets[i1]) {
+                    i0
+                } else {
+                    i1
+                };
+                self.buckets[v] = Bucket([(0, 0); 16]);
+                self.buckets[v].0[0] = want;
+                v
+            };
+            slot * 16 + cell as usize
+        }
+
+        #[inline(always)]
+        fn get(&self, loc: usize) -> (u16, u16) {
+            self.buckets[loc >> 4].0[loc & 15]
+        }
+
+        #[inline(always)]
+        fn bump(&mut self, loc: usize, bit: u64) {
+            let inc = if bit == 1 { (0u16, 1u16) } else { (1u16, 0u16) };
+            let c = &mut self.buckets[loc >> 4].0[loc & 15];
+            *c = cell_merge(*c, inc);
+        }
+    }
+
     impl OrderStore {
         /// Select the face for order `o` over an `nbytes` buffer: dense when the whole coordinate space
-        /// sees ≥ 1 event on average (`S_o ≤ 8·nbytes`), else the diffuse fold sized to the distinct
-        /// contexts (`≤ 8·nbytes`). Derived identically on encode and decode (both know `nbytes`).
+        /// sees ≥ 1 event on average (`S_o ≤ 8·nbytes`), else the diffuse nibble-bucket table. Derived
+        /// identically on encode and decode (both know `nbytes`).
         fn select(o: usize, nbytes: usize) -> Self {
             let events = (nbytes as u64).saturating_mul(8).max(512);
             let s_o = order_space(o);
             if s_o <= events {
                 OrderStore::Dense(CoordMap::coordinate_with_capacity(s_o as usize))
             } else {
-                // grow from a modest floor — the diffuse order's distinct keys are bounded by the buffer,
-                // and FreqMap resize is amortized O(1); pre-allocating the worst case was the 1.25 GB blowup.
-                OrderStore::Diffuse(FreqMap::with_capacity(1 << 12))
+                OrderStore::Diffuse(NibbleTable::new(nbytes))
             }
         }
 
+        /// Read the counts for `(ctx-part, nd)` and return them with the cell location to bump later
+        /// (`usize::MAX` for the dense face, which re-derives its key).
         #[inline(always)]
-        fn get(&self, key: u64) -> (u16, u16) {
+        fn read(&mut self, base: u64, nd: u64) -> ((u16, u16), usize) {
             match self {
-                OrderStore::Dense(m) => m.get(&key).copied().unwrap_or((0, 0)),
-                OrderStore::Diffuse(m) => m.get(&key).copied().unwrap_or((0, 0)),
+                OrderStore::Dense(m) => (
+                    m.get(&(base * 256 + nd)).copied().unwrap_or((0, 0)),
+                    usize::MAX,
+                ),
+                OrderStore::Diffuse(t) => {
+                    let loc = t.locate(base, nd);
+                    (t.get(loc), loc)
+                }
             }
         }
 
+        /// Bump the cell read earlier: `loc` from [`read`](Self::read), `base`/`nd` for the dense face.
         #[inline(always)]
-        fn bump(&mut self, key: u64, bit: u64) {
-            let inc = if bit == 1 { (0u16, 1u16) } else { (1u16, 0u16) };
+        fn bump(&mut self, base: u64, nd: u64, loc: usize, bit: u64) {
             match self {
-                // `cell_merge` is commutative, so the argument order of the two tables' merges is moot.
-                OrderStore::Dense(m) => m.insert_with(key, inc, cell_merge),
-                OrderStore::Diffuse(m) => m.insert_with(&key, inc, cell_merge),
+                OrderStore::Dense(m) => {
+                    let inc = if bit == 1 { (0u16, 1u16) } else { (1u16, 0u16) };
+                    m.insert_with(base * 256 + nd, inc, cell_merge);
+                }
+                OrderStore::Diffuse(t) => t.bump(loc, bit),
             }
         }
     }
@@ -490,8 +573,7 @@ pub mod cm {
         inp: [f64; N_INPUTS],
         sel: usize,
         p_mix: f64,
-        wkey: u64,
-        hikeys: [u64; N_HI],
+        locs: [usize; N_SM], // the cell each count-based input was read from, bumped in `update`
         states: [usize; N_SM], // the StateMap coordinate read for each count-based input
         apm: [(usize, f64); 3],
         gated: bool, // the monad passthrough — the cheap prediction was saturated, expensive lanes skipped
@@ -505,8 +587,8 @@ pub mod cm {
     /// One object shared by encode and decode; both drive it identically off the coded prefix → lossless.
     struct Model {
         store: Store,
-        hi: Vec<FreqMap<u64, (u16, u16)>>, // the hashed high-order stores (one per HI_ORDERS)
-        word: FreqMap<u64, (u16, u16)>,
+        hi: Vec<NibbleTable>, // the hashed high-order stores (one per HI_ORDERS and SPARSE)
+        word: NibbleTable,
         smaps: Vec<StateMap>, // the ICM readouts — one learned state→prob map per count-based input
         mixer: Vec<f64>,      // MIX_CTX × N_INPUTS, the learned logit weights
         apm1: Vec<f64>,
@@ -537,8 +619,8 @@ pub mod cm {
             });
             Model {
                 store: new_store(k, nbytes),
-                hi: (0..N_HI).map(|_| FreqMap::with_capacity(1 << 12)).collect(),
-                word: FreqMap::with_capacity(1 << 12),
+                hi: (0..N_HI).map(|_| NibbleTable::new(nbytes)).collect(),
+                word: NibbleTable::new(nbytes),
                 smaps: (0..N_SM).map(|_| StateMap::new()).collect(),
                 mixer: vec![0.2; MIX_CTX * N_INPUTS], // a small positive prior on every model
                 apm1: apm_init(APM1_ROWS),
@@ -559,7 +641,7 @@ pub mod cm {
         /// function of the coded past, so encode and decode branch identically → lossless.
         #[inline]
         fn predict(
-            &self,
+            &mut self,
             ctx: u64,
             hc: &[u64; N_HI],
             word_hash: u64,
@@ -569,18 +651,14 @@ pub mod cm {
         ) -> (f64, MixState) {
             let mut inp = [0.0f64; N_INPUTS];
             let mut states = [0usize; N_SM];
+            let mut locs = [usize::MAX; N_SM];
             let cheap = GATE_CHEAP.min(self.k);
-            {
-                let (n0, n1) = self.store[0].get(nd);
-                let s = count_state(n0, n1);
-                states[0] = s;
-                inp[0] = stretch(self.smaps[0].prob(s));
-            }
-            for o in 1..=cheap {
-                let key = (ctx % self.mods[o]) * 256 + nd;
-                let (n0, n1) = self.store[o].get(key);
+            for o in 0..=cheap {
+                let base = if o == 0 { 0 } else { ctx % self.mods[o] };
+                let ((n0, n1), loc) = self.store[o].read(base, nd);
                 let s = count_state(n0, n1);
                 states[o] = s;
+                locs[o] = loc;
                 inp[o] = stretch(self.smaps[o].prob(s));
             }
             inp[MATCH_IDX] = match_input(m_pb, m_phit, nd);
@@ -600,8 +678,7 @@ pub mod cm {
                         inp,
                         sel,
                         p_mix: p_cheap,
-                        wkey: 0,
-                        hikeys: [0; N_HI],
+                        locs,
                         states,
                         apm,
                         gated: true,
@@ -611,26 +688,26 @@ pub mod cm {
             }
             // off the monad — gather the expensive diffuse lanes and complete the mix
             for o in cheap + 1..=self.k {
-                let key = (ctx % self.mods[o]) * 256 + nd;
-                let (n0, n1) = self.store[o].get(key);
+                let ((n0, n1), loc) = self.store[o].read(ctx % self.mods[o], nd);
                 let st = count_state(n0, n1);
                 states[o] = st;
+                locs[o] = loc;
                 inp[o] = stretch(self.smaps[o].prob(st));
             }
-            let mut hikeys = [0u64; N_HI];
             for j in 0..N_HI {
-                let key = hc[j].wrapping_mul(GOLD).wrapping_add(nd);
-                hikeys[j] = key;
-                let (n0, n1) = self.hi[j].get(&key).copied().unwrap_or((0, 0));
+                let loc = self.hi[j].locate(hc[j], nd);
+                let (n0, n1) = self.hi[j].get(loc);
                 let st = count_state(n0, n1);
                 states[HI_BASE + j] = st;
+                locs[HI_BASE + j] = loc;
                 inp[HI_BASE + j] = stretch(self.smaps[HI_BASE + j].prob(st));
             }
-            let wkey = word_hash.wrapping_mul(GOLD).wrapping_add(nd);
             {
-                let (n0, n1) = self.word.get(&wkey).copied().unwrap_or((0, 0));
+                let loc = self.word.locate(word_hash, nd);
+                let (n0, n1) = self.word.get(loc);
                 let st = count_state(n0, n1);
                 states[WORD_IDX] = st;
+                locs[WORD_IDX] = loc;
                 inp[WORD_IDX] = stretch(self.smaps[WORD_IDX].prob(st));
             }
             let mut sfull = 0.0;
@@ -652,8 +729,7 @@ pub mod cm {
                     inp,
                     sel,
                     p_mix,
-                    wkey,
-                    hikeys,
+                    locs,
                     states,
                     apm: [(b1, w1), (b2, w2), (b3, w3)],
                     gated: false,
@@ -677,12 +753,8 @@ pub mod cm {
             if st.gated {
                 for o in 0..=st.cheap {
                     self.smaps[o].learn(st.states[o], bit);
-                    let key = if o == 0 {
-                        nd
-                    } else {
-                        (ctx % self.mods[o]) * 256 + nd
-                    };
-                    self.store[o].bump(key, bit);
+                    let b = if o == 0 { 0 } else { ctx % self.mods[o] };
+                    self.store[o].bump(b, nd, st.locs[o], bit);
                 }
                 return;
             }
@@ -698,16 +770,14 @@ pub mod cm {
                 self.smaps[HI_BASE + j].learn(st.states[HI_BASE + j], bit);
             }
             self.smaps[WORD_IDX].learn(st.states[WORD_IDX], bit);
-            self.store[0].bump(nd, bit);
-            for o in 1..=self.k {
-                let key = (ctx % self.mods[o]) * 256 + nd;
-                self.store[o].bump(key, bit);
+            for o in 0..=self.k {
+                let b = if o == 0 { 0 } else { ctx % self.mods[o] };
+                self.store[o].bump(b, nd, st.locs[o], bit);
             }
-            let inc = if bit == 1 { (0u16, 1u16) } else { (1u16, 0u16) };
             for j in 0..N_HI {
-                self.hi[j].insert_with(&st.hikeys[j], inc, cell_merge);
+                self.hi[j].bump(st.locs[HI_BASE + j], bit);
             }
-            self.word.insert_with(&st.wkey, inc, cell_merge);
+            self.word.bump(st.locs[WORD_IDX], bit);
         }
     }
 
@@ -1180,6 +1250,45 @@ pub mod cm {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// `NibbleTable` keeps each (context, node) in its own cell: a re-read finds what was bumped,
+        /// distinct nodes of one context and distinct contexts do not share counts, and every node
+        /// `1..=255` of a byte maps into its nibble's bucket without overlapping another node.
+        #[test]
+        fn nibble_table_cells_are_distinct_and_stable() {
+            let mut t = NibbleTable::new(1 << 16);
+            let mut locs = std::collections::BTreeSet::new();
+            for nd in 1..=255u64 {
+                let loc = t.locate(7, nd);
+                assert!(
+                    locs.insert(loc),
+                    "node {nd} shares a cell with another node"
+                );
+                assert!(loc & 15 != 0, "cell 0 holds the tag, never a count");
+                assert_eq!(t.locate(7, nd), loc, "a re-locate must find the same cell");
+            }
+            for nd in 1..=255u64 {
+                let loc = t.locate(7, nd);
+                for _ in 0..=(nd % 5) {
+                    t.bump(loc, nd & 1);
+                }
+            }
+            for nd in 1..=255u64 {
+                let loc = t.locate(7, nd);
+                let (n0, n1) = t.get(loc);
+                let n = (nd % 5 + 1) as u16;
+                assert_eq!(
+                    (n0, n1),
+                    if nd & 1 == 1 { (0, n) } else { (n, 0) },
+                    "node {nd}"
+                );
+            }
+            // a different context starts empty and is unaffected by the first
+            let other = t.locate(8, 1);
+            assert_eq!(t.get(other), (0, 0));
+            let first = t.locate(7, 1);
+            assert_ne!(t.get(first), (0, 0));
+        }
 
         /// The parallel stride search must pick exactly what a plain sequential scan picks. The
         /// input is an image-like gradient so a non-zero stride really wins (a check that always
@@ -9610,11 +9719,28 @@ fn calib_sample(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
 /// rungs. When the sample IS the whole input (a file ≤ `CALIB`), these bodies are the FINAL ones, so
 /// the caller keeps the winner and never recompresses.
 fn face_bodies(sample: &[u8]) -> [Vec<u8>; 3] {
-    [
-        compress_at(DEFAULT_ORDER, sample),
-        lz::compress(sample),
-        lz::compress_hybrid(sample),
-    ]
+    let code = |face: usize| match face {
+        0 => compress_at(DEFAULT_ORDER, sample),
+        1 => lz::compress(sample),
+        _ => lz::compress_hybrid(sample),
+    };
+    // A sample of two chunks or more already spreads the cm face over the pool inside `compress_at`,
+    // so the faces run one after another. Below that the cm face is one chunk on one core, and the
+    // three faces are independent whole coding passes: run them as one static batch. The bodies, and
+    // so the choice, are identical either way.
+    if sample.len() >= 2 * PAR_CHUNK {
+        return [code(0), code(1), code(2)];
+    }
+    let slots: [std::sync::Mutex<Vec<u8>>; 3] = Default::default();
+    par_tasks(3, |face| {
+        *slots[face]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = code(face);
+    });
+    slots.map(|m| {
+        m.into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    })
 }
 
 /// Pick the face for `bias` given the measured `[cm, lz, hybrid]` sample sizes. `Dense` = the

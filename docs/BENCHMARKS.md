@@ -18,10 +18,13 @@ from runs described there.
   0.22 ms on the telemetry data and 0.26 against 0.11 ms on the random data.
 - **Size with an entropy coder:** wirefold's context-mixing coder produced the smallest output, 14% below
   `postcard + zstd -19` and 19% below `Collapse + zstd -19` on the telemetry data, and 1% below
-  `Collapse + zstd -19` on random data. It costs about 17.7 s to encode 20,000 telemetry records (zstd -19: about
-  0.25 s) and 8.4 s to decode (zstd: about 1 ms), so 25 and 12 microseconds per byte. Use it when ratio matters
-  more than time, for example archival. Its stride search now runs its trials in parallel with byte-identical
-  output (see [DESIGN.md](DESIGN.md)).
+  `Collapse + zstd -19` on random data. It costs about 4.9 s to encode 20,000 telemetry records (zstd -19: about
+  0.25 s) and 3.4 s to decode (zstd: about 1 ms), so about 7 and 5 microseconds per byte. That is 3.6 times faster to
+  encode and 2.4 times faster to decode than the version measured earlier on this page (17.7 s and 8.4 s), at
+  0.08% larger output (168,287 against 168,148 bytes) on the telemetry data. On the random data it is 5.2 times
+  faster to encode (33.4 s to 6.4 s) and 2.9 times faster to decode (10.5 s to 3.6 s). It is still about 20 times
+  slower than zstd -19 to encode and thousands of times slower to decode. Use it when ratio matters more than time,
+  for example archival. What changed is in [DESIGN.md](DESIGN.md#the-context-mixing-coder).
 - **Parsing text into a generic tree:** wirefold's owned JSON parser is level with `serde_json::Value`, and
   `parse_surface_ref`, which borrows strings from the input, is about 1.8 times faster than it on one thread,
   and about 5 times faster on a pool of 4 for documents over 512 KiB (23 ms against about 110 ms for 100,000
@@ -58,7 +61,7 @@ instead the mean and range over three whole processes, one run each, because a r
 | format | size (bytes) | bytes/record | encode (ms) | decode all (ms) |
 |---|---:|---:|---:|---:|
 | wirefold Collapse | 713116 | 35.7 | 0.15 (0.14 to 0.17) | 1.34 (1.14 to 1.67) |
-| wirefold Collapse + cm coder | 168148 | 8.4 | 17,700 (16,451 to 18,642) | 8,422 (8,312 to 8,541) |
+| wirefold Collapse + cm coder | 168287 | 8.4 | 4,925 (4,618 to 5,162) | 3,440 (3,397 to 3,492) |
 | wirefold Collapse + zstd -19 | 207470 | 10.4 | 258.61 (246.48 to 273.54) | 0.84 (0.75 to 0.94) |
 | bincode 1.3 | 713060 | 35.7 | 0.17 (0.15 to 0.18) | 0.74 (0.72 to 0.78) |
 | postcard | 492525 | 24.6 | 0.45 (0.44 to 0.46) | 0.91 (0.89 to 0.94) |
@@ -81,7 +84,7 @@ Sum one `f64` column of 20000 records (open + read, no full decode):
 | format | size (bytes) | bytes/record | encode (ms) | decode all (ms) |
 |---|---:|---:|---:|---:|
 | wirefold Collapse | 918696 | 45.9 | 0.16 (0.13 to 0.17) | 1.23 (1.01 to 1.55) |
-| wirefold Collapse + cm coder | 626037 | 31.3 | 33,389 (32,931 to 34,142) | 10,458 (9,949 to 10,743) |
+| wirefold Collapse + cm coder | 626004 | 31.3 | 6,416 (6,221 to 6,572) | 3,641 (3,381 to 3,996) |
 | wirefold Collapse + zstd -19 | 634681 | 31.7 | 185.42 (163.17 to 223.57) | 1.74 (1.26 to 2.14) |
 | bincode 1.3 | 918640 | 45.9 | 0.17 (0.16 to 0.18) | 0.82 (0.64 to 1.15) |
 | postcard | 827235 | 41.4 | 0.67 (0.54 to 0.79) | 1.06 (1.00 to 1.16) |

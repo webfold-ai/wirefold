@@ -15,8 +15,10 @@ an application of one of them.
 2. **The associative fold.** If an operation is associative, a sequence of it can be split anywhere and the parts
    recombined. Anything that looks serial but is really an associative accumulation is a fold, and a fold is
    parallel by construction. A parser's state is the clearest example (below).
-3. **Coordinate tables** (`CoordMap`, `FreqMap`). Keys that are dense get a direct index; diffuse keys get a hash
-   table. The context-mixing coder's predictor tables are these two shapes, chosen per order from the input size.
+3. **Coordinate tables** (`CoordMap`). Keys whose space is small enough to be mostly occupied get a direct
+   index. The context-mixing coder's low orders use it; its sparse high orders use a table of its own (below),
+   because apeiron's `FreqMap` has no slot handle and hashes per key, and the coder needs one cache line per
+   nibble. The shape is chosen per order from the input size.
 4. **An evidence standard.** A speed claim is a mean over at least three runs with its spread, and a change
    inside the spread seen on unchanged code is not a change. Instruction counts (callgrind) are used where
    wall-clock is too noisy to decide.
@@ -82,20 +84,33 @@ Documents under 512 KiB take the unchanged path.
 ## The context-mixing coder
 
 The `cm` coder predicts each bit from many contexts and mixes them. It is the slowest part of the crate on
-purpose and the benchmark says so: it is tens of microseconds per byte on compress. It earns its place on size
+purpose and the benchmark says so: it is about 7 microseconds per byte on compress. It earns its place on size
 (telemetry records at 7.4 bytes each against 10.0 for zstd -19), and it chooses among three faces (cm, lz,
 hybrid) through `compress_shaped`.
 
-What the apeiron basis did here:
+Where the time was, and what changed (all measured, all lossless; sizes within 0.1% of before on a mixed set of
+inputs, and every case round-trips):
 
-- The stride search tries the raw stream and each proposed 2-D stride on a sample. Each trial is an independent
-  whole coding pass, so they run as one static batch and the winner is picked in the original order (first
-  strictly smallest). The output is byte-identical to the previous sequential search, checked against the old
-  code on mixed inputs and by a test that compares against a sequential scan.
-- The predictor tables are `CoordMap` for dense orders and `FreqMap` for diffuse ones.
+- **One cache miss per bit became one per nibble.** Each of the 8 bits of a byte used to hash `(context, node)`
+  into a table on its own, a random probe per bit for each of about ten context lanes, and then probed again to
+  bump the count it had just read. The diffuse tables are now `NibbleTable`s: the context and the nibble's
+  starting node pick one 64-byte bucket, found once per nibble per lane, holding the 15 counts for that nibble's
+  nodes and a 32-bit tag of the owning context. The read and the later bump of a bit use the same cell, so there is
+  no second probe, and the four bits of a nibble share one miss. A tag collision (2^-32 per probe) costs a hair of
+  ratio, never correctness, because encode and decode build the table from the same coded prefix. Instruction
+  count fell 24%; wall-clock fell more than 2x because the work was memory-bound.
+- **Independent passes run as one static batch.** The stride search tries the raw stream and each proposed 2-D
+  stride, and `compress_shaped` measures the cm, lz and hybrid faces on the input. Each is an independent whole
+  coding pass, so they run on the pool and the winner is picked in the original order: the choice is identical.
+  The faces run concurrently only below two chunks of input; above that `compress_at` already spreads the cm face
+  over the pool and the faces run in turn.
 
-What it did not do, honestly: each bit does a table `get` and later an `insert_with` on the same key, two probes.
-`FreqMap` has no slot or entry handle, so removing the second probe is a change in apeiron, not here.
+The numbers are in [BENCHMARKS.md](BENCHMARKS.md). The coder is still the slowest part of the crate: a flat
+profile of about 4,000 instructions per coded bit (twelve lanes of floating-point mixing, three APM stages, state
+maps) with no single hot spot left, so another large gain would mean a different arithmetic (integer
+lpaq-style mixing), which would change the format and is not attempted here. A single stream cannot be coded on
+several cores without restarting the model, and the chunked path documents what that costs in ratio, so the
+chunk size is left alone. The predictor's dense low orders still use `CoordMap`.
 
 ## Numbers: why not ryu and itoa
 
@@ -118,7 +133,8 @@ convert only at a boundary that needs text.
 ## What wirefold gives up
 
 - **Ecosystem.** Nothing outside wirefold understands its formats, and it does not implement serde's traits.
-- **cm speed.** Compress is orders of magnitude slower than zstd, and decompress is symmetric with it.
+- **cm speed.** Compress is about 20 times slower than zstd -19 and decompress thousands of times slower, even
+  after the changes above.
 - **rkyv's validated column read** is faster in the measured case.
 - **MessagePack** encode and decode are slower than `rmp-serde`.
 - **Owned parsing** is sequential, as above.

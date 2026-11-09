@@ -10,7 +10,11 @@ All notable changes to this crate are documented in this file. The format follow
 
 - `docs/DESIGN.md` (the apeiron basis against serde, bincode, ryu and itoa) and fresh serialization and
   number-formatting benchmarks.
-- The cm coder's stride search runs its trials in parallel with byte-identical output; nested pool dispatch
+- The cm coder is 2.4 to 5 times faster: diffuse context tables are keyed per nibble (one cache-line bucket
+  instead of one hash probe per bit), and the stride trials and face measurements run as parallel batches.
+  Output is within 0.1% of the previous size and still round-trips; the byte stream differs from the previous
+  version. Nested pool dispatch from inside a task now runs inline instead of deadlocking.
+- (previous entry, kept for the record:) the cm coder's stride search runs its trials in parallel with byte-identical output; nested pool dispatch
   from inside a task now runs inline instead of deadlocking.
 
 - Initial release of wirefold: the serialization core split out of `hashtrinity` and renamed. It contains
