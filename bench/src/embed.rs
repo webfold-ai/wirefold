@@ -815,19 +815,123 @@ fn recall(got: &[(f32, u32)], truth: &[(f32, u32)]) -> f64 {
 
 // ---------- measurement helpers ----------
 
-fn median3(mut v: [f64; 3]) -> (f64, f64, f64) {
-    v.sort_by(f64::total_cmp);
-    (v[1], v[0], v[2])
+// ---------- statistics: the definitions spbench's criterion port uses (percentile bootstrap, Tukey fences,
+// OLS through the origin over linearly growing iteration counts), with a fixed seed so intervals reproduce ----------
+
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    let n = sorted.len();
+    if n == 0 {
+        return 0.0;
+    }
+    if n == 1 {
+        return sorted[0];
+    }
+    let idx = p * (n - 1) as f64;
+    let (lo, hi) = (idx.floor() as usize, idx.ceil() as usize);
+    sorted[lo] + (idx - lo as f64) * (sorted[hi] - sorted[lo])
 }
 
-fn time3<R>(mut f: impl FnMut() -> R) -> (f64, f64, f64) {
-    let mut t = [0.0; 3];
-    for x in &mut t {
-        let s = Instant::now();
-        std::hint::black_box(f());
-        *x = s.elapsed().as_secs_f64();
+fn sorted(v: &[f64]) -> Vec<f64> {
+    let mut s = v.to_vec();
+    s.sort_by(f64::total_cmp);
+    s
+}
+
+/// Tukey's fences: how many samples lie outside 1.5 (mild) or 3.0 (severe) interquartile ranges.
+fn tukey_outliers(v: &[f64]) -> usize {
+    if v.len() < 4 {
+        return 0;
     }
-    median3(t)
+    let s = sorted(v);
+    let (q1, q3) = (percentile(&s, 0.25), percentile(&s, 0.75));
+    let iqr = q3 - q1;
+    v.iter().filter(|x| **x < q1 - 1.5 * iqr || **x > q3 + 1.5 * iqr).count()
+}
+
+/// Percentile-bootstrap 95% interval of `f` over resamples of `v` (10,000 resamples, seeded).
+fn bootstrap_ci(v: &[f64], f: impl Fn(&[f64]) -> f64) -> (f64, f64) {
+    let mut r = Rng(0xB007);
+    let n = v.len();
+    let mut dist: Vec<f64> = (0..10_000)
+        .map(|_| {
+            let re: Vec<f64> = (0..n).map(|_| v[(r.next() % n as u64) as usize]).collect();
+            f(&re)
+        })
+        .collect();
+    dist.sort_by(f64::total_cmp);
+    (percentile(&dist, 0.025), percentile(&dist, 0.975))
+}
+
+fn median_of(v: &[f64]) -> f64 {
+    percentile(&sorted(v), 0.5)
+}
+
+/// A measurement: the median, its 95% bootstrap interval, and how many samples the Tukey fences flag.
+#[derive(Clone, Copy)]
+struct Est {
+    med: f64,
+    lo: f64,
+    hi: f64,
+    outliers: usize,
+}
+
+fn estimate(v: &[f64]) -> Est {
+    let (lo, hi) = bootstrap_ci(v, median_of);
+    Est { med: median_of(v), lo, hi, outliers: tukey_outliers(v) }
+}
+
+/// Samples per measurement. Fewer than criterion's 100 because one sample here can be a whole scan.
+const SAMPLES: usize = 12;
+
+/// Time `f` (seconds per call): one untimed warm-up call, then `SAMPLES` timed calls.
+fn time_est<R>(mut f: impl FnMut() -> R) -> Est {
+    std::hint::black_box(f());
+    let v: Vec<f64> = (0..SAMPLES)
+        .map(|_| {
+            let s = Instant::now();
+            std::hint::black_box(f());
+            s.elapsed().as_secs_f64()
+        })
+        .collect();
+    estimate(&v)
+}
+
+/// Median and the two ends of its interval, for call sites that print a range.
+fn time3<R>(f: impl FnMut() -> R) -> (f64, f64, f64) {
+    let e = time_est(f);
+    (e.med, e.lo, e.hi)
+}
+
+/// Per-iteration cost by linear sampling, as criterion does it: sample k runs k*d iterations, and the slope of
+/// total time against iterations (least squares through the origin) is the per-iteration time, with the fixed
+/// per-sample overhead (timer, loop entry) taken out. Returns (slope, 95% interval of the slope, r^2).
+fn slope_est(mut f: impl FnMut(u64), d: u64) -> (f64, f64, f64, f64) {
+    f(d);
+    let pts: Vec<(f64, f64)> = (1..=20u64)
+        .map(|k| {
+            let it = k * d;
+            let s = Instant::now();
+            f(it);
+            (it as f64, s.elapsed().as_secs_f64())
+        })
+        .collect();
+    let ols = |p: &[(f64, f64)]| {
+        let (xy, xx) = p.iter().fold((0.0, 0.0), |a, (x, y)| (a.0 + x * y, a.1 + x * x));
+        xy / xx
+    };
+    let m = ols(&pts);
+    let mut r = Rng(0x5107E);
+    let mut dist: Vec<f64> = (0..10_000)
+        .map(|_| {
+            let re: Vec<(f64, f64)> = (0..pts.len()).map(|_| pts[(r.next() % pts.len() as u64) as usize]).collect();
+            ols(&re)
+        })
+        .collect();
+    dist.sort_by(f64::total_cmp);
+    let my = pts.iter().map(|p| p.1).sum::<f64>() / pts.len() as f64;
+    let ss_res: f64 = pts.iter().map(|(x, y)| (y - m * x).powi(2)).sum();
+    let ss_tot: f64 = pts.iter().map(|(_, y)| (y - my).powi(2)).sum();
+    (m, percentile(&dist, 0.025), percentile(&dist, 0.975), 1.0 - ss_res / ss_tot)
 }
 
 fn shuffle(d: &[u8], w: usize) -> Vec<u8> {
@@ -1060,7 +1164,7 @@ fn bandwidth() {
 /// Scan speed with the column resident in cache against the column far beyond it.
 fn big(rot: &Rot, x: &[f32], queries: &[f32]) {
     let kinds = [Kind::F32, Kind::F16, Kind::I8(D), Kind::I8R, Kind::I4R, Kind::B2, Kind::Bin, Kind::I8(256), Kind::I8(64)];
-    println!("| format | B/vec | resident: 200k rows ms/query | resident GB/s | DRAM: 2 GiB column ms/query | DRAM GB/s | DRAM 1-core ns/row | rows/s/core (DRAM) |");
+    println!("| format | B/vec | resident: 200k rows ms/query | resident GB/s | DRAM: 2 GiB column ms/query [95% CI] | DRAM GB/s | DRAM 1-core ns/row | rows/s/core (DRAM) |");
     println!("|---|---:|---:|---:|---:|---:|---:|---:|");
     let nq = 8;
     let w = Pool::global().width().max(1);
@@ -1070,13 +1174,14 @@ fn big(rot: &Rot, x: &[f32], queries: &[f32]) {
         let (ts, _, _) = time3(|| preps.iter().for_each(|p| drop(std::hint::black_box(scan_par(&small, p, K)))));
         let big = tiled(&small, 2 << 30);
         drop(small);
-        let (tb, lo, hi) = time3(|| preps.iter().for_each(|p| drop(std::hint::black_box(scan_par(&big, p, K)))));
+        let eb = time_est(|| preps.iter().for_each(|p| drop(std::hint::black_box(scan_par(&big, p, K)))));
+        let (tb, lo, hi) = (eb.med, eb.lo, eb.hi);
         let slice = big.n / w;
         let (t1, _, _) = time3(|| preps.iter().take(2).for_each(|p| drop(std::hint::black_box(scan_range(&big, p, 0, slice, K)))));
         let ns = t1 * 1e9 / (2.0 * slice as f64);
         let st = kind.stride();
         println!(
-            "| {} | {} | {:.2} | {:.1} | {:.1} [{:.1}-{:.1}] | {:.1} | {:.0} | {:.1}M |",
+            "| {} | {} | {:.2} | {:.1} | {:.1} [{:.1}-{:.1}]{} | {:.1} | {:.0} | {:.1}M |",
             kind.name(),
             st,
             ts * 1e3 / nq as f64,
@@ -1084,11 +1189,13 @@ fn big(rot: &Rot, x: &[f32], queries: &[f32]) {
             tb * 1e3 / nq as f64,
             lo * 1e3 / nq as f64,
             hi * 1e3 / nq as f64,
+            if eb.outliers > 0 { format!(" ({} outlier{})", eb.outliers, if eb.outliers == 1 { "" } else { "s" }) } else { String::new() },
             gb(big.bytes.len()) / (tb / nq as f64),
             ns,
             1e3 / ns
         );
-        println!("ROW\t{}\t{}\t{:.9}\t{:.1}", kind.name(), st, tb / nq as f64 / big.n as f64, ns);
+        let per = |t: f64| t / nq as f64 / big.n as f64;
+        println!("ROW\t{}\t{}\t{:.9}\t{:.9}\t{:.9}\t{:.1}", kind.name(), st, per(tb), per(lo), per(hi), ns);
     }
 }
 
@@ -1103,14 +1210,21 @@ fn batch(rot: &Rot, x: &[f32], queries: &[f32]) {
         let big = tiled(&small, 2 << 30);
         drop(small);
         let mut cells = Vec::new();
+        let mut ci: Vec<(f64, f64)> = Vec::new();
         for &q in &sizes {
             let ps: Vec<Prep> = (0..q).map(|i| prep(kind, rot, &queries[(i % 64) * D..(i % 64 + 1) * D])).collect();
-            let (t, _, _) = time3(|| drop(std::hint::black_box(scan_batch_par(&big, &ps, K))));
-            let per = t * 1e9 / (big.n as f64 * q as f64);
+            let e = time_est(|| drop(std::hint::black_box(scan_batch_par(&big, &ps, K))));
+            let per = e.med * 1e9 / (big.n as f64 * q as f64);
             cells.push(per);
+            ci.push((e.lo * 1e9 / (big.n as f64 * q as f64), e.hi * 1e9 / (big.n as f64 * q as f64)));
         }
         println!("| {} | {} |", kind.name(), cells.iter().map(|c| format!("{c:.2}")).collect::<Vec<_>>().join(" | "));
-        println!("ROWB\t{}\t{}\t{}", kind.name(), kind.stride(), cells.iter().map(|c| format!("{c:.4}")).collect::<Vec<_>>().join("\t"));
+        println!(
+            "ROWB\t{}\t{}\t{}",
+            kind.name(),
+            kind.stride(),
+            cells.iter().zip(&ci).map(|(c, (l, h))| format!("{c:.4}\t{l:.4}\t{h:.4}")).collect::<Vec<_>>().join("\t")
+        );
     }
 }
 
@@ -1186,24 +1300,47 @@ fn cold(x: &[f32]) {
 
 /// Each kernel on a row that stays in L1: the compute-bound floor, against which the memory-bound figures are read.
 fn kernel(rot: &Rot, x: &[f32], queries: &[f32]) {
-    println!("| format | B/vec | L1-resident ns/row | GB/s of stored bytes (one core) |");
-    println!("|---|---:|---:|---:|");
+    println!("| format | B/vec | L1-resident ns/row [95% CI] | r^2 | GB/s of stored bytes (one core) |");
+    println!("|---|---:|---:|---:|---:|");
     for kind in [Kind::F32, Kind::F16, Kind::I8(D), Kind::I8R, Kind::I4R, Kind::B2, Kind::Bin, Kind::I8(256), Kind::I8(64)] {
         let s = encode_all(kind, rot, &x[..16 * D]);
         let p = prep(kind, rot, &queries[..D]);
         let st = kind.stride();
-        let reps = 200_000;
-        let (t, _, _) = time3(|| {
-            let mut acc = 0f32;
-            for i in 0..reps {
-                let r = i & 15;
-                acc += score_row(kind, &s.bytes[r * st..(r + 1) * st], &p);
-            }
-            acc
-        });
-        let ns = t * 1e9 / reps as f64;
-        println!("| {} | {} | {:.0} | {:.1} |", kind.name(), st, ns, st as f64 / ns);
+        let (m, lo, hi, r2) = slope_est(
+            |iters| {
+                let mut acc = 0f32;
+                for i in 0..iters {
+                    let r = (i & 15) as usize;
+                    acc += score_row(kind, &s.bytes[r * st..(r + 1) * st], &p);
+                }
+                std::hint::black_box(acc);
+            },
+            20_000,
+        );
+        println!("| {} | {} | {:.1} [{:.1}-{:.1}] | {:.4} | {:.1} |", kind.name(), st, m * 1e9, lo * 1e9, hi * 1e9, r2, st as f64 / (m * 1e9));
     }
+}
+
+/// One format on one corpus, as an external command for spbench: it prints the markers spbench's harness reads,
+/// `BENCH_QUALITY` (recall@10 after the f32 re-rank) and `BENCH_TOK_S` (rows scored per second, all cores).
+fn one(rot: &Rot, kind_name: &str, corpus: Corpus) {
+    let kinds = [Kind::F32, Kind::F16, Kind::I8(D), Kind::I8R, Kind::I4, Kind::I4R, Kind::B2, Kind::Bin, Kind::I8(256), Kind::I8(128), Kind::I8(64)];
+    let kind = *kinds.iter().find(|k| k.name() == kind_name).unwrap_or_else(|| panic!("unknown format {kind_name}; one of {:?}", kinds.map(|k| k.name())));
+    let n = 200_000;
+    let x = gen(corpus, n, 42);
+    let qs = gen(corpus, 40, 4242);
+    let f32s = encode_all(Kind::F32, rot, &x);
+    let s = encode_all(kind, rot, &x);
+    let mut rec = 0.0;
+    for i in 0..40 {
+        let q = &qs[i * D..(i + 1) * D];
+        let truth = scan_par(&f32s, &prep(Kind::F32, rot, q), K);
+        rec += recall(&two_stage(&s, &prep(kind, rot, q), &x, q), &truth);
+    }
+    let preps: Vec<Prep> = (0..8).map(|i| prep(kind, rot, &qs[i * D..(i + 1) * D])).collect();
+    let e = time_est(|| preps.iter().for_each(|p| drop(std::hint::black_box(scan_par(&s, p, K)))));
+    println!("BENCH_QUALITY {:.4}", rec / 40.0);
+    println!("BENCH_TOK_S {:.0}", 8.0 * n as f64 / e.med);
 }
 
 fn main() {
@@ -1225,6 +1362,7 @@ fn main() {
                 _ => cold(&x),
             }
         }
+        "one" => one(&rot, a.get(2).map(String::as_str).unwrap_or("int8"), if a.get(3).map(String::as_str) == Some("iso") { Corpus::Iso } else { Corpus::Mrl }),
         "sweep" => sweep(&rot, a.get(2).and_then(|s| s.parse().ok()).unwrap_or(100_000), 40),
         _ => resident_report(a),
     }
