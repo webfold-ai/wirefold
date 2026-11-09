@@ -19,6 +19,11 @@ postcard = { version = "1", features = ["use-std"] }
 rmp-serde = "1"
 rkyv = { version = "0.8", default-features = false, features = ["std", "bytecheck", "alloc"] }
 zstd = "0.13"
+# the other compressors the report compares against (benchmark only; the library depends on none of them)
+lz4 = "1"
+snap = "1"
+flate2 = "1"
+brotli = "7"
 ryu = "1"
 itoa = "1"
 

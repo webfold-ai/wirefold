@@ -24,6 +24,8 @@ wirefold = { git = "https://github.com/webfold-ai/wirefold", features = ["derive
   is in `examples/usage.rs`, which CI runs (`cargo run --example usage --all-features`).
 - [Design](docs/DESIGN.md): why it is built on apeiron rather than serde, bincode, ryu and itoa, how parsing
   becomes a fold, and what it gives up.
+- [Report](docs/REPORT.md): a standalone comparison with lz4, Snappy, deflate, Brotli and zstd on three datasets, with the
+  method, the data generators and the limits.
 - [Benchmarks](docs/BENCHMARKS.md): wirefold against serde_json, bincode, postcard, rmp-serde, rkyv and zstd,
   with the harness in `bench/` and a plain statement of where it wins and where it does not.
 - [Contributing](CONTRIBUTING.md), [security policy](SECURITY.md), [code of conduct](CODE_OF_CONDUCT.md),

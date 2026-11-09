@@ -46,8 +46,14 @@ Supported field types: the primitive integers and floats, `bool`, nested `Collap
 
 A scalar field's `_column()` accessor (`celsius_column()`) is omitted if another field of the record has that name;
 `bool` columns are `0`/`1` bytes. Opening a truncated or corrupt buffer, or one whose columns disagree about the
-record count, returns an error. It does not panic. Buffers written by an earlier version, which packed the scalar
-fields into one row-major block, are refused (usually by the section count) and not misread.
+record count, returns an error. It does not panic.
+
+Every table starts with a header word: the section count in the low 32 bits, then the bytes `W`, `C`, the layout
+version (`codec::web::TABLE_VERSION`, now 1) and a zero. A reader accepts exactly its own version and returns
+`WireErr::UnsupportedVersion(v)` for another, and `WireErr::BadMagic` for bytes that are not a table or that were
+written before tables carried a version (including every buffer from before the per-field column layout). Nested
+record tables carry their own header. A flat array of plain values (`Wire<T>`, what a `Vec<u64>` packs to) is not a
+table and has no header.
 
 ## Structs to and from text: `#[derive(Term)]`
 

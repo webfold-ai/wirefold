@@ -701,10 +701,11 @@ is exactness, since `1.0`, `1e3` and `0.10` survive unchanged.
   of a millisecond between serializers are not established.
 - The encodings, the per-column frames, the thread split and the block store are benchmark code (see
   [Layout, columns and blocks](#layout-columns-and-blocks)); the bf16 weights are synthetic.
-- A `Collapse` buffer has no version or magic number. A buffer written before the column layout is usually refused
-  at open because the section count differs, but a record with exactly one scalar field has the same section count
-  in both layouts and is not distinguishable by that. Until a version header exists, do not store `Collapse` buffers
-  you cannot regenerate.
+- Every `Collapse` table now starts with a magic and a version (`TABLE_VERSION`, 1), written in the same 8-byte word
+  as the section count, so the buffers in these tables are the same size as before and opening one costs the same
+  (0.30 ms against 0.31 to 0.33). Buffers written before the header existed, and before the column layout, have no magic
+  and are refused with `WireErr::BadMagic`, including the one-scalar-field records that the section count could
+  not tell apart.
 - The CI jobs, including the sanitizer jobs, have not run on GitHub (a billing limit rejects them before a runner is
   assigned); the same commands were run locally.
 - Every serializer here round-trips through a `Vec<u8>`; a caller that keeps rkyv or `Collapse` bytes in place

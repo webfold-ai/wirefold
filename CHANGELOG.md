@@ -21,12 +21,23 @@ All notable changes to this crate are documented in this file. The format follow
 - CI gains AddressSanitizer and ThreadSanitizer jobs. Locally, the library and integration tests pass under both,
   Miri finds no undefined behaviour in the tANS, Huffman and `web` module tests or the derive tests, and each fuzz
   target ran 4 minutes without a crash.
+- `docs/REPORT.md`: a standalone report comparing `Collapse`, the column encodings and five other serializers against
+  lz4, Snappy, deflate, Brotli and zstd on three datasets (medians of three runs; `bench/scripts/merge_reports.py`). The
+  benchmark gains those compressors behind one `Backend` type (`bench/src/backends.rs`) and a `report` mode.
+- Breaking, section tables are versioned: the first word of every table (the root and each nested record table) is
+  now the section count in its low 32 bits and the bytes `W`, `C`, `TABLE_VERSION` (1) and `0` in its high 32 bits,
+  so no table grew. `Sections::open` and every derive-generated `collapse_open` refuse a table without the magic
+  (`WireErr::BadMagic`, which includes every buffer written before this change, whatever its layout) and one of
+  another version (`WireErr::UnsupportedVersion(v)`). `WireErr` gains those two variants and `codec::web` exports
+  `TABLE_VERSION` and `table_word`. A plain `Wire<T>` array is not a table and has no header. Tests cover the magic,
+  the version, an old-format buffer (including the one-scalar-field case the section count could not tell apart) and
+  nested tables; removing either check fails the test.
 - Breaking, `Collapse` layout: each scalar field of a record is now its own contiguous column (a `Wire<T>` section,
   `bool` as a byte) instead of one row-major block of packed records, followed by the variable-length columns as before.
   `#[derive(Collapse)]` views gain a zero-copy `<field>_column()` slice accessor per scalar field (omitted when a field
   has that name), `collapse_to_vec` reads each column once, and a scalar field's alignment must divide 8 (checked at
   compile time). Buffers written by earlier versions are refused at open, usually by the section count, and not
-  misread; there is no version byte on a `Collapse` buffer. Measured on the telemetry benchmark: whole-buffer zstd -3
+  misread (and now, by the table header above, always). Measured on the telemetry benchmark: whole-buffer zstd -3
   189,754 bytes (was 234,791), decode of every record 1.25 ms (was 1.03). The record count of a record with no scalar
   field is kept in one empty count section.
 - The benchmark harness reports per column, per zstd level and per block size, with encodings for each column (delta,

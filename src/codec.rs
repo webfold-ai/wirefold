@@ -7472,6 +7472,11 @@ pub mod web {
         BadTag,
         /// A `String` column holds bytes that are not valid UTF-8 (derive-generated views).
         BadUtf8,
+        /// A section table does not begin with the `WC` magic: not a table this crate wrote, or one written
+        /// before tables carried a version.
+        BadMagic,
+        /// A section table carries a version this build does not read; the payload is that version.
+        UnsupportedVersion(u8),
     }
 
     /// An owned, 8-aligned seed buffer: `[count: u64 LE][T; count]`. The serialised form IS the runtime
@@ -7891,7 +7896,7 @@ pub mod web {
             words.set_len(nwords);
         }
         words[nwords - 1] = 0;
-        words[0] = n as u64;
+        words[0] = table_word(n);
         for (j, s) in sections.iter().enumerate() {
             words[1 + j] = starts[j] as u64;
             words[1 + n + j] = s.len() as u64;
@@ -7910,6 +7915,24 @@ pub mod web {
         Seed { words, len: total }
     }
 
+    /// The version of the section-table layout written by this build. A reader accepts exactly this value
+    /// and returns [`WireErr::UnsupportedVersion`] for any other, so a layout change bumps it and old
+    /// buffers are refused rather than misread. The first versioned layout is 1; tables written before
+    /// versioning began carry no magic and are refused with [`WireErr::BadMagic`].
+    pub const TABLE_VERSION: u8 = 1;
+
+    /// The first word of every section table: the section count in the low 32 bits and, in the high 32
+    /// bits, the bytes `W`, `C`, the version and a reserved zero (so a hex dump shows `57 43 01 00` after
+    /// the count). It versions every record table, nested ones included, at no extra byte.
+    #[must_use]
+    pub fn table_word(n: usize) -> u64 {
+        assert!(
+            u32::try_from(n).is_ok(),
+            "a section table holds at most 2^32 - 1 sections"
+        );
+        (u64::from(u32::from_le_bytes([b'W', b'C', TABLE_VERSION, 0])) << 32) | n as u64
+    }
+
     /// A zero-copy view of a sectioned buffer — each `section(j)` is an 8-aligned sub-slice ready to
     /// `Wire::open` / `Ragged::open`. Open BORROWS the stored offsets — zero allocation, so recursive
     /// (deep-nested) navigation pays no per-node alloc.
@@ -7924,8 +7947,17 @@ pub mod web {
             if buf.len() < 8 || !(buf.as_ptr() as usize).is_multiple_of(8) {
                 return Err(WireErr::Misaligned);
             }
-            // SAFETY: 8-aligned, ≥8 bytes; read the section count.
-            let n = unsafe { *buf.as_ptr().cast::<u64>() } as usize;
+            // SAFETY: 8-aligned, ≥8 bytes; read the table word (section count and magic).
+            let word = unsafe { *buf.as_ptr().cast::<u64>() };
+            let tag = (word >> 32).to_le_bytes();
+            let tag = [tag[0], tag[1], tag[2], tag[3]];
+            if tag[0] != b'W' || tag[1] != b'C' || tag[3] != 0 {
+                return Err(WireErr::BadMagic);
+            }
+            if tag[2] != TABLE_VERSION {
+                return Err(WireErr::UnsupportedVersion(tag[2]));
+            }
+            let n = (word & 0xFFFF_FFFF) as usize;
             let header = n
                 .checked_mul(2)
                 .and_then(|c| c.checked_add(1))
@@ -8009,7 +8041,7 @@ pub mod web {
         }
         let dst =
             unsafe { core::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), total) };
-        dst[0..8].copy_from_slice(&(nsec as u64).to_le_bytes());
+        dst[0..8].copy_from_slice(&table_word(nsec).to_le_bytes());
         for j in 0..nsec {
             dst[8 + j * 8..16 + j * 8].copy_from_slice(&(start[j] as u64).to_le_bytes());
             dst[8 + nsec * 8 + j * 8..16 + nsec * 8 + j * 8]
@@ -8081,7 +8113,7 @@ pub mod web {
             starts.push(pos);
             pos += s;
         }
-        dst[0..8].copy_from_slice(&(n as u64).to_le_bytes());
+        dst[0..8].copy_from_slice(&table_word(n).to_le_bytes());
         for j in 0..n {
             dst[8 + j * 8..16 + j * 8].copy_from_slice(&(starts[j] as u64).to_le_bytes());
             dst[8 + n * 8 + j * 8..16 + n * 8 + j * 8]

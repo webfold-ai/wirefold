@@ -149,8 +149,8 @@ fn each_scalar_field_is_a_contiguous_column() {
     let seed = Reading::collapse_pack(&src);
     let b = seed.as_bytes();
     let u64_at = |at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap()) as usize;
-    // four scalar fields and one string field: five sections
-    assert_eq!(u64_at(0), 5);
+    // four scalar fields and one string field: five sections, in the low 32 bits of the table word
+    assert_eq!(u64_at(0) & 0xFFFF_FFFF, 5);
     let sec = |j: usize| (u64_at(8 + 8 * j), u64_at(48 + 8 * j));
     // each scalar section is [count][n values], 8-aligned, and nothing but that field
     assert_eq!(sec(0).1, 8 + src.len() * 8); // ts
@@ -245,8 +245,92 @@ fn columns_that_disagree_are_refused() {
     let mut bad = good.clone();
     bad[second..second + 8].copy_from_slice(&((src.len() as u64) + 1).to_le_bytes());
     assert!(open(&bad).is_err());
-    // a table with the wrong section count
+    // a table with the wrong section count (the magic and version kept, the count changed)
     let mut bad = good.clone();
-    bad[0..8].copy_from_slice(&4u64.to_le_bytes());
+    bad[0..4].copy_from_slice(&4u32.to_le_bytes());
     assert_eq!(open(&bad), Err(WireErr::BadLength));
+}
+
+/// Every record table begins with the section count and then the bytes `W`, `C`, the version and a zero, so
+/// a buffer is identifiable and a layout change is refused instead of misread.
+#[test]
+fn a_record_table_carries_its_magic_and_version() {
+    use wirefold::codec::web::{WireErr, TABLE_VERSION};
+    let src = readings();
+    let good = Reading::collapse_pack(&src).as_bytes().to_vec();
+    assert_eq!(&good[0..4], &5u32.to_le_bytes());
+    assert_eq!(&good[4..8], &[b'W', b'C', TABLE_VERSION, 0]);
+    let open = |bytes: &[u8]| {
+        let mut w = vec![0u64; bytes.len().div_ceil(8)];
+        for (i, b) in bytes.iter().enumerate() {
+            w[i / 8] |= u64::from(*b) << (8 * (i % 8));
+        }
+        let s: &[u8] = unsafe { std::slice::from_raw_parts(w.as_ptr().cast::<u8>(), bytes.len()) };
+        ReadingView::collapse_open(s).map(|_| ())
+    };
+    assert_eq!(open(&good), Ok(()));
+    // a different version is refused by name, whatever else is in the buffer
+    for v in [0u8, TABLE_VERSION + 1, 0xFF] {
+        let mut bad = good.clone();
+        bad[6] = v;
+        assert_eq!(open(&bad), Err(WireErr::UnsupportedVersion(v)));
+    }
+    // no magic (a table written before tables were versioned, whose first word is just the count)
+    let mut old = good.clone();
+    old[4..8].copy_from_slice(&[0, 0, 0, 0]);
+    assert_eq!(open(&old), Err(WireErr::BadMagic));
+    // a wrong magic byte, and a nonzero reserved byte
+    for at in [4usize, 5, 7] {
+        let mut bad = good.clone();
+        bad[at] ^= 0x01;
+        assert_eq!(open(&bad), Err(WireErr::BadMagic), "byte {at}");
+    }
+    // a record with a single scalar field has the same section count in the old and new layouts, so only the
+    // header can tell them apart
+    #[derive(Collapse, Clone, Debug, PartialEq)]
+    struct One {
+        a: u64,
+    }
+    let one = One::collapse_pack(&[One { a: 7 }, One { a: 9 }]);
+    let mut legacy = one.as_bytes().to_vec();
+    legacy[4..8].copy_from_slice(&[0, 0, 0, 0]);
+    let mut w = vec![0u64; legacy.len().div_ceil(8)];
+    for (i, b) in legacy.iter().enumerate() {
+        w[i / 8] |= u64::from(*b) << (8 * (i % 8));
+    }
+    let s: &[u8] = unsafe { std::slice::from_raw_parts(w.as_ptr().cast::<u8>(), legacy.len()) };
+    assert_eq!(
+        OneView::collapse_open(s).map(|_| ()),
+        Err(WireErr::BadMagic)
+    );
+}
+
+/// Nested record tables are versioned too: each sub-table starts with its own count and magic.
+#[derive(Collapse, Clone, Debug, PartialEq)]
+struct Outer {
+    id: u32,
+    items: Vec<Reading>,
+}
+
+#[test]
+fn nested_tables_carry_the_version() {
+    use wirefold::codec::web::TABLE_VERSION;
+    let src: Vec<Outer> = (0..3)
+        .map(|i| Outer {
+            id: i,
+            items: readings().into_iter().take(i as usize + 1).collect(),
+        })
+        .collect();
+    let seed = Outer::collapse_pack(&src);
+    let b = seed.as_bytes();
+    assert_eq!(&b[4..8], &[b'W', b'C', TABLE_VERSION, 0]);
+    let view = OuterView::collapse_open(b).expect("opens");
+    assert_eq!(view.collapse_to_vec(), src);
+    // every occurrence of a table header inside the buffer carries the same tag: the outer table and one
+    // per record's `items` table, found by their 8-aligned `[n][W C v 0]` words
+    let tags = b
+        .chunks_exact(8)
+        .filter(|w| w[4..8] == [b'W', b'C', TABLE_VERSION, 0])
+        .count();
+    assert!(tags > src.len(), "found {tags} tagged tables");
 }

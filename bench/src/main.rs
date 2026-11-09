@@ -47,6 +47,10 @@ fn alloc_counters() -> (u64, u64) {
     (ALLOCS.load(Relaxed), ALLOC_BYTES.load(Relaxed))
 }
 
+mod backends;
+
+use backends::Backend;
+use std::cell::Cell;
 use std::hint::black_box;
 use std::time::Instant;
 use wirefold::codec::syntax::{parse_surface, Surface};
@@ -274,9 +278,9 @@ fn column_row(dataset: &str, n: usize, row: &str) {
             } else {
                 Mode::Plain
             };
-            let z = columns_compress(&wf, 3, mode, 1);
-            assert_eq!(columns_value_sum(&z), want);
-            let t = ms(runs, || columns_value_sum(&z));
+            let z = columns_compress(&wf, Backend::Zstd(3), mode, 1);
+            assert_eq!(columns_value_sum(&z, Backend::Zstd(3)), want);
+            let t = ms(runs, || columns_value_sum(&z, Backend::Zstd(3)));
             (
                 if mode == Mode::Smart {
                     "columns, encoded planes, zstd -3: decompress one column"
@@ -406,13 +410,18 @@ enum Mode {
     Smart,
 }
 
+/// The section count of a table: the low 32 bits of its first word (the high 32 bits are the magic and version).
+fn table_n(b: &[u8]) -> usize {
+    le_u64(b, 0) & 0xFFFF_FFFF
+}
+
 fn le_u64(b: &[u8], at: usize) -> usize {
     u64::from_le_bytes(b[at..at + 8].try_into().unwrap()) as usize
 }
 
 /// `(start, length)` of every section of a `Collapse` buffer, from its section table.
 fn sections(b: &[u8]) -> Vec<(usize, usize)> {
-    let n = le_u64(b, 0);
+    let n = table_n(b);
     (0..n)
         .map(|j| (le_u64(b, 8 + 8 * j), le_u64(b, 8 + 8 * n + 8 * j)))
         .collect()
@@ -561,10 +570,16 @@ fn unpack_bits(b: &[u8], n: usize, bits: usize) -> Vec<u64> {
         .collect()
 }
 
-/// What the compressor will make of a candidate encoding: its length after zstd -3, or its own length if
-/// that is smaller (a bit-packed stream does not compress).
+thread_local! {
+    /// The compressor the encodings are being judged with (the probe of the backend being used).
+    static COST_BACKEND: Cell<Backend> = const { Cell::new(Backend::Zstd(3)) };
+}
+
+/// What the compressor will make of a candidate encoding: its length after compression, or its own length
+/// if that is smaller (a bit-packed stream does not compress). The compressor is the one the columns are
+/// about to be compressed with, so the choice between forms is made for it.
 fn cost(e: &[u8]) -> usize {
-    zstd::encode_all(e, 3).unwrap().len().min(e.len())
+    COST_BACKEND.with(Cell::get).compress(e).len().min(e.len())
 }
 
 /// An integer sequence in one of three forms, the cheapest of: the values less their minimum at the
@@ -819,13 +834,11 @@ fn encoded_planes(b: &[u8], mode: Mode) -> Vec<Vec<u8>> {
 
 /// Compress a buffer plane by plane, the planes spread over `threads` threads (static: plane `i` goes to
 /// thread `i % threads`): `[total len][section table][compressed length per plane][frames]`.
-fn columns_compress(b: &[u8], level: i32, mode: Mode, threads: usize) -> Vec<u8> {
+fn columns_compress(b: &[u8], backend: Backend, mode: Mode, threads: usize) -> Vec<u8> {
+    COST_BACKEND.with(|c| c.set(backend.probe()));
     let planes = encoded_planes(b, mode);
     let frames: Vec<Vec<u8>> = if threads <= 1 {
-        planes
-            .iter()
-            .map(|p| zstd::encode_all(&p[..], level).unwrap())
-            .collect()
+        planes.iter().map(|p| backend.compress(&p[..])).collect()
     } else {
         let mut slots: Vec<Option<Vec<u8>>> = vec![None; planes.len()];
         std::thread::scope(|sc| {
@@ -835,7 +848,7 @@ fn columns_compress(b: &[u8], level: i32, mode: Mode, threads: usize) -> Vec<u8>
                     sc.spawn(move || {
                         (t..planes.len())
                             .step_by(threads)
-                            .map(|i| (i, zstd::encode_all(&planes[i][..], level).unwrap()))
+                            .map(|i| (i, backend.compress(&planes[i][..])))
                             .collect::<Vec<_>>()
                     })
                 })
@@ -848,7 +861,7 @@ fn columns_compress(b: &[u8], level: i32, mode: Mode, threads: usize) -> Vec<u8>
         });
         slots.into_iter().map(Option::unwrap).collect()
     };
-    let header_len = 8 * (1 + 2 * le_u64(b, 0));
+    let header_len = 8 * (1 + 2 * table_n(b));
     let mut out = Vec::new();
     out.extend((b.len() as u32).to_le_bytes());
     out.extend_from_slice(&b[..header_len]);
@@ -865,7 +878,7 @@ fn columns_compress(b: &[u8], level: i32, mode: Mode, threads: usize) -> Vec<u8>
 /// The parts of a plane-compressed buffer: total length, section table, record count and each frame.
 fn columns_parse(z: &[u8]) -> (usize, &[u8], usize, Vec<&[u8]>) {
     let u32_at = |at: usize| u32::from_le_bytes(z[at..at + 4].try_into().unwrap()) as usize;
-    let header_len = 8 * (1 + 2 * le_u64(z, 4));
+    let header_len = 8 * (1 + 2 * (le_u64(z, 4) & 0xFFFF_FFFF));
     let n = u32_at(4 + header_len);
     let mut at = 8 + header_len + 4 * NPLANES;
     let frames = (0..NPLANES)
@@ -880,12 +893,9 @@ fn columns_parse(z: &[u8]) -> (usize, &[u8], usize, Vec<&[u8]>) {
 }
 
 /// Rebuild the exact buffer from its plane frames.
-fn columns_decompress(z: &[u8]) -> Vec<u8> {
+fn columns_decompress(z: &[u8], backend: Backend) -> Vec<u8> {
     let (total, header, n, frames) = columns_parse(z);
-    let dec: Vec<Vec<u8>> = frames
-        .iter()
-        .map(|f| zstd::decode_all(*f).unwrap())
-        .collect();
+    let dec: Vec<Vec<u8>> = frames.iter().map(|f| backend.decompress(f)).collect();
     let mut raw: Vec<Vec<u8>> = (0..5).map(|j| decode_scalar(j, &dec[j], n)).collect();
     let (lens, bytes) = decode_strings(&dec[5], &dec[6]);
     raw.push(lens);
@@ -894,13 +904,9 @@ fn columns_decompress(z: &[u8]) -> Vec<u8> {
 }
 
 /// Sum of the `f64` field from a plane-compressed buffer, decompressing only that field's plane.
-fn columns_value_sum(z: &[u8]) -> f64 {
+fn columns_value_sum(z: &[u8], backend: Backend) -> f64 {
     let (_, _, n, frames) = columns_parse(z);
-    let raw = decode_scalar(
-        VALUE_PLANE,
-        &zstd::decode_all(frames[VALUE_PLANE]).unwrap(),
-        n,
-    );
+    let raw = decode_scalar(VALUE_PLANE, &backend.decompress(frames[VALUE_PLANE]), n);
     raw.chunks_exact(8)
         .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
         .sum()
@@ -965,7 +971,9 @@ impl Codec {
             Codec::Raw => bytes,
             Codec::Zstd(l) => zstd::encode_all(&bytes[..], l).unwrap(),
             Codec::Wirefold => wirefold::codec::compress(&bytes),
-            Codec::Columns { level, mode } => columns_compress(&bytes, level, mode, 1),
+            Codec::Columns { level, mode } => {
+                columns_compress(&bytes, Backend::Zstd(level), mode, 1)
+            }
         }
     }
 
@@ -974,7 +982,7 @@ impl Codec {
             Codec::Raw => Cow::Borrowed(z),
             Codec::Zstd(_) => Cow::Owned(zstd::decode_all(z).unwrap()),
             Codec::Wirefold => Cow::Owned(wirefold::codec::decompress(z)),
-            Codec::Columns { .. } => Cow::Owned(columns_decompress(z)),
+            Codec::Columns { level, .. } => Cow::Owned(columns_decompress(z, Backend::Zstd(level))),
         }
     }
 
@@ -1246,18 +1254,26 @@ fn level_report(dataset: &str, n: usize) {
             format!("{wd:.2}"),
         ];
         for mode in [Mode::Plain, Mode::Smart] {
-            let c = columns_compress(&b, level, mode, 1);
-            assert_eq!(columns_decompress(&c), b);
+            let c = columns_compress(&b, Backend::Zstd(level), mode, 1);
+            assert_eq!(columns_decompress(&c, Backend::Zstd(level)), b);
             row.push(format!("{}", c.len()));
             row.push(format!(
                 "{:.2}",
-                ms(reps, || columns_compress(&b, level, mode, 1))
+                ms(reps, || columns_compress(&b, Backend::Zstd(level), mode, 1))
             ));
-            row.push(format!("{:.2}", ms(reps, || columns_decompress(&c))));
+            row.push(format!(
+                "{:.2}",
+                ms(reps, || columns_decompress(&c, Backend::Zstd(level)))
+            ));
         }
         row.push(format!(
             "{:.2}",
-            ms(reps, || columns_compress(&b, level, Mode::Smart, 4))
+            ms(reps, || columns_compress(
+                &b,
+                Backend::Zstd(level),
+                Mode::Smart,
+                4
+            ))
         ));
         println!("| {} |", row.join(" | "));
     }
@@ -1405,6 +1421,223 @@ fn bf16_report(n: usize) {
         "low byte plane alone (1 exponent bit, 7 mantissa bits)",
         &[&lo],
     );
+}
+
+/// Wall time of `f` in milliseconds: the median of five runs after a first run, or that first run alone when it
+/// takes over 0.3 s (the slow settings of the slow compressors).
+fn auto_ms<R>(mut f: impl FnMut() -> R) -> f64 {
+    let t = Instant::now();
+    black_box(f());
+    let first = t.elapsed().as_secs_f64() * 1e3;
+    if first > 300.0 {
+        first
+    } else {
+        ms(5, f)
+    }
+}
+
+/// The version a crate resolves to in this crate's `Cargo.lock`.
+fn lock_version(name: &str) -> String {
+    let lock = include_str!("../Cargo.lock");
+    let key = format!("name = \"{name}\"\nversion = \"");
+    lock.find(&key)
+        .map(|i| {
+            let rest = &lock[i + key.len()..];
+            rest[..rest.find('"').unwrap_or(0)].to_string()
+        })
+        .unwrap_or_else(|| "?".to_string())
+}
+
+/// Machine and software the numbers were measured on.
+fn environment() {
+    let cpu = std::fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|t| {
+            t.lines()
+                .find(|l| l.starts_with("model name"))
+                .and_then(|l| l.split(':').nth(1).map(|v| v.trim().to_string()))
+        })
+        .unwrap_or_else(|| "unknown CPU".to_string());
+    let rustc = std::process::Command::new("rustc")
+        .arg("-V")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    let cores = std::thread::available_parallelism().map_or(1, usize::from);
+    println!("- Machine: {cpu}, {cores} vCPUs (a shared virtual machine); {rustc}; release build, `lto = true`, `codegen-units = 1`.");
+    println!(
+        "- Compressors: lz4 {} (the C library liblz4, block format with the original length prepended), zstd {} (C library), snap {} (Snappy, pure Rust), flate2 {} (zlib/deflate through the pure-Rust miniz_oxide), brotli {} (pure Rust). The pure-Rust ports are slower than their C originals, so the deflate and brotli times understate what the C libraries do.",
+        lock_version("lz4"),
+        lock_version("zstd"),
+        lock_version("snap"),
+        lock_version("flate2"),
+        lock_version("brotli")
+    );
+    println!(
+        "- Serializers: serde_json {}, bincode {}, postcard {}, rmp-serde {}, rkyv {}, wirefold {}.",
+        lock_version("serde_json"),
+        lock_version("bincode"),
+        lock_version("postcard"),
+        lock_version("rmp-serde"),
+        lock_version("rkyv"),
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+/// The shareable report: general-purpose compressors on the `Collapse` bytes, every serializer under the main
+/// compressors, end-to-end times for lz4 and zstd, and the column encodings behind each compressor.
+fn report(n: usize) {
+    environment();
+    let datasets = [
+        ("Telemetry-shaped", "ordered"),
+        ("Random", "random"),
+        ("Sensor-shaped", "sensor"),
+    ];
+    for (title, dataset) in datasets {
+        let data: &'static Vec<Event> = Box::leak(Box::new(dataset_by_name(dataset, n)));
+        println!("\n## {title} records ({n} records)\n");
+
+        // 1. every compressor on the Collapse bytes
+        let wf = (serializer("wirefold", data).ser)();
+        println!(
+            "### Compressors on the `Collapse` bytes ({} bytes)\n",
+            wf.len()
+        );
+        println!("| compressor | size (B) | ratio | size / raw | encode (ms) | encode (MB/s) | decode (ms) | decode (MB/s) |");
+        println!("|---|---:|---:|---:|---:|---:|---:|---:|");
+        let all = [
+            Backend::None,
+            Backend::Lz4Fast,
+            Backend::Lz4Hc(9),
+            Backend::Snappy,
+            Backend::Deflate(1),
+            Backend::Deflate(6),
+            Backend::Deflate(9),
+            Backend::Brotli(1),
+            Backend::Brotli(5),
+            Backend::Brotli(9),
+            Backend::Brotli(11),
+            Backend::Zstd(1),
+            Backend::Zstd(3),
+            Backend::Zstd(9),
+            Backend::Zstd(19),
+        ];
+        let mb = wf.len() as f64 / 1e6;
+        for b in all {
+            let z = b.compress(&wf);
+            assert_eq!(b.decompress(&z), wf, "{} round trip", b.name());
+            let (e, d) = (auto_ms(|| b.compress(&wf)), auto_ms(|| b.decompress(&z)));
+            let rate = |t: f64| {
+                if b == Backend::None {
+                    "-".to_string()
+                } else {
+                    format!("{:.0}", mb / (t / 1e3))
+                }
+            };
+            println!(
+                "| {} | {} | {:.2} | {:.1}% | {e:.2} | {} | {d:.2} | {} |",
+                b.name(),
+                z.len(),
+                wf.len() as f64 / z.len() as f64,
+                100.0 * z.len() as f64 / wf.len() as f64,
+                rate(e),
+                rate(d),
+            );
+        }
+
+        // 2. every serializer under the main compressors
+        let sers = ["wirefold", "bincode", "postcard", "rmp", "rkyv", "json"];
+        let cols = [
+            Backend::None,
+            Backend::Lz4Fast,
+            Backend::Snappy,
+            Backend::Zstd(1),
+            Backend::Zstd(3),
+            Backend::Zstd(19),
+            Backend::Brotli(5),
+        ];
+        println!("\n### Size of every serializer's bytes under each compressor\n");
+        let head: Vec<String> = cols.iter().map(|b| b.name()).collect();
+        println!("| serializer | {} |", head.join(" | "));
+        println!("|---|{}", "---:|".repeat(cols.len()));
+        let mut timing = Vec::new();
+        for w in sers {
+            let s = serializer(w, data);
+            let bytes = (s.ser)();
+            let mut row = vec![s.name.to_string()];
+            for b in cols {
+                let z = b.compress(&bytes);
+                assert!((s.check)(&b.decompress(&z)), "{w} {} round trip", b.name());
+                row.push(format!("{}", z.len()));
+            }
+            println!("| {} |", row.join(" | "));
+            let ser_ms = ms(9, || (s.ser)());
+            let de_ms = ms(9, || (s.de)(&bytes));
+            timing.push((s.name, bytes, ser_ms, de_ms));
+        }
+
+        // 3. end-to-end times for lz4 and zstd
+        println!("\n### End-to-end time with lz4 and with zstd -3\n");
+        println!("Encode is serialize then compress, decode is decompress then deserialize; milliseconds, median of 5.\n");
+        println!("| serializer | serialize | + lz4: compress | encode total | decompress | deserialize | decode total | + zstd -3: compress | encode total | decompress | decode total |");
+        println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+        for (name, bytes, ser_ms, de_ms) in &timing {
+            let mut row = vec![name.to_string(), format!("{ser_ms:.2}")];
+            for (k, b) in [Backend::Lz4Fast, Backend::Zstd(3)].into_iter().enumerate() {
+                let z = b.compress(bytes);
+                let (c, d) = (ms(5, || b.compress(bytes)), ms(5, || b.decompress(&z)));
+                row.push(format!("{c:.2}"));
+                row.push(format!("{:.2}", ser_ms + c));
+                if k == 0 {
+                    row.push(format!("{d:.2}"));
+                    row.push(format!("{de_ms:.2}"));
+                    row.push(format!("{:.2}", d + de_ms));
+                } else {
+                    row.push(format!("{d:.2}"));
+                    row.push(format!("{:.2}", d + de_ms));
+                }
+            }
+            println!("| {} |", row.join(" | "));
+        }
+
+        // 4. the column encodings behind each compressor
+        println!("\n### `Collapse` columns with encodings, behind each compressor\n");
+        println!("The same compressor is applied to the whole buffer, to each column as its own frame, and to each column after the encodings (delta, exact-bit-width packing, decimal scaling, dictionary). Times are for the encoded columns.\n");
+        println!("| compressor | whole buffer (B) | columns (B) | encoded columns (B) | saving vs whole | encode (ms) | decode (ms) |");
+        println!("|---|---:|---:|---:|---:|---:|---:|");
+        for b in [
+            Backend::None,
+            Backend::Lz4Fast,
+            Backend::Lz4Hc(9),
+            Backend::Snappy,
+            Backend::Deflate(6),
+            Backend::Zstd(1),
+            Backend::Zstd(3),
+            Backend::Zstd(19),
+            Backend::Brotli(5),
+            Backend::Brotli(11),
+        ] {
+            let whole = b.compress(&wf).len();
+            let plain = columns_compress(&wf, b, Mode::Plain, 1).len();
+            let c = columns_compress(&wf, b, Mode::Smart, 1);
+            assert_eq!(
+                columns_decompress(&c, b),
+                wf,
+                "{} columns round trip",
+                b.name()
+            );
+            let (e, d) = (
+                auto_ms(|| columns_compress(&wf, b, Mode::Smart, 1)),
+                auto_ms(|| columns_decompress(&c, b)),
+            );
+            println!(
+                "| {} | {whole} | {plain} | {} | {:.0}% | {e:.2} | {d:.2} |",
+                b.name(),
+                c.len(),
+                100.0 * (1.0 - c.len() as f64 / whole as f64),
+            );
+        }
+    }
 }
 
 /// Number formatting, which every text format pays for: std against `ryu` and `itoa`, and against
@@ -1795,6 +2028,10 @@ fn main() {
     }
     if args.get(1).map(String::as_str) == Some("column") && args.len() == 5 {
         column_row(&args[2], args[3].parse().unwrap(), &args[4]);
+        return;
+    }
+    if args.get(1).map(String::as_str) == Some("report") {
+        report(args.get(2).and_then(|v| v.parse().ok()).unwrap_or(20_000));
         return;
     }
     if args.get(1).map(String::as_str) == Some("bf16") {
