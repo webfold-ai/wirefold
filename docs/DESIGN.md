@@ -34,9 +34,11 @@ is walked field by field, row by row, and each format receives a stream of calls
 
 wirefold keeps the data in the shape it will be used in:
 
-- **`#[derive(Collapse)]` lays a `Vec<T>` out as columns.** A column of `f64` is a contiguous run of bytes in the
-  file. Opening the buffer validates the layout without walking rows, and reading one column is a slice, not a
-  decode. Summing one field of 100,000 telemetry records reads only that field's bytes.
+- **`#[derive(Collapse)]` lays a `Vec<T>` out as a section table.** The scalar fields are one row-major array of
+  packed records and each variable-length field is a column of its own. Opening the buffer validates the layout
+  without walking rows, and reading a field is a read at a computed offset, not a decode. Summing the `f64` field
+  of the telemetry records strides through the record array (0.3 ms for 20,000 records); the strings are never
+  touched.
 - **Text formats go through one universal `SyntaxTerm`.** JSON, YAML, TOON, POML, CSV and others parse into the
   same tree and render from it, so a conversion is parse then render, not a per-pair adapter.
 - **Parsers are generic over a `Build` trait** with an owned builder (`SyntaxTerm`) and a borrowed one
@@ -49,11 +51,12 @@ on the serde ecosystem, serde is the right choice.
 
 These are row-wise (bincode, postcard) or archive-in-place (rkyv). They are fast and small, and the benchmark
 shows them winning some rows: bincode and rkyv decode a full vector of records as fast as or faster than
-wirefold, and rkyv's validated column read beats wirefold's. What columnar layout buys is the case those formats
-cannot serve cheaply: reading one field of many records without touching the rest. It does not buy smaller
-compressed output on the benchmark data: after zstd -19 the telemetry records are 207,470 bytes as `Collapse`
-against 199,079 for bincode and 194,386 for postcard, because the varint and in-place encodings of those
-formats leave less for the compressor to remove than fixed-width columns do.
+wirefold, and rkyv's validated column read beats wirefold's. What the layout buys is a zero-copy
+open that validates without walking the rows. It does not buy smaller compressed output as stored: after zstd -19 the
+telemetry records are 207,470 bytes as `Collapse` against 199,079 for bincode and 194,386 for postcard, because the
+scalar fields are interleaved row after row. Split into one plane per field and compressed plane by plane, the same
+records are 151,213 bytes at -19 and 166,713 at zstd -3, smaller than any of them (see BENCHMARKS.md, Columns and
+zstd); that split is not in the library, and a layout with contiguous scalar columns would make it a slice.
 
 ## Parsing as a fold
 

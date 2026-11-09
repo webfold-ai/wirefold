@@ -11,7 +11,7 @@ cargo run --release -- 20000       # records [and runs per cell]; default 20000 
 ```
 
 It prints markdown tables. Every pipeline is round-trip checked before it is timed and runs in a fresh process;
-the table gives the mean of 3 runs with the range. Encode is serialize then compress and decode is decompress
+the table gives the mean of 3 runs with the range. The `columns` pipelines split a `Collapse` buffer into per-field planes and compress each with zstd (bench-only code). Encode is serialize then compress and decode is decompress
 then deserialize, with each stage timed on its own, and the Rust-side allocations of one encode and one decode
 are counted. Run it on an otherwise idle machine: other CPU work changes the numbers. A full run takes about two
 minutes.
@@ -41,7 +41,7 @@ Results and how to read them: [`../docs/BENCHMARKS.md`](../docs/BENCHMARKS.md).
 ## What it measures
 
 - **Two datasets.** Telemetry-shaped records (increasing timestamps, small domains, repeated names) and
-  random records, the worst case for a columnar model.
+  random records, which have no structure to exploit.
 - **Pipelines**: size, encode (serialize + compress) and decode (decompress + deserialize) with the stages timed
   separately, and allocation counts, for each serializer raw and with each compressor.
 - **Reading one column** of a packed buffer without decoding the rest (wirefold and rkyv read in place;

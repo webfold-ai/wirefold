@@ -19,7 +19,8 @@
 // — to documented `unsafe` blocks in `web.rs`; everything else denies unchecked unsafe.
 #![deny(unsafe_op_in_unsafe_fn)]
 
-/// `#[derive(Collapse)]` — the columnar zero-copy bridge (feature `derive`). Generates
+/// `#[derive(Collapse)]` — the zero-copy bridge (feature `derive`): scalar fields as one row-major
+/// array of packed records, variable-length fields as columns. Generates
 /// `T::collapse_encode(&[T]) -> Seed` + a zero-copy `TView` from a flat struct, so the column-gather
 /// is generated, not hand-written. Build-time proc-macro; the runtime stays zero-dep.
 #[cfg(feature = "derive")]

@@ -188,6 +188,36 @@ fn column_row(dataset: &str, n: usize, row: &str) {
             });
             ("postcard (decode all, then sum)", b.len(), t)
         }
+        "col-collapse-whole-zstd3" => {
+            let z = zstd::encode_all(&wf[..], 3).unwrap();
+            let read = || {
+                let b = zstd::decode_all(&z[..]).unwrap();
+                let v = EventView::collapse_open(&b).unwrap();
+                (0..v.collapse_len()).map(|i| v.value(i)).sum::<f64>()
+            };
+            assert_eq!(read(), want);
+            let t = ms(runs, read);
+            (
+                "whole buffer zstd -3: decompress all, then read",
+                z.len(),
+                t,
+            )
+        }
+        "col-collapse-cols-zstd3" | "col-collapse-colshuf-zstd3" => {
+            let transform = row == "col-collapse-colshuf-zstd3";
+            let z = columns_compress(&wf, 3, transform);
+            assert_eq!(columns_value_sum(&z, transform), want);
+            let t = ms(runs, || columns_value_sum(&z, transform));
+            (
+                if transform {
+                    "columns, shuffle, zstd -3: decompress one column"
+                } else {
+                    "columns, zstd -3: decompress one column"
+                },
+                z.len(),
+                t,
+            )
+        }
         other => panic!("unknown column row {other:?}"),
     };
     println!("| {name} | {size} | {t:.3} |");
@@ -274,6 +304,165 @@ fn serializer(which: &str, data: &'static Vec<Event>) -> Serializer {
     }
 }
 
+// ── Columns. The `Event` buffer is a section table of two sections: the scalar fields as one array of
+// packed 22-byte records (row-major), then the strings as a ragged column. These helpers split it into
+// one plane per field (a true column store), compress each plane with zstd (zstd stays in this crate),
+// optionally byte-shuffling the multi-byte planes, and rebuild the exact buffer. Reading one field then
+// decompresses only its plane. The field offsets are those of the packed record, checked by the round trip.
+
+/// `(offset, width)` of each scalar field in the packed record: ts, user, kind, value, ok.
+const FIELDS: [(usize, usize); 5] = [(0, 8), (8, 4), (12, 1), (13, 8), (21, 1)];
+const RECORD: usize = 22;
+/// Index of the `f64` field in [`FIELDS`].
+const VALUE_PLANE: usize = 3;
+
+fn le_u64(b: &[u8], at: usize) -> usize {
+    u64::from_le_bytes(b[at..at + 8].try_into().unwrap()) as usize
+}
+
+/// Group a plane's elements by byte position (all first bytes, then all second bytes, ...).
+fn shuffle(d: &[u8], w: usize) -> Vec<u8> {
+    if w <= 1 {
+        return d.to_vec();
+    }
+    let n = d.len() / w;
+    let mut o = vec![0u8; d.len()];
+    for i in 0..n {
+        for b in 0..w {
+            o[b * n + i] = d[i * w + b];
+        }
+    }
+    o
+}
+
+fn unshuffle(d: &[u8], w: usize) -> Vec<u8> {
+    if w <= 1 {
+        return d.to_vec();
+    }
+    let n = d.len() / w;
+    let mut o = vec![0u8; d.len()];
+    for i in 0..n {
+        for b in 0..w {
+            o[i * w + b] = d[b * n + i];
+        }
+    }
+    o
+}
+
+/// The planes of a buffer, in frame order: the five scalar fields, the string lengths, the string bytes.
+/// Multi-byte planes are byte-shuffled when `transform` is set.
+fn planes(b: &[u8], transform: bool) -> Vec<Vec<u8>> {
+    let (st0, st1) = (le_u64(b, 8), le_u64(b, 16));
+    let count = le_u64(b, st0);
+    let rec = &b[st0 + 8..st0 + 8 + count * RECORD];
+    let mut out: Vec<Vec<u8>> = FIELDS
+        .iter()
+        .map(|&(off, w)| {
+            let plane: Vec<u8> = (0..count)
+                .flat_map(|i| rec[i * RECORD + off..i * RECORD + off + w].iter().copied())
+                .collect();
+            if transform {
+                shuffle(&plane, w)
+            } else {
+                plane
+            }
+        })
+        .collect();
+    let n = le_u64(b, st1);
+    let offs: Vec<usize> = (0..=n).map(|i| le_u64(b, st1 + 8 + 8 * i)).collect();
+    let lens: Vec<u8> = (0..n)
+        .flat_map(|i| ((offs[i + 1] - offs[i]) as u64).to_le_bytes())
+        .collect();
+    out.push(if transform { shuffle(&lens, 8) } else { lens });
+    let text = st1 + 8 + 8 * (n + 1);
+    out.push(b[text..text + offs[n]].to_vec());
+    out
+}
+
+/// Compress a buffer plane by plane:
+/// `[total len][raw section table][record count][string count][compressed length per plane][frames]`.
+fn columns_compress(b: &[u8], level: i32, transform: bool) -> Vec<u8> {
+    let (st0, st1) = (le_u64(b, 8), le_u64(b, 16));
+    let frames: Vec<Vec<u8>> = planes(b, transform)
+        .iter()
+        .map(|p| zstd::encode_all(&p[..], level).unwrap())
+        .collect();
+    let mut out = Vec::new();
+    out.extend((b.len() as u32).to_le_bytes());
+    out.extend_from_slice(&b[..40]);
+    out.extend((le_u64(b, st0) as u32).to_le_bytes());
+    out.extend((le_u64(b, st1) as u32).to_le_bytes());
+    for f in &frames {
+        out.extend((f.len() as u32).to_le_bytes());
+    }
+    for f in &frames {
+        out.extend_from_slice(f);
+    }
+    out
+}
+
+/// The parts of a plane-compressed buffer: total length, section table, counts and each frame.
+fn columns_parse(z: &[u8]) -> (usize, &[u8], usize, usize, Vec<&[u8]>) {
+    let u32_at = |at: usize| u32::from_le_bytes(z[at..at + 4].try_into().unwrap()) as usize;
+    let nplanes = FIELDS.len() + 2;
+    let mut at = 4 + 40 + 8 + 4 * nplanes;
+    let frames = (0..nplanes)
+        .map(|j| {
+            let l = u32_at(4 + 40 + 8 + 4 * j);
+            let f = &z[at..at + l];
+            at += l;
+            f
+        })
+        .collect();
+    (u32_at(0), &z[4..44], u32_at(44), u32_at(48), frames)
+}
+
+/// Rebuild the exact buffer from its plane frames.
+fn columns_decompress(z: &[u8], transform: bool) -> Vec<u8> {
+    let (total, header, count, n, frames) = columns_parse(z);
+    let plane = |j: usize, w: usize| {
+        let d = zstd::decode_all(frames[j]).unwrap();
+        if transform {
+            unshuffle(&d, w)
+        } else {
+            d
+        }
+    };
+    let (st0, st1) = (le_u64(header, 8), le_u64(header, 16));
+    let mut out = vec![0u8; total];
+    out[..40].copy_from_slice(header);
+    out[st0..st0 + 8].copy_from_slice(&(count as u64).to_le_bytes());
+    for (j, &(off, w)) in FIELDS.iter().enumerate() {
+        let p = plane(j, w);
+        for i in 0..count {
+            let dst = st0 + 8 + i * RECORD + off;
+            out[dst..dst + w].copy_from_slice(&p[i * w..(i + 1) * w]);
+        }
+    }
+    let lens = plane(FIELDS.len(), 8);
+    let text = zstd::decode_all(frames[FIELDS.len() + 1]).unwrap();
+    out[st1..st1 + 8].copy_from_slice(&(n as u64).to_le_bytes());
+    let mut off = 0u64;
+    out[st1 + 8..st1 + 16].copy_from_slice(&off.to_le_bytes());
+    for i in 0..n {
+        off += u64::from_le_bytes(lens[8 * i..8 * i + 8].try_into().unwrap());
+        out[st1 + 16 + 8 * i..st1 + 24 + 8 * i].copy_from_slice(&off.to_le_bytes());
+    }
+    let t = st1 + 8 + 8 * (n + 1);
+    out[t..t + text.len()].copy_from_slice(&text);
+    out
+}
+
+/// Sum of the `f64` field from a plane-compressed buffer, decompressing only that field's plane.
+fn columns_value_sum(z: &[u8], transform: bool) -> f64 {
+    let (_, _, _, _, frames) = columns_parse(z);
+    let d = zstd::decode_all(frames[VALUE_PLANE]).unwrap();
+    let d = if transform { unshuffle(&d, 8) } else { d };
+    d.chunks_exact(8)
+        .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+        .sum()
+}
+
 /// The compression stage after a serializer.
 #[derive(Clone, Copy)]
 enum Codec {
@@ -282,6 +471,11 @@ enum Codec {
     Zstd(i32),
     /// wirefold's own `compress()`.
     Wirefold,
+    /// A `Collapse` buffer compressed column by column with zstd, with or without the columnar transform.
+    Columns {
+        level: i32,
+        transform: bool,
+    },
 }
 
 impl Codec {
@@ -289,6 +483,14 @@ impl Codec {
         match s {
             "raw" => Codec::Raw,
             "wirefold" => Codec::Wirefold,
+            c if c.starts_with("colshuf") => Codec::Columns {
+                level: c["colshuf".len()..].parse().expect("a level"),
+                transform: true,
+            },
+            c if c.starts_with("cols") => Codec::Columns {
+                level: c["cols".len()..].parse().expect("a level"),
+                transform: false,
+            },
             z => Codec::Zstd(
                 z.strip_prefix("zstd")
                     .expect("a codec")
@@ -303,6 +505,16 @@ impl Codec {
             Codec::Raw => "raw".to_string(),
             Codec::Zstd(l) => format!("+ zstd -{l}"),
             Codec::Wirefold => "+ wirefold compress()".to_string(),
+            Codec::Columns {
+                level,
+                transform: false,
+            } => format!("+ columns, zstd -{level}"),
+            Codec::Columns {
+                level,
+                transform: true,
+            } => {
+                format!("+ columns, shuffle, zstd -{level}")
+            }
         }
     }
 
@@ -311,6 +523,7 @@ impl Codec {
             Codec::Raw => bytes,
             Codec::Zstd(l) => zstd::encode_all(&bytes[..], l).unwrap(),
             Codec::Wirefold => wirefold::codec::compress(&bytes),
+            Codec::Columns { level, transform } => columns_compress(&bytes, level, transform),
         }
     }
 
@@ -319,13 +532,14 @@ impl Codec {
             Codec::Raw => Cow::Borrowed(z),
             Codec::Zstd(_) => Cow::Owned(zstd::decode_all(z).unwrap()),
             Codec::Wirefold => Cow::Owned(wirefold::codec::decompress(z)),
+            Codec::Columns { transform, .. } => Cow::Owned(columns_decompress(z, transform)),
         }
     }
 
     /// Repetitions per run: the slow settings take longer than the others.
     fn reps(self) -> usize {
         match self {
-            Codec::Zstd(l) if l >= 10 => 3,
+            Codec::Zstd(l) | Codec::Columns { level: l, .. } if l >= 10 => 3,
             Codec::Wirefold => 5,
             _ => 9,
         }
@@ -430,14 +644,27 @@ fn serialize_tables(n: usize, runs: usize) {
     let mean = |v: &[f64]| spread(v).0;
     for (title, dataset) in [
         ("Telemetry-shaped records", "ordered"),
-        ("Random records (worst case for a columnar model)", "random"),
+        ("Random records (no structure to exploit)", "random"),
     ] {
         println!("\n### {title} ({n} records)\n");
         println!("Encode is serialize then compress; decode is decompress then deserialize. Milliseconds. Allocations are Rust-side calls and MiB requested for one encode and one decode.\n");
         println!("| pipeline | size (bytes) | bytes/record | encode (ms) | serialize | compress | decode (ms) | decompress | deserialize | encode allocs (MiB) | decode allocs (MiB) |");
         println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
         for which in ["wirefold", "bincode", "postcard", "rmp", "rkyv", "json"] {
-            for codec in ["raw", "zstd1", "zstd3", "zstd6", "zstd19", "wirefold"] {
+            let mut codecs = vec!["raw", "zstd1", "zstd3", "zstd6", "zstd19", "wirefold"];
+            if which == "wirefold" {
+                codecs.extend([
+                    "cols1",
+                    "cols3",
+                    "cols6",
+                    "cols19",
+                    "colshuf1",
+                    "colshuf3",
+                    "colshuf6",
+                    "colshuf19",
+                ]);
+            }
+            for codec in codecs {
                 let rows: Vec<Vec<String>> = (0..runs)
                     .map(|_| child_row(&["pipeline", dataset, &n.to_string(), which, codec]))
                     .collect();
@@ -465,7 +692,15 @@ fn serialize_tables(n: usize, runs: usize) {
         println!("\nSum one `f64` column of {n} records (open + read, no full decode):\n");
         println!("| format | time (ms) |");
         println!("|---|---:|");
-        for row in ["col-collapse", "col-rkyv", "col-bincode", "col-postcard"] {
+        for row in [
+            "col-collapse",
+            "col-rkyv",
+            "col-bincode",
+            "col-postcard",
+            "col-collapse-whole-zstd3",
+            "col-collapse-cols-zstd3",
+            "col-collapse-colshuf-zstd3",
+        ] {
             let times: Vec<f64> = (0..runs)
                 .map(|_| {
                     child_row(&["column", dataset, &n.to_string(), row])[3]

@@ -15,6 +15,11 @@ All notable changes to this crate are documented in this file. The format follow
   encodes the telemetry benchmark in 127 ms (was 3.5 s) and decodes it in 2.0 ms (was 1.5 s), at 39% larger
   output on that data. zstd -1 does the same in 2.0 ms and 1.2 ms with 237,083 bytes, so compress with zstd when
   compression matters. `Collapse` serialization is unchanged and independent of it.
+- Documentation correction: `Collapse` stores the scalar fields of a record slice as one row-major array of packed
+  records and only variable-length fields as columns; earlier text called the whole layout columnar. The
+  benchmarks now include compressing the scalar fields plane by plane (a bench-only split): 166,713 bytes against
+  234,791 for zstd on the whole buffer at zstd -3 on the telemetry records, with a one-field read that decompresses
+  only that field.
 - The benchmark harness now measures pipelines: each serializer raw and followed by zstd (levels 1, 3, 6, 19) and
   by `compress()`, with serialize/compress and decompress/deserialize timed separately and Rust-side allocations
   counted, replacing rows that timed a compressor on bytes serialized outside the timer. The docs no longer claim

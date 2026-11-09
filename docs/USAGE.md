@@ -13,10 +13,11 @@ wirefold = { git = "https://github.com/webfold-ai/wirefold", features = ["derive
 Pick only the features you need (see the table in the [README](../README.md)). The library depends on
 apeiron and nothing else; the derive crate depends on nothing.
 
-## Columnar zero-copy records: `#[derive(Collapse)]`
+## Zero-copy records: `#[derive(Collapse)]`
 
-`Collapse` stores a slice of records column by column. Opening the bytes checks the layout once; it
-does not walk the rows, so reading one field of one row costs the read, not a decode.
+`Collapse` stores a slice of records as one row-major array of packed records for the scalar fields and one column
+per variable-length field (strings, vectors). Opening the bytes checks the layout once; it does not walk the rows, so
+reading one field of one row costs the read, not a decode.
 
 ```rust
 use wirefold::codec::web::CollapseElem;
