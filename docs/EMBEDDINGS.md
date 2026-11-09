@@ -252,13 +252,13 @@ measured table: /tmp/tcotest/tcofold/data/embed-scan.csv (9 formats)
   format          vCores    RAM GB  recall c/i   rent (best provider) band         own-node share band    cheaper
   mrl64 int8         0.3       0.7  1.00/0.01*         17 [   17-    17] Bin          2 [    2-     2]        own
   binary rot         0.5       1.3  1.00/0.23*         19 [   19-    19] Bin          4 [    4-     4]        own
-  mrl256 int8        0.9       2.6  1.00/0.09*         23 [   23-    23] Bin          7 [    7-     7]        own
-  2-bit rot          1.0       2.6  1.00/0.93*         24 [   24-    24] Bin          9 [    9-     9]        own
-  int4 rot           1.7       5.2  1.00/1.00          31 [   31-    31] Bin         14 [   14-    14]        own
-  int8               3.0      10.3  1.00/1.00          46 [   46-    47] Bin         26 [   25-    27]        own
-  int8 rot           3.0      10.3  1.00/1.00          46 [   45-    47] Bin         26 [   24-    26]        own
-  f16                5.7      20.5  1.00/1.00          71 [   69-    72] Bin         50 [   48-    51]        own
-  f32               13.1      41.0  1.00/1.00         145 [  143-   147] Bin        113 [  111-   116]        own
+  mrl256 int8        0.9       2.6  1.00/0.09*         23 [   23-    23] Bin          7 [    6-     7]        own
+  2-bit rot          1.0       2.6  1.00/0.93*         24 [   24-    24] Bin          8 [    8-     8]        own
+  int4 rot           1.7       5.2  1.00/1.00          31 [   31-    31] Bin         13 [   12-    13]        own
+  int8               3.0      10.3  1.00/1.00          46 [   46-    47] Bin         23 [   22-    24]        own
+  int8 rot           3.0      10.3  1.00/1.00          46 [   45-    47] Bin         23 [   22-    24]        own
+  f16                5.7      20.5  1.00/1.00          71 [   69-    72] Bin         45 [   43-    46]        own
+  f32               13.1      41.0  1.00/1.00         145 [  143-   147] Bin        102 [  100-   104]        own
 
 ── 10M rows, 1 QPS, 16 queries per pass ──
   format          vCores    RAM GB  recall c/i   rent (best provider) band         own-node share band    cheaper
@@ -266,92 +266,94 @@ measured table: /tmp/tcotest/tcofold/data/embed-scan.csv (9 formats)
   binary rot         0.2       1.3  1.00/0.23*         17 [   17-    17] Bin          2 [    2-     2]        own
   mrl256 int8        0.3       2.6  1.00/0.09*         19 [   19-    19] Bin          2 [    2-     3]        own
   2-bit rot          0.5       2.6  1.00/0.93*         20 [   20-    21] Bin          4 [    4-     4]        own
-  int4 rot           0.6       5.2  1.00/1.00          24 [   23-    24] Bin          5 [    4-     6]        own
-  int8 rot           0.8      10.3  1.00/1.00          31 [   31-    32] Bin          7 [    6-     8]        own
-  int8               0.8      10.3  1.00/1.00          31 [   31-    31] Bin          7 [    7-     7]        own
-  f16                1.6      20.5  1.00/1.00          41 [   41-    43] Bin         14 [   12-    15]        own
-  f32                4.0      41.0  1.00/1.00          81 [   80-    83] Bin         34 [   34-    37]        own
+  int4 rot           0.6       5.2  1.00/1.00          24 [   23-    24] Bin          5 [    4-     5]        own
+  int8 rot           0.8      10.3  1.00/1.00          31 [   31-    32] Bin          6 [    6-     7]        own
+  int8               0.8      10.3  1.00/1.00          31 [   31-    31] Bin          6 [    6-     7]        own
+  f16                1.6      20.5  1.00/1.00          41 [   41-    43] Bin         12 [   11-    14]        own
+  f32                4.0      41.0  1.00/1.00          81 [   80-    83] Bin         31 [   30-    33]        own
 
 ── 10M rows, 50 QPS, one query per pass ──
   format          vCores    RAM GB  recall c/i   rent (best provider) band         own-node share band    cheaper
-  mrl64 int8        13.3       0.7  1.00/0.01*        108 [  108-   108] Bin        115 [  115-   115]       rent
-  binary rot        23.3       1.3  1.00/0.23*        179 [  179-   179] Bin        202 [  202-   202]       rent
-  mrl256 int8       43.3       2.6  1.00/0.09*        320 [  297-   320] Bin        374 [  345-   374]       rent
-  2-bit rot         50.0       2.6  1.00/0.93*        367 [  367-   390] Bin        432 [  432-   461]       rent
-  int4 rot          83.3       5.2  1.00/1.00         603 [  580-   603] Bin        720 [  691-   720]       rent
-  int8             150.0      10.3  1.00/1.00        1075 [ 1029-  1122] Bin       1295 [ 1238-  1353]       rent
-  int8 rot         150.0      10.3  1.00/1.00        1075 [ 1005-  1099] Bin       1295 [ 1209-  1324]       rent
-  f16              286.7      20.5  1.00/1.00        2037 [ 1967-  2084] Bin       2476 [ 2389-  2533]       rent
-  f32              656.7      41.0  1.00/1.00        4650 [ 4556-  4743] Bin       5671 [ 5556-  5786]       rent
+  mrl64 int8        13.3       0.7  1.00/0.01*        108 [  108-   108] Bin        104 [  104-   104]        own
+  binary rot        23.3       1.3  1.00/0.23*        179 [  179-   179] Bin        181 [  181-   181]       rent
+  mrl256 int8       43.3       2.6  1.00/0.09*        320 [  297-   320] Bin        337 [  311-   337]       rent
+  2-bit rot         50.0       2.6  1.00/0.93*        367 [  367-   390] Bin        388 [  388-   414]       rent
+  int4 rot          83.3       5.2  1.00/1.00         603 [  580-   603] Bin        647 [  621-   647]       rent
+  int8             150.0      10.3  1.00/1.00        1075 [ 1029-  1122] Bin       1165 [ 1113-  1217]       rent
+  int8 rot         150.0      10.3  1.00/1.00        1075 [ 1005-  1099] Bin       1165 [ 1087-  1191]       rent
+  f16              286.7      20.5  1.00/1.00        2037 [ 1967-  2084] Bin       2227 [ 2149-  2278]       rent
+  f32              656.7      41.0  1.00/1.00        4650 [ 4556-  4743] Bin       5100 [ 4997-  5204]       rent
 
 ── 10M rows, 50 QPS, 16 queries per pass ──
   format          vCores    RAM GB  recall c/i   rent (best provider) band         own-node share band    cheaper
-  mrl64 int8         6.8       0.7  1.00/0.01*         62 [   59-    66] Bin         58 [   54-    63]        own
-  binary rot        10.2       1.3  1.00/0.23*         87 [   83-    90] Bin         88 [   84-    92]       rent
-  mrl256 int8       14.4       2.6  1.00/0.09*        118 [  112-   130] Bin        125 [  118-   140]       rent
-  2-bit rot         23.9       2.6  1.00/0.93*        185 [  179-   198] Bin        207 [  200-   223]       rent
-  int4 rot          30.3       5.2  1.00/1.00         232 [  198-   254] Bin        261 [  220-   289]       rent
-  int8 rot          39.9      10.3  1.00/1.00         304 [  284-   336] Bin        344 [  319-   384]       rent
-  int8              40.5      10.3  1.00/1.00         309 [  294-   322] Bin        349 [  332-   365]       rent
-  f16               78.2      20.5  1.00/1.00         578 [  536-   640] Bin        675 [  624-   752]       rent
-  f32              199.0      41.0  1.00/1.00        1446 [ 1418-  1535] Bin       1718 [ 1684-  1828]       rent
+  mrl64 int8         6.8       0.7  1.00/0.01*         62 [   59-    66] Bin         53 [   49-    57]        own
+  binary rot        10.2       1.3  1.00/0.23*         87 [   83-    90] Bin         79 [   75-    83]        own
+  mrl256 int8       14.4       2.6  1.00/0.09*        118 [  112-   130] Bin        112 [  106-   125]        own
+  2-bit rot         23.9       2.6  1.00/0.93*        185 [  179-   198] Bin        186 [  180-   201]       rent
+  int4 rot          30.3       5.2  1.00/1.00         232 [  198-   254] Bin        235 [  198-   260]       rent
+  int8 rot          39.9      10.3  1.00/1.00         304 [  284-   336] Bin        310 [  287-   345]       rent
+  int8              40.5      10.3  1.00/1.00         309 [  294-   322] Bin        314 [  298-   329]       rent
+  f16               78.2      20.5  1.00/1.00         578 [  536-   640] Bin        607 [  561-   676]       rent
+  f32              199.0      41.0  1.00/1.00        1446 [ 1418-  1535] Bin       1545 [ 1515-  1644]       rent
 
 ── 100M rows, 1 QPS, one query per pass ──
   format          vCores    RAM GB  recall c/i   rent (best provider) band         own-node share band    cheaper
-  mrl64 int8         2.7       6.8  1.00/0.01*         93 [   93-    93] Dig         23 [   23-    23]        own
-  binary rot         4.7      12.8  1.00/0.23*        116 [  116-   116] Bin         40 [   40-    40]        own
-  mrl256 int8        8.7      26.0  1.00/0.09*        159 [  154-   159] Bin         75 [   69-    75]        own
-  2-bit rot         10.0      25.6  1.00/0.93*        168 [  168-   172] Bin         86 [   86-    92]        own
-  int4 rot          16.7      51.6  1.00/1.00         243 [  238-   243] Bin        144 [  138-   144]        own
-  int8              30.0     102.8  1.00/1.00         393 [  383-   402] Bin        259 [  248-   271]        own
-  int8 rot          30.0     102.8  1.00/1.00         393 [  379-   397] Bin        259 [  242-   265]        own
-  f16               57.3     204.8  1.00/1.00         635 [  621-   644] Bin        495 [  478-   507]        own
-  f32              131.3     409.6  1.00/1.00        1378 [ 1359-  1397] Bin       1134 [ 1111-  1157]        own
+  mrl64 int8         2.7       6.8  1.00/0.01*         93 [   93-    93] Dig         21 [   21-    21]        own
+  binary rot         4.7      12.8  1.00/0.23*        116 [  116-   116] Bin         36 [   36-    36]        own
+  mrl256 int8        8.7      26.0  1.00/0.09*        159 [  154-   159] Bin         67 [   62-    67]        own
+  2-bit rot         10.0      25.6  1.00/0.93*        168 [  168-   172] Bin         78 [   78-    83]        own
+  int4 rot          16.7      51.6  1.00/1.00         243 [  238-   243] Bin        129 [  124-   129]        own
+  int8              30.0     102.8  1.00/1.00         393 [  383-   402] Bin        233 [  223-   243]        own
+  int8 rot          30.0     102.8  1.00/1.00         393 [  379-   397] Bin        233 [  217-   238]        own
+  f16               57.3     204.8  1.00/1.00         635 [  621-   644] Bin        445 [  430-   456]        own
+  f32              131.3     409.6  1.00/1.00        1378 [ 1359-  1397] Bin       1020 [  999-  1041]        own
 
 ── 100M rows, 1 QPS, 16 queries per pass ──
   format          vCores    RAM GB  recall c/i   rent (best provider) band         own-node share band    cheaper
-  mrl64 int8         1.4       6.8  1.00/0.01*         81 [   80-    82] Dig         12 [   11-    13]        own
-  binary rot         2.0      12.8  1.00/0.23*         95 [   95-    96] Dig         18 [   17-    18]        own
-  mrl256 int8        2.9      26.0  1.00/0.09*        118 [  117-   121] Bin         25 [   24-    28]        own
-  2-bit rot          4.8      25.6  1.00/0.93*        131 [  130-   134] Bin         41 [   40-    45]        own
-  int4 rot           6.1      51.6  1.00/1.00         169 [  162-   173] Bin         52 [   44-    58]        own
-  int8 rot           8.0     102.8  1.00/1.00         238 [  234-   245] Bin         69 [   64-    77]        own
-  int8               8.1     102.8  1.00/1.00         239 [  236-   242] Bin         70 [   66-    73]        own
-  f16               15.6     204.8  1.00/1.00         343 [  334-   355] Bin        135 [  125-   150]        own
-  f32               39.8     409.6  1.00/1.00         737 [  732-   755] Bin        344 [  337-   366]        own
+  mrl64 int8         1.4       6.8  1.00/0.01*         81 [   80-    82] Dig         11 [   10-    11]        own
+  binary rot         2.0      12.8  1.00/0.23*         95 [   95-    96] Dig         16 [   15-    17]        own
+  mrl256 int8        2.9      26.0  1.00/0.09*        118 [  117-   121] Bin         22 [   21-    25]        own
+  2-bit rot          4.8      25.6  1.00/0.93*        131 [  130-   134] Bin         37 [   36-    40]        own
+  int4 rot           6.1      51.6  1.00/1.00         169 [  162-   173] Bin         47 [   40-    52]        own
+  int8 rot           8.0     102.8  1.00/1.00         238 [  234-   245] Bin         62 [   57-    69]        own
+  int8               8.1     102.8  1.00/1.00         239 [  236-   242] Bin         63 [   60-    66]        own
+  f16               15.6     204.8  1.00/1.00         343 [  334-   355] Bin        121 [  112-   135]        own
+  f32               39.8     409.6  1.00/1.00         737 [  732-   755] Bin        309 [  303-   329]        own
 
 ── 100M rows, 50 QPS, one query per pass ──
   format          vCores    RAM GB  recall c/i   rent (best provider) band         own-node share band    cheaper
-  mrl64 int8       133.3       6.8  1.00/0.01*       1010 [ 1010-  1010] Bin       1151 [ 1151-  1151]       rent
-  binary rot       233.3      12.8  1.00/0.23*       1717 [ 1717-  1717] Bin       2015 [ 2015-  2015]       rent
-  mrl256 int8      433.3      26.0  1.00/0.09*       3131 [ 2898-  3131] Bin       3742 [ 3454-  3742]       rent
-  2-bit rot        500.0      25.6  1.00/0.93*       3598 [ 3598-  3831] Bin       4318 [ 4318-  4606]       rent
-  int4 rot         833.3      51.6  1.00/1.00        5960 [ 5726-  5960] Bin       7197 [ 6909-  7197]       rent
-  int8            1500.0     102.8  1.00/1.00       10683 [10216- 11149] Bin      12954 [12378- 13530]       rent
-  int8 rot        1500.0     102.8  1.00/1.00       10683 [ 9983- 10916] Bin      12954 [12090- 13242]       rent
-  f16             2866.7     204.8  1.00/1.00       20300 [19600- 20767] Bin      24756 [23893- 25332]       rent
-  f32             6566.7     409.6  1.00/1.00       46425 [45492- 47359] Bin      56709 [55557- 57860]       rent
+  mrl64 int8       133.3       6.8  1.00/0.01*       1010 [ 1010-  1010] Bin       1036 [ 1036-  1036]       rent
+  binary rot       233.3      12.8  1.00/0.23*       1717 [ 1717-  1717] Bin       1812 [ 1812-  1812]       rent
+  mrl256 int8      433.3      26.0  1.00/0.09*       3131 [ 2898-  3131] Bin       3366 [ 3107-  3366]       rent
+  2-bit rot        500.0      25.6  1.00/0.93*       3598 [ 3598-  3831] Bin       3884 [ 3884-  4142]       rent
+  int4 rot         833.3      51.6  1.00/1.00        5960 [ 5726-  5960] Bin       6473 [ 6214-  6473]       rent
+  int8            1500.0     102.8  1.00/1.00       10683 [10216- 11149] Bin      11651 [11133- 12169]       rent
+  int8 rot        1500.0     102.8  1.00/1.00       10683 [ 9983- 10916] Bin      11651 [10874- 11910]       rent
+  f16             2866.7     204.8  1.00/1.00       20300 [19600- 20767] Bin      22266 [21489- 22784]       rent
+  f32             6566.7     409.6  1.00/1.00       46425 [45492- 47359] Bin      51004 [49969- 52040]       rent
 
 ── 100M rows, 50 QPS, 16 queries per pass ──
   format          vCores    RAM GB  recall c/i   rent (best provider) band         own-node share band    cheaper
-  mrl64 int8        67.6       6.8  1.00/0.01*        550 [  517-   589] Bin        584 [  543-   631]       rent
-  binary rot       101.6      12.8  1.00/0.23*        795 [  762-   831] Bin        878 [  837-   923]       rent
-  mrl256 int8      144.3      26.0  1.00/0.09*       1108 [ 1053-  1229] Bin       1247 [ 1178-  1395]       rent
-  2-bit rot        239.5      25.6  1.00/0.93*       1774 [ 1717-  1907] Bin       2068 [ 1998-  2232]       rent
-  int4 rot         302.7      51.6  1.00/1.00        2245 [ 1911-  2466] Bin       2614 [ 2201-  2886]       rent
-  int8 rot         398.5     102.8  1.00/1.00        2972 [ 2768-  3291] Bin       3442 [ 3190-  3835]       rent
-  int8             404.6     102.8  1.00/1.00        3015 [ 2871-  3143] Bin       3494 [ 3316-  3653]       rent
-  f16              782.0     204.8  1.00/1.00        5707 [ 5291-  6330] Bin       6753 [ 6239-  7521]       rent
-  f32             1989.8     409.6  1.00/1.00       14387 [14111- 15277] Bin      17183 [16844- 18281]       rent
+  mrl64 int8        67.6       6.8  1.00/0.01*        550 [  517-   589] Bin        525 [  489-   568]        own
+  binary rot       101.6      12.8  1.00/0.23*        795 [  762-   831] Bin        789 [  753-   830]        own
+  mrl256 int8      144.3      26.0  1.00/0.09*       1108 [ 1053-  1229] Bin       1121 [ 1059-  1255]       rent
+  2-bit rot        239.5      25.6  1.00/0.93*       1774 [ 1717-  1907] Bin       1860 [ 1797-  2007]       rent
+  int4 rot         302.7      51.6  1.00/1.00        2245 [ 1911-  2466] Bin       2351 [ 1980-  2596]       rent
+  int8 rot         398.5     102.8  1.00/1.00        2972 [ 2768-  3291] Bin       3095 [ 2869-  3450]       rent
+  int8             404.6     102.8  1.00/1.00        3015 [ 2871-  3143] Bin       3143 [ 2983-  3285]       rent
+  f16              782.0     204.8  1.00/1.00        5707 [ 5291-  6330] Bin       6074 [ 5612-  6765]       rent
+  f32             1989.8     409.6  1.00/1.00       14387 [14111- 15277] Bin      15455 [15149- 16442]       rent
 
 recall c/i = recall@10 after the f32 re-rank on the clustered / isotropic synthetic corpus; * = under 0.95 on one of them,
 so its price is for a result a real model may not give you. Formats never measured on both corpora are left out.
 ```
 
-What that shows: at 1 QPS owning is cheaper at every size; at 50 QPS the cheaper side flips to renting, because the
-synthetic node costs about A$8.6 per vCore-month at full load (A$138 for 16 vCores) against BinaryLane's A$7 per vCore plus a RAM charge. At 10M rows and 1
+What that shows: at 1 QPS owning is cheaper at every size; at 50 QPS renting is cheaper for the formats that hold recall on both
+corpora (owning is marginally cheaper only for the lossy prefix columns), because the synthetic node costs about
+A$7.8 per vCore-month at the 60% utilisation these services are sized for (A$124 for 16 vCores) against BinaryLane's
+A$7 per vCore plus a RAM charge. At 10M rows and 1
 QPS the cheapest format that holds recall on both corpora is int4 rot (A$5 per month on an owned node batched, A$24
-rented) against A$34 / A$81 for f32. At 100M rows and 50 QPS an exact scan needs hundreds to thousands of vCores
+rented) against A$31 / A$81 for f32. At 100M rows and 50 QPS an exact scan needs hundreds to thousands of vCores
 for any format that holds recall, which is where an index stops being optional; this report does not measure one.
 
 ## How bad our implementation still is
