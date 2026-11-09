@@ -151,7 +151,41 @@ fn column_row(dataset: &str, n: usize, row: &str) {
             let sum = |v: &EventView| (0..v.collapse_len()).map(|i| v.value(i)).sum::<f64>();
             assert_eq!(sum(&EventView::collapse_open(&wf).unwrap()), want);
             let t = ms(runs, || sum(&EventView::collapse_open(&wf).unwrap()));
-            ("wirefold view (open + column read)", wf.len(), t)
+            ("wirefold view (open + per-element accessor)", wf.len(), t)
+        }
+        "col-collapse-slice" => {
+            let sum = |v: &EventView| v.value_column().iter().sum::<f64>();
+            assert_eq!(sum(&EventView::collapse_open(&wf).unwrap()), want);
+            let t = ms(runs, || sum(&EventView::collapse_open(&wf).unwrap()));
+            ("wirefold view (open + column slice)", wf.len(), t)
+        }
+        "col-collapse-open" => {
+            let t = ms(runs, || {
+                EventView::collapse_open(&wf).unwrap().collapse_len()
+            });
+            ("wirefold open only (validates the table)", wf.len(), t)
+        }
+        "col-collapse-read-elem" | "col-collapse-read-slice" => {
+            let v = EventView::collapse_open(&wf).unwrap();
+            let slice = row == "col-collapse-read-slice";
+            let sum = || {
+                if slice {
+                    v.value_column().iter().sum::<f64>()
+                } else {
+                    (0..v.collapse_len()).map(|i| v.value(i)).sum::<f64>()
+                }
+            };
+            assert_eq!(sum(), want);
+            let t = ms(runs.max(25), sum);
+            (
+                if slice {
+                    "wirefold, view already open: column slice"
+                } else {
+                    "wirefold, view already open: per-element accessor"
+                },
+                wf.len(),
+                t,
+            )
         }
         "col-rkyv" => {
             let b = rkyv::to_bytes::<rkyv::rancor::Error>(data).unwrap();
@@ -203,14 +237,18 @@ fn column_row(dataset: &str, n: usize, row: &str) {
                 t,
             )
         }
-        "col-collapse-cols-zstd3" | "col-collapse-colshuf-zstd3" => {
-            let transform = row == "col-collapse-colshuf-zstd3";
-            let z = columns_compress(&wf, 3, transform);
-            assert_eq!(columns_value_sum(&z, transform), want);
-            let t = ms(runs, || columns_value_sum(&z, transform));
+        "col-collapse-cols-zstd3" | "col-collapse-colsmart-zstd3" => {
+            let mode = if row == "col-collapse-colsmart-zstd3" {
+                Mode::Smart
+            } else {
+                Mode::Plain
+            };
+            let z = columns_compress(&wf, 3, mode, 1);
+            assert_eq!(columns_value_sum(&z), want);
+            let t = ms(runs, || columns_value_sum(&z));
             (
-                if transform {
-                    "columns, shuffle, zstd -3: decompress one column"
+                if mode == Mode::Smart {
+                    "columns, encoded planes, zstd -3: decompress one column"
                 } else {
                     "columns, zstd -3: decompress one column"
                 },
@@ -304,20 +342,49 @@ fn serializer(which: &str, data: &'static Vec<Event>) -> Serializer {
     }
 }
 
-// ── Columns. The `Event` buffer is a section table of two sections: the scalar fields as one array of
-// packed 22-byte records (row-major), then the strings as a ragged column. These helpers split it into
-// one plane per field (a true column store), compress each plane with zstd (zstd stays in this crate),
-// optionally byte-shuffling the multi-byte planes, and rebuild the exact buffer. Reading one field then
-// decompresses only its plane. The field offsets are those of the packed record, checked by the round trip.
+// ── Columns. A `Collapse` buffer of `Event`s is a section table with one section per scalar field
+// (a contiguous column: `[count][values]`) and one for the strings (`[n][offsets][bytes]`). These
+// helpers take the columns as planes, optionally transform each plane with an encoding chosen for its
+// type, compress each plane as its own zstd frame (zstd stays in this crate), and rebuild the exact
+// buffer. Reading one field decompresses only its plane.
 
-/// `(offset, width)` of each scalar field in the packed record: ts, user, kind, value, ok.
-const FIELDS: [(usize, usize); 5] = [(0, 8), (8, 4), (12, 1), (13, 8), (21, 1)];
-const RECORD: usize = 22;
-/// Index of the `f64` field in [`FIELDS`].
+/// Element widths of the scalar columns in section order: ts, user, kind, value, ok.
+const SCALAR_WIDTHS: [usize; 5] = [8, 4, 1, 8, 1];
+/// The planes, in frame order: the five scalar columns, then the string lengths and the string bytes.
+const PLANE_NAMES: [&str; 7] = [
+    "ts (u64)",
+    "user (u32)",
+    "kind (u8)",
+    "value (f64)",
+    "ok (bool)",
+    "name lengths",
+    "name bytes",
+];
+/// Index of the `f64` plane.
 const VALUE_PLANE: usize = 3;
+const NPLANES: usize = 7;
+
+/// How planes are transformed before compression.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mode {
+    /// The column bytes as stored.
+    Plain,
+    /// Byte-shuffle each multi-byte plane (kept for comparison).
+    Shuffle,
+    /// Encodings chosen per plane: delta, narrowing, decimal scaling, dictionary.
+    Smart,
+}
 
 fn le_u64(b: &[u8], at: usize) -> usize {
     u64::from_le_bytes(b[at..at + 8].try_into().unwrap()) as usize
+}
+
+/// `(start, length)` of every section of a `Collapse` buffer, from its section table.
+fn sections(b: &[u8]) -> Vec<(usize, usize)> {
+    let n = le_u64(b, 0);
+    (0..n)
+        .map(|j| (le_u64(b, 8 + 8 * j), le_u64(b, 8 + 8 * n + 8 * j)))
+        .collect()
 }
 
 /// Group a plane's elements by byte position (all first bytes, then all second bytes, ...).
@@ -349,49 +416,373 @@ fn unshuffle(d: &[u8], w: usize) -> Vec<u8> {
     o
 }
 
-/// The planes of a buffer, in frame order: the five scalar fields, the string lengths, the string bytes.
-/// Multi-byte planes are byte-shuffled when `transform` is set.
-fn planes(b: &[u8], transform: bool) -> Vec<Vec<u8>> {
-    let (st0, st1) = (le_u64(b, 8), le_u64(b, 16));
-    let count = le_u64(b, st0);
-    let rec = &b[st0 + 8..st0 + 8 + count * RECORD];
-    let mut out: Vec<Vec<u8>> = FIELDS
-        .iter()
-        .map(|&(off, w)| {
-            let plane: Vec<u8> = (0..count)
-                .flat_map(|i| rec[i * RECORD + off..i * RECORD + off + w].iter().copied())
-                .collect();
-            if transform {
-                shuffle(&plane, w)
-            } else {
-                plane
-            }
-        })
+/// The seven raw planes of an `Event` buffer: the scalar columns' values (without the count word), the
+/// string lengths as `u64`s, and the string bytes.
+fn raw_planes(b: &[u8]) -> Vec<Vec<u8>> {
+    let secs = sections(b);
+    let mut out: Vec<Vec<u8>> = (0..5)
+        .map(|j| b[secs[j].0 + 8..secs[j].0 + secs[j].1].to_vec())
         .collect();
-    let n = le_u64(b, st1);
-    let offs: Vec<usize> = (0..=n).map(|i| le_u64(b, st1 + 8 + 8 * i)).collect();
-    let lens: Vec<u8> = (0..n)
-        .flat_map(|i| ((offs[i + 1] - offs[i]) as u64).to_le_bytes())
-        .collect();
-    out.push(if transform { shuffle(&lens, 8) } else { lens });
-    let text = st1 + 8 + 8 * (n + 1);
+    let (st, _) = secs[5];
+    let n = le_u64(b, st);
+    let offs: Vec<usize> = (0..=n).map(|i| le_u64(b, st + 8 + 8 * i)).collect();
+    out.push(
+        (0..n)
+            .flat_map(|i| ((offs[i + 1] - offs[i]) as u64).to_le_bytes())
+            .collect(),
+    );
+    let text = st + 8 + 8 * (n + 1);
     out.push(b[text..text + offs[n]].to_vec());
     out
 }
 
-/// Compress a buffer plane by plane:
-/// `[total len][raw section table][record count][string count][compressed length per plane][frames]`.
-fn columns_compress(b: &[u8], level: i32, transform: bool) -> Vec<u8> {
-    let (st0, st1) = (le_u64(b, 8), le_u64(b, 16));
-    let frames: Vec<Vec<u8>> = planes(b, transform)
-        .iter()
-        .map(|p| zstd::encode_all(&p[..], level).unwrap())
-        .collect();
+/// Rebuild the exact buffer from its section table (`header`) and raw planes.
+fn from_raw_planes(header: &[u8], planes: &[Vec<u8>], total: usize) -> Vec<u8> {
+    let secs = sections(header);
+    let mut out = vec![0u8; total];
+    out[..header.len()].copy_from_slice(header);
+    for j in 0..5 {
+        let (st, _) = secs[j];
+        out[st..st + 8]
+            .copy_from_slice(&((planes[j].len() / SCALAR_WIDTHS[j]) as u64).to_le_bytes());
+        out[st + 8..st + 8 + planes[j].len()].copy_from_slice(&planes[j]);
+    }
+    let (st, _) = secs[5];
+    let n = planes[5].len() / 8;
+    out[st..st + 8].copy_from_slice(&(n as u64).to_le_bytes());
+    let mut off = 0u64;
+    out[st + 8..st + 16].copy_from_slice(&off.to_le_bytes());
+    for i in 0..n {
+        off += u64::from_le_bytes(planes[5][8 * i..8 * i + 8].try_into().unwrap());
+        out[st + 16 + 8 * i..st + 24 + 8 * i].copy_from_slice(&off.to_le_bytes());
+    }
+    let t = st + 8 + 8 * (n + 1);
+    out[t..t + planes[6].len()].copy_from_slice(&planes[6]);
+    out
+}
+
+/// The smallest byte width (1, 2, 4 or 8) that holds `max`.
+fn width_for(max: u64) -> usize {
+    match max {
+        0..=0xFF => 1,
+        0x100..=0xFFFF => 2,
+        0x1_0000..=0xFFFF_FFFF => 4,
+        _ => 8,
+    }
+}
+
+fn put_narrow(out: &mut Vec<u8>, v: u64, w: usize) {
+    out.extend_from_slice(&v.to_le_bytes()[..w]);
+}
+
+fn get_narrow(b: &[u8], i: usize, w: usize) -> u64 {
+    let mut x = [0u8; 8];
+    x[..w].copy_from_slice(&b[i * w..(i + 1) * w]);
+    u64::from_le_bytes(x)
+}
+
+/// Plane tags written as the first byte of a transformed plane.
+const T_RAW: u8 = 0;
+const T_SHUFFLE: u8 = 1;
+const T_DELTA: u8 = 2;
+const T_INTS: u8 = 3;
+const T_DECIMAL: u8 = 4;
+const T_DICT: u8 = 5;
+/// Integer-stream tags: values minus their minimum at the narrowest byte width, or at the exact bit width.
+const I_NARROW: u8 = 0;
+const I_BITS: u8 = 1;
+
+/// Pack `v` (each below `2^bits`) into `bits` bits apiece, least significant bit first.
+fn pack_bits(v: &[u64], bits: usize) -> Vec<u8> {
+    let mut out = vec![0u8; (v.len() * bits).div_ceil(8)];
+    for (i, &x) in v.iter().enumerate() {
+        let mut at = i * bits;
+        let mut left = bits;
+        let mut x = x;
+        while left > 0 {
+            let (byte, off) = (at / 8, at % 8);
+            let take = (8 - off).min(left);
+            out[byte] |= ((x & ((1 << take) - 1)) as u8) << off;
+            x >>= take;
+            at += take;
+            left -= take;
+        }
+    }
+    out
+}
+
+fn unpack_bits(b: &[u8], n: usize, bits: usize) -> Vec<u64> {
+    (0..n)
+        .map(|i| {
+            let (mut at, mut left, mut x, mut got) = (i * bits, bits, 0u64, 0);
+            while left > 0 {
+                let (byte, off) = (at / 8, at % 8);
+                let take = (8 - off).min(left);
+                x |= u64::from((b[byte] >> off) & ((1u16 << take) - 1) as u8) << got;
+                at += take;
+                got += take;
+                left -= take;
+            }
+            x
+        })
+        .collect()
+}
+
+/// An integer sequence as `[kind][width][minimum][data]`: the values less their minimum, at the narrowest
+/// byte width (which a byte compressor then shrinks further) or packed to the exact bit width (which it
+/// cannot, but which is smaller when the values are spread evenly). The smaller after zstd -3 wins.
+fn enc_ints(v: &[i64]) -> Vec<u8> {
+    let min = v.iter().copied().min().unwrap_or(0);
+    let off: Vec<u64> = v.iter().map(|x| (x - min) as u64).collect();
+    let range = off.iter().copied().max().unwrap_or(0);
+    let w = width_for(range);
+    let mut narrow = vec![I_NARROW, w as u8];
+    narrow.extend_from_slice(&min.to_le_bytes());
+    for &x in &off {
+        put_narrow(&mut narrow, x, w);
+    }
+    let bits = (64 - range.leading_zeros() as usize).max(1);
+    let mut packed = vec![I_BITS, bits as u8];
+    packed.extend_from_slice(&min.to_le_bytes());
+    packed.extend(pack_bits(&off, bits));
+    if zstd::encode_all(&narrow[..], 3).unwrap().len() <= packed.len() {
+        narrow
+    } else {
+        packed
+    }
+}
+
+fn dec_ints(e: &[u8], n: usize) -> Vec<i64> {
+    let w = e[1] as usize;
+    let min = i64::from_le_bytes(e[2..10].try_into().unwrap());
+    let d = &e[10..];
+    let off: Vec<u64> = if e[0] == I_NARROW {
+        (0..n).map(|i| get_narrow(d, i, w)).collect()
+    } else {
+        unpack_bits(d, n, w)
+    };
+    off.into_iter().map(|x| x as i64 + min).collect()
+}
+
+/// Encode scalar plane `j` (raw values) with the encoding that suits its type, or leave it raw.
+fn encode_scalar(j: usize, raw: &[u8], mode: Mode) -> Vec<u8> {
+    let w = SCALAR_WIDTHS[j];
+    let mut out = Vec::new();
+    match mode {
+        Mode::Plain => {
+            out.push(T_RAW);
+            out.extend_from_slice(raw);
+        }
+        Mode::Shuffle => {
+            out.push(T_SHUFFLE);
+            out.extend(shuffle(raw, w));
+        }
+        Mode::Smart => match j {
+            // an increasing u64: the first value, then the differences as an integer sequence
+            0 => {
+                let v: Vec<u64> = (0..raw.len() / 8).map(|i| get_narrow(raw, i, 8)).collect();
+                let d: Vec<i64> = v
+                    .windows(2)
+                    .map(|p| p[1].wrapping_sub(p[0]) as i64)
+                    .collect();
+                out.push(T_DELTA);
+                out.extend_from_slice(&v.first().copied().unwrap_or(0).to_le_bytes());
+                out.extend(enc_ints(&d));
+            }
+            // a u32 that rarely needs 4 bytes: an integer sequence
+            1 => {
+                let v: Vec<i64> = (0..raw.len() / 4)
+                    .map(|i| get_narrow(raw, i, 4) as i64)
+                    .collect();
+                out.push(T_INTS);
+                out.extend(enc_ints(&v));
+            }
+            // an f64 that is a decimal number: scaled to an integer sequence
+            3 => {
+                let v: Vec<f64> = (0..raw.len() / 8)
+                    .map(|i| f64::from_bits(get_narrow(raw, i, 8)))
+                    .collect();
+                let scaled = [0u32, 1, 2, 3, 4, 6].iter().find_map(|&sc| {
+                    let m = 10f64.powi(sc as i32);
+                    let c: Vec<i64> = v.iter().map(|x| (x * m).round() as i64).collect();
+                    let ok = v.iter().zip(&c).all(|(x, ci)| {
+                        x.is_finite()
+                            && x.abs() * m < 9.0e15
+                            && (*ci as f64 / m).to_bits() == x.to_bits()
+                    });
+                    ok.then_some((sc, c))
+                });
+                if let Some((sc, c)) = scaled {
+                    out.push(T_DECIMAL);
+                    out.push(sc as u8);
+                    out.extend(enc_ints(&c));
+                } else {
+                    out.push(T_RAW);
+                    out.extend_from_slice(raw);
+                }
+            }
+            _ => {
+                out.push(T_RAW);
+                out.extend_from_slice(raw);
+            }
+        },
+    }
+    out
+}
+
+fn decode_scalar(j: usize, enc: &[u8], n: usize) -> Vec<u8> {
+    let w = SCALAR_WIDTHS[j];
+    match enc[0] {
+        T_RAW => enc[1..].to_vec(),
+        T_SHUFFLE => unshuffle(&enc[1..], w),
+        T_DELTA => {
+            let mut v = u64::from_le_bytes(enc[1..9].try_into().unwrap());
+            let mut out = v.to_le_bytes().to_vec();
+            for d in dec_ints(&enc[9..], n - 1) {
+                v = v.wrapping_add(d as u64);
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out
+        }
+        T_INTS => dec_ints(&enc[1..], n)
+            .into_iter()
+            .flat_map(|x| (x as u32).to_le_bytes())
+            .collect(),
+        T_DECIMAL => {
+            let m = 10f64.powi(i32::from(enc[1]));
+            dec_ints(&enc[2..], n)
+                .into_iter()
+                .flat_map(|c| (c as f64 / m).to_bits().to_le_bytes())
+                .collect()
+        }
+        t => panic!("bad plane tag {t}"),
+    }
+}
+
+/// Encode the two string planes: a dictionary and one-byte indices when there are at most 255 distinct
+/// strings, otherwise the lengths and bytes as stored (or shuffled lengths in `Shuffle` mode).
+fn encode_strings(lens: &[u8], bytes: &[u8], mode: Mode) -> (Vec<u8>, Vec<u8>) {
+    if mode == Mode::Smart {
+        let n = lens.len() / 8;
+        let mut at = 0usize;
+        let mut dict: Vec<&[u8]> = Vec::new();
+        let mut idx = Vec::with_capacity(n);
+        for i in 0..n {
+            let l = get_narrow(lens, i, 8) as usize;
+            let s = &bytes[at..at + l];
+            at += l;
+            let k = dict.iter().position(|d| *d == s).unwrap_or_else(|| {
+                dict.push(s);
+                dict.len() - 1
+            });
+            idx.push(k);
+            if dict.len() > 255 {
+                break;
+            }
+        }
+        if dict.len() <= 255 && idx.len() == n {
+            let mut p5 = vec![T_DICT];
+            p5.extend(idx.iter().map(|&k| k as u8));
+            let mut p6 = vec![T_DICT, dict.len() as u8];
+            for d in &dict {
+                p6.extend((d.len() as u32).to_le_bytes());
+            }
+            for d in &dict {
+                p6.extend_from_slice(d);
+            }
+            return (p5, p6);
+        }
+    }
+    let mut p5 = vec![if mode == Mode::Shuffle {
+        T_SHUFFLE
+    } else {
+        T_RAW
+    }];
+    p5.extend(if mode == Mode::Shuffle {
+        shuffle(lens, 8)
+    } else {
+        lens.to_vec()
+    });
+    let mut p6 = vec![T_RAW];
+    p6.extend_from_slice(bytes);
+    (p5, p6)
+}
+
+fn decode_strings(p5: &[u8], p6: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    if p5[0] == T_DICT {
+        let nd = p6[1] as usize;
+        let dl: Vec<usize> = (0..nd)
+            .map(|i| u32::from_le_bytes(p6[2 + 4 * i..6 + 4 * i].try_into().unwrap()) as usize)
+            .collect();
+        let mut start = Vec::new();
+        let mut at = 2 + 4 * nd;
+        for l in &dl {
+            start.push(at);
+            at += l;
+        }
+        let (mut lens, mut bytes) = (Vec::new(), Vec::new());
+        for &k in &p5[1..] {
+            let k = k as usize;
+            lens.extend((dl[k] as u64).to_le_bytes());
+            bytes.extend_from_slice(&p6[start[k]..start[k] + dl[k]]);
+        }
+        (lens, bytes)
+    } else {
+        let lens = if p5[0] == T_SHUFFLE {
+            unshuffle(&p5[1..], 8)
+        } else {
+            p5[1..].to_vec()
+        };
+        (lens, p6[1..].to_vec())
+    }
+}
+
+/// The encoded planes of a buffer, in frame order.
+fn encoded_planes(b: &[u8], mode: Mode) -> Vec<Vec<u8>> {
+    let raw = raw_planes(b);
+    let mut out: Vec<Vec<u8>> = (0..5).map(|j| encode_scalar(j, &raw[j], mode)).collect();
+    let (p5, p6) = encode_strings(&raw[5], &raw[6], mode);
+    out.push(p5);
+    out.push(p6);
+    out
+}
+
+/// Compress a buffer plane by plane, the planes spread over `threads` threads (static: plane `i` goes to
+/// thread `i % threads`): `[total len][section table][compressed length per plane][frames]`.
+fn columns_compress(b: &[u8], level: i32, mode: Mode, threads: usize) -> Vec<u8> {
+    let planes = encoded_planes(b, mode);
+    let frames: Vec<Vec<u8>> = if threads <= 1 {
+        planes
+            .iter()
+            .map(|p| zstd::encode_all(&p[..], level).unwrap())
+            .collect()
+    } else {
+        let mut slots: Vec<Option<Vec<u8>>> = vec![None; planes.len()];
+        std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..threads)
+                .map(|t| {
+                    let planes = &planes;
+                    sc.spawn(move || {
+                        (t..planes.len())
+                            .step_by(threads)
+                            .map(|i| (i, zstd::encode_all(&planes[i][..], level).unwrap()))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            for h in hs {
+                for (i, f) in h.join().unwrap() {
+                    slots[i] = Some(f);
+                }
+            }
+        });
+        slots.into_iter().map(Option::unwrap).collect()
+    };
+    let header_len = 8 * (1 + 2 * le_u64(b, 0));
     let mut out = Vec::new();
     out.extend((b.len() as u32).to_le_bytes());
-    out.extend_from_slice(&b[..40]);
-    out.extend((le_u64(b, st0) as u32).to_le_bytes());
-    out.extend((le_u64(b, st1) as u32).to_le_bytes());
+    out.extend_from_slice(&b[..header_len]);
+    out.extend((le_u64(b, sections(b)[0].0) as u32).to_le_bytes());
     for f in &frames {
         out.extend((f.len() as u32).to_le_bytes());
     }
@@ -401,64 +792,46 @@ fn columns_compress(b: &[u8], level: i32, transform: bool) -> Vec<u8> {
     out
 }
 
-/// The parts of a plane-compressed buffer: total length, section table, counts and each frame.
-fn columns_parse(z: &[u8]) -> (usize, &[u8], usize, usize, Vec<&[u8]>) {
+/// The parts of a plane-compressed buffer: total length, section table, record count and each frame.
+fn columns_parse(z: &[u8]) -> (usize, &[u8], usize, Vec<&[u8]>) {
     let u32_at = |at: usize| u32::from_le_bytes(z[at..at + 4].try_into().unwrap()) as usize;
-    let nplanes = FIELDS.len() + 2;
-    let mut at = 4 + 40 + 8 + 4 * nplanes;
-    let frames = (0..nplanes)
+    let header_len = 8 * (1 + 2 * le_u64(z, 4));
+    let n = u32_at(4 + header_len);
+    let mut at = 8 + header_len + 4 * NPLANES;
+    let frames = (0..NPLANES)
         .map(|j| {
-            let l = u32_at(4 + 40 + 8 + 4 * j);
+            let l = u32_at(8 + header_len + 4 * j);
             let f = &z[at..at + l];
             at += l;
             f
         })
         .collect();
-    (u32_at(0), &z[4..44], u32_at(44), u32_at(48), frames)
+    (u32_at(0), &z[4..4 + header_len], n, frames)
 }
 
 /// Rebuild the exact buffer from its plane frames.
-fn columns_decompress(z: &[u8], transform: bool) -> Vec<u8> {
-    let (total, header, count, n, frames) = columns_parse(z);
-    let plane = |j: usize, w: usize| {
-        let d = zstd::decode_all(frames[j]).unwrap();
-        if transform {
-            unshuffle(&d, w)
-        } else {
-            d
-        }
-    };
-    let (st0, st1) = (le_u64(header, 8), le_u64(header, 16));
-    let mut out = vec![0u8; total];
-    out[..40].copy_from_slice(header);
-    out[st0..st0 + 8].copy_from_slice(&(count as u64).to_le_bytes());
-    for (j, &(off, w)) in FIELDS.iter().enumerate() {
-        let p = plane(j, w);
-        for i in 0..count {
-            let dst = st0 + 8 + i * RECORD + off;
-            out[dst..dst + w].copy_from_slice(&p[i * w..(i + 1) * w]);
-        }
-    }
-    let lens = plane(FIELDS.len(), 8);
-    let text = zstd::decode_all(frames[FIELDS.len() + 1]).unwrap();
-    out[st1..st1 + 8].copy_from_slice(&(n as u64).to_le_bytes());
-    let mut off = 0u64;
-    out[st1 + 8..st1 + 16].copy_from_slice(&off.to_le_bytes());
-    for i in 0..n {
-        off += u64::from_le_bytes(lens[8 * i..8 * i + 8].try_into().unwrap());
-        out[st1 + 16 + 8 * i..st1 + 24 + 8 * i].copy_from_slice(&off.to_le_bytes());
-    }
-    let t = st1 + 8 + 8 * (n + 1);
-    out[t..t + text.len()].copy_from_slice(&text);
-    out
+fn columns_decompress(z: &[u8]) -> Vec<u8> {
+    let (total, header, n, frames) = columns_parse(z);
+    let dec: Vec<Vec<u8>> = frames
+        .iter()
+        .map(|f| zstd::decode_all(*f).unwrap())
+        .collect();
+    let mut raw: Vec<Vec<u8>> = (0..5).map(|j| decode_scalar(j, &dec[j], n)).collect();
+    let (lens, bytes) = decode_strings(&dec[5], &dec[6]);
+    raw.push(lens);
+    raw.push(bytes);
+    from_raw_planes(header, &raw, total)
 }
 
 /// Sum of the `f64` field from a plane-compressed buffer, decompressing only that field's plane.
-fn columns_value_sum(z: &[u8], transform: bool) -> f64 {
-    let (_, _, _, _, frames) = columns_parse(z);
-    let d = zstd::decode_all(frames[VALUE_PLANE]).unwrap();
-    let d = if transform { unshuffle(&d, 8) } else { d };
-    d.chunks_exact(8)
+fn columns_value_sum(z: &[u8]) -> f64 {
+    let (_, _, n, frames) = columns_parse(z);
+    let raw = decode_scalar(
+        VALUE_PLANE,
+        &zstd::decode_all(frames[VALUE_PLANE]).unwrap(),
+        n,
+    );
+    raw.chunks_exact(8)
         .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
         .sum()
 }
@@ -471,10 +844,10 @@ enum Codec {
     Zstd(i32),
     /// wirefold's own `compress()`.
     Wirefold,
-    /// A `Collapse` buffer compressed column by column with zstd, with or without the columnar transform.
+    /// A `Collapse` buffer compressed column by column with zstd, the planes transformed per `mode`.
     Columns {
         level: i32,
-        transform: bool,
+        mode: Mode,
     },
 }
 
@@ -485,11 +858,15 @@ impl Codec {
             "wirefold" => Codec::Wirefold,
             c if c.starts_with("colshuf") => Codec::Columns {
                 level: c["colshuf".len()..].parse().expect("a level"),
-                transform: true,
+                mode: Mode::Shuffle,
+            },
+            c if c.starts_with("colsmart") => Codec::Columns {
+                level: c["colsmart".len()..].parse().expect("a level"),
+                mode: Mode::Smart,
             },
             c if c.starts_with("cols") => Codec::Columns {
                 level: c["cols".len()..].parse().expect("a level"),
-                transform: false,
+                mode: Mode::Plain,
             },
             z => Codec::Zstd(
                 z.strip_prefix("zstd")
@@ -505,16 +882,11 @@ impl Codec {
             Codec::Raw => "raw".to_string(),
             Codec::Zstd(l) => format!("+ zstd -{l}"),
             Codec::Wirefold => "+ wirefold compress()".to_string(),
-            Codec::Columns {
-                level,
-                transform: false,
-            } => format!("+ columns, zstd -{level}"),
-            Codec::Columns {
-                level,
-                transform: true,
-            } => {
-                format!("+ columns, shuffle, zstd -{level}")
-            }
+            Codec::Columns { level, mode } => match mode {
+                Mode::Plain => format!("+ columns, zstd -{level}"),
+                Mode::Shuffle => format!("+ columns, byte shuffle, zstd -{level}"),
+                Mode::Smart => format!("+ columns, encoded planes, zstd -{level}"),
+            },
         }
     }
 
@@ -523,7 +895,7 @@ impl Codec {
             Codec::Raw => bytes,
             Codec::Zstd(l) => zstd::encode_all(&bytes[..], l).unwrap(),
             Codec::Wirefold => wirefold::codec::compress(&bytes),
-            Codec::Columns { level, transform } => columns_compress(&bytes, level, transform),
+            Codec::Columns { level, mode } => columns_compress(&bytes, level, mode, 1),
         }
     }
 
@@ -532,7 +904,7 @@ impl Codec {
             Codec::Raw => Cow::Borrowed(z),
             Codec::Zstd(_) => Cow::Owned(zstd::decode_all(z).unwrap()),
             Codec::Wirefold => Cow::Owned(wirefold::codec::decompress(z)),
-            Codec::Columns { transform, .. } => Cow::Owned(columns_decompress(z, transform)),
+            Codec::Columns { .. } => Cow::Owned(columns_decompress(z)),
         }
     }
 
@@ -658,10 +1030,11 @@ fn serialize_tables(n: usize, runs: usize) {
                     "cols3",
                     "cols6",
                     "cols19",
-                    "colshuf1",
+                    "colsmart1",
+                    "colsmart3",
+                    "colsmart6",
+                    "colsmart19",
                     "colshuf3",
-                    "colshuf6",
-                    "colshuf19",
                 ]);
             }
             for codec in codecs {
@@ -693,13 +1066,17 @@ fn serialize_tables(n: usize, runs: usize) {
         println!("| format | time (ms) |");
         println!("|---|---:|");
         for row in [
+            "col-collapse-open",
+            "col-collapse-read-elem",
+            "col-collapse-read-slice",
             "col-collapse",
+            "col-collapse-slice",
             "col-rkyv",
             "col-bincode",
             "col-postcard",
             "col-collapse-whole-zstd3",
             "col-collapse-cols-zstd3",
-            "col-collapse-colshuf-zstd3",
+            "col-collapse-colsmart-zstd3",
         ] {
             let times: Vec<f64> = (0..runs)
                 .map(|_| {
@@ -712,6 +1089,251 @@ fn serialize_tables(n: usize, runs: usize) {
             println!("| {name} | {} |", fmt(&times));
         }
     }
+}
+
+/// The `Event` buffer of one dataset, built the way the pipelines build it.
+fn event_buffer(dataset: &str, n: usize) -> Vec<u8> {
+    use wirefold::codec::web::CollapseElem as _;
+    let data = dataset_by_name(dataset, n);
+    Event::collapse_pack(&data).as_bytes().to_vec()
+}
+
+/// Where the bytes are: every plane of the buffer, raw and under zstd at three levels, as stored and as
+/// encoded for its type.
+fn plane_report(dataset: &str, n: usize) {
+    let b = event_buffer(dataset, n);
+    let raw = raw_planes(&b);
+    let enc = encoded_planes(&b, Mode::Smart);
+    let z = |d: &[u8], l: i32| zstd::encode_all(d, l).unwrap().len();
+    println!(
+        "\n#### Planes, {dataset} records ({n} records, {} bytes)\n",
+        b.len()
+    );
+    println!("| plane | raw (B) | zstd -1 | zstd -3 | zstd -19 | encoded (B) | encoded, zstd -1 | zstd -3 | zstd -19 | encoding |");
+    println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|---|");
+    let tag = |t: u8| match t {
+        T_DELTA => "delta, integer",
+        T_INTS => "integer",
+        T_DECIMAL => "decimal scaled, integer",
+        T_DICT => "dictionary",
+        _ => "as stored",
+    };
+    for j in 0..NPLANES {
+        // the string planes are encoded together; show the dictionary tag on both
+        let (e, t) = (&enc[j], tag(enc[j][0]));
+        let row = [
+            raw[j].len(),
+            z(&raw[j], 1),
+            z(&raw[j], 3),
+            z(&raw[j], 19),
+            e.len(),
+            z(e, 1),
+            z(e, 3),
+            z(e, 19),
+        ];
+        println!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {t} |",
+            PLANE_NAMES[j], row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7]
+        );
+    }
+    let last: Vec<usize> = (0..NPLANES).map(|j| z(&enc[j], 19)).collect();
+    println!(
+        "| **total** | {} | {} | {} | {} | {} | {} | {} | {} | |",
+        raw.iter().map(Vec::len).sum::<usize>(),
+        raw.iter().map(|p| z(p, 1)).sum::<usize>(),
+        raw.iter().map(|p| z(p, 3)).sum::<usize>(),
+        raw.iter().map(|p| z(p, 19)).sum::<usize>(),
+        enc.iter().map(Vec::len).sum::<usize>(),
+        enc.iter().map(|p| z(p, 1)).sum::<usize>(),
+        enc.iter().map(|p| z(p, 3)).sum::<usize>(),
+        last.iter().sum::<usize>(),
+    );
+}
+
+/// Size and time at every zstd level that matters, for the whole buffer and for per-plane compression
+/// (plain and encoded planes, and the encoded planes spread over 4 threads). Times are the median of 5
+/// in-process runs.
+fn level_report(dataset: &str, n: usize) {
+    let b = event_buffer(dataset, n);
+    println!(
+        "\n#### zstd levels, {dataset} records ({n} records, {} bytes)\n",
+        b.len()
+    );
+    println!("| level | whole: size | enc ms | dec ms | planes: size | enc ms | dec ms | encoded planes: size | enc ms | dec ms | enc ms, 4 threads |");
+    println!("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+    for level in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15, 19, 22] {
+        let reps = if level >= 15 { 3 } else { 5 };
+        let w = zstd::encode_all(&b[..], level).unwrap();
+        let (we, wd) = (
+            ms(reps, || zstd::encode_all(&b[..], level).unwrap()),
+            ms(reps, || zstd::decode_all(&w[..]).unwrap()),
+        );
+        let mut row = vec![
+            format!("{level}"),
+            format!("{}", w.len()),
+            format!("{we:.2}"),
+            format!("{wd:.2}"),
+        ];
+        for mode in [Mode::Plain, Mode::Smart] {
+            let c = columns_compress(&b, level, mode, 1);
+            assert_eq!(columns_decompress(&c), b);
+            row.push(format!("{}", c.len()));
+            row.push(format!(
+                "{:.2}",
+                ms(reps, || columns_compress(&b, level, mode, 1))
+            ));
+            row.push(format!("{:.2}", ms(reps, || columns_decompress(&c))));
+        }
+        row.push(format!(
+            "{:.2}",
+            ms(reps, || columns_compress(&b, level, Mode::Smart, 4))
+        ));
+        println!("| {} |", row.join(" | "));
+    }
+}
+
+/// FNV-1a over a block: a fast 64-bit non-cryptographic checksum, used here to time the cost of one and
+/// to find duplicate blocks (duplicates are confirmed by comparing bytes).
+fn fnv(b: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &x in b {
+        h = (h ^ u64::from(x)).wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
+/// A block store over the encoded planes: every plane cut into fixed-size blocks, each compressed on its
+/// own with a checksum, duplicates stored once. For each block size: total size (with a 16-byte
+/// pointer per block: checksum, logical and stored length), encode and decode time, the time to read
+/// 100 rows of the `f64` column by decompressing only the blocks that cover them against decompressing the
+/// whole plane, the share of bytes in duplicate blocks, and the checksum cost.
+fn block_report(dataset: &str, n: usize) {
+    let b = event_buffer(dataset, n);
+    let planes = encoded_planes(&b, Mode::Smart);
+    println!("\n#### Block store over the encoded planes, {dataset} records ({n} records)\n");
+    println!("| block size | blocks | stored (B) | with pointers (B) | encode ms | decode ms | read 100 rows (ms) | whole plane read (ms) | duplicate bytes | checksum ms |");
+    println!("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|");
+    let value = &planes[VALUE_PLANE];
+    // where the values start in the plane and how many bits each takes: a decimal-scaled integer plane has
+    // a 12-byte header (tag, scale, kind, width, minimum) and then `width` bytes or bits per value;
+    // anything else is a 1-byte tag and 8-byte floats
+    let (hdr, vbits) = if value[0] == T_DECIMAL {
+        let w = usize::from(value[3]);
+        (12, if value[2] == I_NARROW { 8 * w } else { w })
+    } else {
+        (1, 64)
+    };
+    for bs in [1usize << 12, 1 << 14, 1 << 16, 1 << 18, usize::MAX] {
+        let blocks: Vec<&[u8]> = planes
+            .iter()
+            .flat_map(|p| p.chunks(bs.min(p.len().max(1))))
+            .collect();
+        let comp: Vec<Vec<u8>> = blocks
+            .iter()
+            .map(|x| zstd::encode_all(*x, 3).unwrap())
+            .collect();
+        let stored: usize = comp.iter().map(Vec::len).sum();
+        let enc_ms = ms(5, || {
+            blocks
+                .iter()
+                .map(|x| zstd::encode_all(*x, 3).unwrap().len())
+                .sum::<usize>()
+        });
+        let dec_ms = ms(5, || {
+            comp.iter()
+                .map(|z| zstd::decode_all(&z[..]).unwrap().len())
+                .sum::<usize>()
+        });
+        // rows 10000..10100 of the value plane: its blocks are those of plane VALUE_PLANE
+        let vb: Vec<Vec<u8>> = value
+            .chunks(bs.min(value.len()))
+            .map(|x| zstd::encode_all(x, 3).unwrap())
+            .collect();
+        let per = bs.min(value.len());
+        let (lo, hi) = (hdr + 10_000 * vbits / 8, hdr + (10_100 * vbits).div_ceil(8));
+        let (b0, b1) = (lo / per, (hi - 1) / per);
+        let read_ms = ms(9, || {
+            (b0..=b1)
+                .map(|i| zstd::decode_all(&vb[i][..]).unwrap().len())
+                .sum::<usize>()
+        });
+        let whole: Vec<u8> = zstd::encode_all(&value[..], 3).unwrap();
+        let whole_ms = ms(9, || zstd::decode_all(&whole[..]).unwrap().len());
+        // duplicate blocks: same checksum and same bytes
+        let mut seen: std::collections::HashMap<u64, Vec<&[u8]>> = std::collections::HashMap::new();
+        let mut dup = 0usize;
+        for x in &blocks {
+            let e = seen.entry(fnv(x)).or_default();
+            if e.iter().any(|y| y == x) {
+                dup += x.len();
+            } else {
+                e.push(x);
+            }
+        }
+        let sum_ms = ms(5, || {
+            blocks.iter().map(|x| fnv(x)).fold(0u64, u64::wrapping_add)
+        });
+        let label = if bs == usize::MAX {
+            "whole plane".to_string()
+        } else {
+            format!("{} KiB", bs / 1024)
+        };
+        println!(
+            "| {label} | {} | {stored} | {} | {enc_ms:.2} | {dec_ms:.2} | {read_ms:.3} | {whole_ms:.3} | {dup} | {sum_ms:.2} |",
+            blocks.len(),
+            stored + 16 * blocks.len(),
+        );
+    }
+}
+
+/// Model weights, the case `seed-format` stores: bf16 values drawn from a normal distribution (synthetic,
+/// standard deviation 0.02, as in an initialised or trained linear layer). Compared: the bytes as stored,
+/// the two bytes of each value in separate planes, and the sign-and-exponent byte alone, under zstd.
+fn bf16_report(n: usize) {
+    let mut r = Rng(0x1234_5678_9ABC_DEF1);
+    let mut unit = move || (r.next() >> 11) as f64 / (1u64 << 53) as f64;
+    let vals: Vec<u16> = (0..n)
+        .map(|_| {
+            let (u1, u2) = (unit().max(1e-12), unit());
+            let g = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos() * 0.02;
+            let bits = (g as f32).to_bits();
+            // round to nearest even into bf16
+            ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16) as u16
+        })
+        .collect();
+    let raw: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let hi: Vec<u8> = vals.iter().map(|v| (v >> 8) as u8).collect();
+    let lo: Vec<u8> = vals.iter().map(|v| *v as u8).collect();
+    let z = |d: &[u8], l: i32| zstd::encode_all(d, l).unwrap().len();
+    println!(
+        "\n#### bf16 weights, synthetic normal (sd 0.02), {n} values, {} bytes\n",
+        raw.len()
+    );
+    println!("| representation | zstd -1 | zstd -3 | zstd -19 | share of raw at -3 |");
+    println!("|---|---:|---:|---:|---:|");
+    let row = |name: &str, parts: &[&[u8]]| {
+        let t: Vec<usize> = [1, 3, 19]
+            .iter()
+            .map(|&l| parts.iter().map(|p| z(p, l)).sum())
+            .collect();
+        println!(
+            "| {name} | {} | {} | {} | {:.1}% |",
+            t[0],
+            t[1],
+            t[2],
+            100.0 * t[1] as f64 / raw.len() as f64
+        );
+    };
+    row("as stored (interleaved bytes)", &[&raw]);
+    row(
+        "two byte planes (high, low), compressed separately",
+        &[&hi, &lo],
+    );
+    row("high byte plane alone (sign and 7 exponent bits)", &[&hi]);
+    row(
+        "low byte plane alone (1 exponent bit, 7 mantissa bits)",
+        &[&lo],
+    );
 }
 
 /// Number formatting, which every text format pays for: std against `ryu` and `itoa`, and against
@@ -1103,6 +1725,28 @@ fn main() {
     if args.get(1).map(String::as_str) == Some("column") && args.len() == 5 {
         column_row(&args[2], args[3].parse().unwrap(), &args[4]);
         return;
+    }
+    if args.get(1).map(String::as_str) == Some("bf16") {
+        bf16_report(
+            args.get(2)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4_000_000),
+        );
+        return;
+    }
+    for (mode, report) in [
+        ("planes", plane_report as fn(&str, usize)),
+        ("levels", level_report),
+        ("blocks", block_report),
+    ] {
+        if args.get(1).map(String::as_str) == Some(mode) {
+            let dataset = args.get(2).map_or("ordered", String::as_str);
+            report(
+                dataset,
+                args.get(3).and_then(|v| v.parse().ok()).unwrap_or(20_000),
+            );
+            return;
+        }
     }
     if args.get(1).map(String::as_str) == Some("numbers") {
         number_formatting(args.get(2).map(String::as_str));

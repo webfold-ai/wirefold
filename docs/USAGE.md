@@ -15,9 +15,9 @@ apeiron and nothing else; the derive crate depends on nothing.
 
 ## Zero-copy records: `#[derive(Collapse)]`
 
-`Collapse` stores a slice of records as one row-major array of packed records for the scalar fields and one column
+`Collapse` stores a slice of records as a section table with one contiguous column per scalar field and one column
 per variable-length field (strings, vectors). Opening the bytes checks the layout once; it does not walk the rows, so
-reading one field of one row costs the read, not a decode.
+reading one field of one row costs the read, not a decode, and a whole column is available as a zero-copy slice.
 
 ```rust
 use wirefold::codec::web::CollapseElem;
@@ -35,6 +35,7 @@ let packed = Reading::collapse_pack(&readings);      // Vec<Reading> -> Seed
 let bytes = packed.as_bytes();                       // store or send these
 let view = ReadingView::collapse_open(bytes)?;       // validates the layout, no row walk
 let one = view.celsius(7);                           // one field of row 7, in place
+let temps: &[f64] = view.celsius_column();           // the whole column, a slice of the buffer
 let all = view.collapse_to_vec();                    // or materialise every record
 ```
 
@@ -43,7 +44,10 @@ Supported field types: the primitive integers and floats, `bool`, nested `Collap
 `to_vec` is fine: your field wins its own name and the derive's methods are always available under the
 `collapse_*` prefix.
 
-Opening a truncated or corrupt buffer returns an error. It does not panic.
+A scalar field's `_column()` accessor (`celsius_column()`) is omitted if another field of the record has that name;
+`bool` columns are `0`/`1` bytes. Opening a truncated or corrupt buffer, or one whose columns disagree about the
+record count, returns an error. It does not panic. Buffers written by an earlier version, which packed the scalar
+fields into one row-major block, are refused (usually by the section count) and not misread.
 
 ## Structs to and from text: `#[derive(Term)]`
 

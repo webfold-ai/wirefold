@@ -26,6 +26,15 @@ HASHTRINITY_POOL_WIDTH=1 cargo run --release -- parse json-ref 100000   # the sa
 cargo run --release -- parse serde 100000   # the serde_json reference alone, any record count
 ```
 
+Where the compressed bytes are, and the storage experiments (all on the `Collapse` buffer of the same records):
+
+```bash
+cargo run --release -- planes ordered 20000   # per column: raw, zstd, and encoded for its type (also: random)
+cargo run --release -- levels ordered 20000   # every zstd level: whole buffer, columns, encoded columns, 4 threads
+cargo run --release -- blocks ordered 20000   # fixed-size blocks: size, speed, row-range reads, duplicates, checksum
+cargo run --release -- bf16 4000000           # synthetic bf16 weights, as stored and split into byte planes
+```
+
 Rendering and the binary codecs, each row in its own process:
 
 ```bash

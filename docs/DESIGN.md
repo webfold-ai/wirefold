@@ -52,11 +52,11 @@ on the serde ecosystem, serde is the right choice.
 These are row-wise (bincode, postcard) or archive-in-place (rkyv). They are fast and small, and the benchmark
 shows them winning some rows: bincode and rkyv decode a full vector of records as fast as or faster than
 wirefold, and rkyv's validated column read beats wirefold's. What the layout buys is a zero-copy
-open that validates without walking the rows. It does not buy smaller compressed output as stored: after zstd -19 the
-telemetry records are 207,470 bytes as `Collapse` against 199,079 for bincode and 194,386 for postcard, because the
-scalar fields are interleaved row after row. Split into one plane per field and compressed plane by plane, the same
-records are 151,213 bytes at -19 and 166,713 at zstd -3, smaller than any of them (see BENCHMARKS.md, Columns and
-zstd); that split is not in the library, and a layout with contiguous scalar columns would make it a slice.
+open that validates without walking the rows, and, since each scalar field is its own contiguous column, a
+compressor that sees one field's values at a time. That is why `Collapse` is the smallest of the binary formats
+under plain zstd on the benchmark data (167,132 bytes at -19 against 187,121 for rkyv, the next smallest), where it
+was the largest when the scalar fields of a record were interleaved. Encoding each column for its type before
+compressing it goes much further (see [Compression and storage](#compression-and-storage)).
 
 ## Parsing as a fold
 
@@ -127,6 +127,49 @@ standard library's `Display`. They are not used, and the reason is where numbers
 
 The philosophy is that the cheapest number format is none: keep the representation the data already has, and
 convert only at a boundary that needs text.
+
+## Compression and storage
+
+The question is whether a copy-on-write filesystem design (ZFS, or similar) built from apeiron's primitives is a
+better frame for serialization and compression than "serialize, then compress the bytes". Taken piece by piece:
+
+| ZFS | from the apeiron basis | state here |
+|---|---|---|
+| a block pointer tree | the section table: one entry per column (start, length), O(1) lookup, validated once at open | in the library; one pointer per column, not per block |
+| fixed-size records, each compressed on its own | a static, schedule-free partition: blocks are independent, so encode and decode run on the pool and a row range decompresses only its blocks | measured in the benchmark; not in the library |
+| a checksum per block, a hash tree over them | a hash per block, and the root as an associative fold of the block hashes (so it can be built in any grouping) | cost measured (an FNV-1a pass over every block: 0.21 ms for 155 KB); not implemented |
+| deduplication by content hash | an exact table keyed by block hash with a byte comparison on a hit (apeiron's own guidance is to use an exact table where a false merge is unacceptable, not the 2^-64 fold) | measured: no duplicate blocks in either dataset, so no gain on a single set of records |
+| per-block choice of algorithm | measure and take the smaller (the face selector does this for the whole stream; the integer columns do it per column) | per column, in the benchmark |
+| copy-on-write snapshots | immutable blocks plus a new pointer table sharing the unchanged ones | not measured: needs versioned data, which the benchmarks do not have |
+
+What the measurements say (all in [BENCHMARKS.md](BENCHMARKS.md#layout-columns-and-blocks)):
+
+- **The column is the right unit.** Making each scalar field a contiguous column took whole-buffer zstd -3 from 234,791 to
+  189,754 bytes with no other change. Encoding each column for its type (delta, exact-bit-width packing, decimal scaling,
+  a dictionary) took it to 105,790 bytes at zstd -1 in the same encode time, within about 4% of the entropy of the
+  columns. This is where the gain is; it is not specific to blocks.
+- **The block is a random-access and parallelism unit, not a size win.** Block size changes the stored size by under
+  0.5% at any size from 4 KiB to a whole column. At a million records a 100-row read costs 0.014 to 0.034 ms from
+  4 to 256 KiB blocks against 0.53 ms for a whole column, and the encode and decode costs of small blocks are 4 to 5
+  times those of whole columns at 4 KiB and 16 to 20% more at 64 KiB. On this data 16 to 64 KiB is the useful range (ZFS's own default record is
+  128 KiB, which these runs do not cover).
+- **Deduplication and snapshots are for data that repeats or versions.** A single set of telemetry records has no repeated
+  64 KiB block. It would matter for an append-only record log (old blocks unchanged, a new pointer table per version)
+  or for tied weights in a model; neither is in the benchmarks, and neither is claimed.
+- **The checksum is cheap and is the integrity story.** A per-block checksum costs about 0.2 ms per 155 KB with a
+  non-cryptographic hash; whether to use a cryptographic one is a different question that these numbers do not answer.
+
+### `seed-format`
+
+`seed-format` is a flat file: a header, then each tensor as a name, shape, dtype and raw bytes, then the tokenizer
+counts. It checks the lengths it reads, and nothing else: no checksum, no compression and no block structure, and it
+reads the whole tensor into memory. The same frame applies: a tensor's bytes in fixed-size blocks with a pointer table
+makes it addressable without reading it all (storage is execution), a per-block checksum detects corruption, and a
+dictionary of block hashes stores a tied embedding and output matrix once. For compression, a bf16 weight is a high byte
+(sign and exponent) and a low byte (mantissa) that behave differently: on synthetic normal weights, compressing the two byte
+planes separately takes zstd -3 from 78.0% to 71.2% of the raw size, and the mantissa plane does not compress at all.
+That is a measurement of the mechanism on synthetic data, not of a real checkpoint; deduplication of tied weights and the
+random-access gain are untested there. None of this is implemented in `seed-format`.
 
 ## What wirefold gives up
 

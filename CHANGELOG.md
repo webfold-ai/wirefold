@@ -21,6 +21,18 @@ All notable changes to this crate are documented in this file. The format follow
 - CI gains AddressSanitizer and ThreadSanitizer jobs. Locally, the library and integration tests pass under both,
   Miri finds no undefined behaviour in the tANS, Huffman and `web` module tests or the derive tests, and each fuzz
   target ran 4 minutes without a crash.
+- Breaking, `Collapse` layout: each scalar field of a record is now its own contiguous column (a `Wire<T>` section,
+  `bool` as a byte) instead of one row-major block of packed records, followed by the variable-length columns as before.
+  `#[derive(Collapse)]` views gain a zero-copy `<field>_column()` slice accessor per scalar field (omitted when a field
+  has that name), `collapse_to_vec` reads each column once, and a scalar field's alignment must divide 8 (checked at
+  compile time). Buffers written by earlier versions are refused at open, usually by the section count, and not
+  misread; there is no version byte on a `Collapse` buffer. Measured on the telemetry benchmark: whole-buffer zstd -3
+  189,754 bytes (was 234,791), decode of every record 1.25 ms (was 1.03). The record count of a record with no scalar
+  field is kept in one empty count section.
+- The benchmark harness reports per column, per zstd level and per block size, with encodings for each column (delta,
+  exact-bit-width packing, decimal scaling, dictionary) that take the telemetry records to 105,790 bytes at zstd -1,
+  and measures a block store and synthetic bf16 weights. `docs/DESIGN.md` gains a section on a copy-on-write storage
+  design (ZFS) from the apeiron basis and `seed-format`. The encodings and the block layer are benchmark code, not library.
 - Documentation correction: `Collapse` stores the scalar fields of a record slice as one row-major array of packed
   records and only variable-length fields as columns; earlier text called the whole layout columnar. The
   benchmarks now include compressing the scalar fields plane by plane (a bench-only split): 166,713 bytes against

@@ -40,6 +40,7 @@ fn main() {
     let view = ReadingView::collapse_open(bytes).expect("validates the layout, does not walk rows");
     assert_eq!(view.collapse_len(), 1000);
     assert_eq!(view.celsius(7), readings[7].celsius); // one field of one row, in place
+    assert_eq!(view.celsius_column()[7], readings[7].celsius); // or the whole column as a slice
     assert_eq!(view.collapse_to_vec(), readings); // or materialise everything
     println!(
         "columnar: {} records in {} bytes",

@@ -10,36 +10,32 @@ Serialization and compression are separate stages, and the tables below time the
 serializer, optionally followed by a compressor, and encode is serialize then compress while decode is
 decompress then deserialize.
 
-- **Serialization alone (the `raw` pipelines):** wirefold `Collapse` is the same size as bincode (713,116 against
-  713,060 bytes for 20,000 telemetry records) and encodes in the same time (0.19 against 0.17 ms). It decodes
-  slower than bincode (1.03 against 0.83 ms) and about level with postcard and rkyv (1.09 and 1.10 ms). Against
-  serde_json it is about 11 times faster to encode and 4.6 times faster to decode, and 2.3 times smaller;
-  MessagePack through rmp-serde is slower to encode (0.53 ms) and decode (1.66 ms) than `Collapse`. postcard is
-  smaller (24.6 against 35.7 bytes per record) and rkyv larger (40.0). On the random data the picture is the
-  same for sizes and rkyv decodes fastest (0.80 ms).
-- **With a compressor, the compressor sets the time and the serializer sets the size.** Serializing takes
-  0.2 to 0.6 ms (2 ms for JSON) whatever follows, so with zstd -3 the encode time is 2.7 to 3.1 ms for every binary
-  serializer and almost all of it is zstd. What differs is the output: on the telemetry data after zstd -19, rkyv
-  is smallest (187,121 bytes), then postcard (194,386), bincode (199,079), JSON (201,563), rmp-serde (202,583)
-  and `Collapse` (207,470). `Collapse` as stored does not compress smaller than the row formats, because its scalar
-  fields are one row-major array of packed records; compressed per field it does (next bullet). Decoding is
-  1.6 to 3.2 ms for the binary formats and 5 to 7 ms for JSON, of which zstd decompression is 0.6 to 1.6 ms.
-- **wirefold plus zstd, compressed per field:** splitting the scalar records into one plane per field and
-  compressing each plane with zstd gives 166,713 bytes at zstd -3 (8.3 bytes per record) on the telemetry data, against
-  234,791 for zstd on the whole buffer, 219,402 for bincode, 207,314 for postcard and 225,765 for rkyv at the same
-  level, and below all of their zstd -19 sizes (151,213 bytes at -19). It costs 3.5 ms to encode and 2.1 ms to
-  decode, the same as the others at -3, and reading one field decompresses only its plane: 0.18 ms for the `f64`
-  field against 1.12 ms to decompress everything and then read. On the random data the saving is small (589,955
-  against 628,869 bytes) because the values have no structure to find. The split is in the benchmark, not the
-  library. See [Columns and zstd](#columns-and-zstd).
-- **Reading one column without decoding the rest:** wirefold's validated open plus a column read is about
-  4.5 times faster than bincode or postcard (decode everything, then read) and slower than rkyv: 0.30 against
-  0.24 ms on the telemetry data and 0.35 against 0.10 ms on the random data.
-- **wirefold's own coder (`compress()`, experimental):** after `Collapse` it gives 243,203 bytes and costs
-  124.7 ms to encode and 3.6 ms to decode, against 237,083 bytes, 2.3 ms and 1.9 ms for zstd -1 (and 207,470
-  bytes, 260 ms and 2.1 ms for zstd -19). It does not beat zstd at any level. Its cost depends on the input
-  as well as the serializer: on the postcard, bincode and MessagePack bytes it encodes in about 49 ms.
-  `Collapse` does not depend on it; if you want compression, compress the `Collapse` bytes with zstd.
+- **Serialization alone (the `raw` pipelines):** wirefold `Collapse` is the same size as bincode (713,212 against
+  713,060 bytes for 20,000 telemetry records) and encodes in about the same time (0.20 against 0.16 ms). It
+  decodes slower than bincode (1.25 against 0.92 ms) and rkyv (1.16 ms), and faster than MessagePack through
+  rmp-serde (1.65 ms). Against serde_json it is about 11 times faster to encode and 3.6 times faster to decode,
+  and 2.3 times smaller. postcard is smaller (24.6 against 35.7 bytes per record) and rkyv larger (40.0).
+- **With a compressor, the layout decides the size.** `Collapse` stores each scalar field as its own contiguous
+  column, so the compressor sees one field's values at a time. With plain zstd on the whole buffer the telemetry
+  records are 189,754 bytes at -3 and 167,132 at -19, against 219,402 and 199,079 for bincode, 207,314 and 194,386 for
+  postcard and 225,765 and 187,121 for rkyv. Before that layout (the scalar fields interleaved row after row) it was
+  234,791 and 207,470, the largest of the binary formats. Encode and decode times with zstd are the same as the
+  other serializers'.
+- **Encoding each column for its type roughly halves it again.** Delta coding the timestamps, packing integers to
+  their exact bit width, storing decimal floats as scaled integers and dictionary-coding the strings, each column then
+  compressed with zstd on its own, gives 105,790 bytes at zstd -1 (5.3 bytes per record): 2.3 ms to encode, 2.0 ms to
+  decode, 46% smaller than the best other pipeline at zstd -19 (postcard, 194,386 bytes, 164 ms to encode). Going up to
+  zstd -19 only reaches 104,729. Reading one field decompresses only its column: 0.17 ms for the `f64` field against
+  1.64 ms to decompress the whole buffer and then read. These encodings are in the benchmark, not the library; see
+  [Layout, columns and blocks](#layout-columns-and-blocks), which also has the per-column, per-level and per-block-size
+  breakdowns. On the random data there is little to find: the column pipelines land at about 590,000 bytes, 6% below
+  whole-buffer zstd -3 (624,300) and 14% below bincode + zstd -3 (683,707).
+- **Reading one column without decoding the rest:** opening a `Collapse` buffer validates it (all 20,000 strings
+  as UTF-8) in 0.33 ms; reading the 20,000 `f64` values from an open view takes 0.013 ms. rkyv's validate-and-read takes
+  0.26 ms on the telemetry data and 0.08 ms on the random data, where wirefold's open takes 0.28 ms.
+- **wirefold's own coder (`compress()`, experimental):** after `Collapse` it gives 222,540 bytes and costs
+  89 ms to encode and 3.8 ms to decode, against 199,392 bytes, 3.1 ms and 3.6 ms for zstd -1. It does not beat zstd
+  at any level. `Collapse` does not depend on it; if you want compression, compress the `Collapse` bytes with zstd.
 - **Allocations:** every deserializer allocates once per record for the name string (about 20,000 calls for
   20,000 records), so decode allocation counts are within 14 of each other for the plain pipelines. Encode is
   where they differ: `Collapse` makes 3 calls (1.4 MiB, the packed buffer and a copy), bincode 1, postcard 17,
@@ -69,7 +65,8 @@ fields are stored as one row-major array of records and its variable-length fiel
 - Versions: serde_json 1 (with `float_roundtrip` so floats are exact), bincode 1.3, postcard 1,
   rmp-serde 1, rkyv 0.8 (validated), zstd 0.13 (levels 1, 3, 6 and 19).
 - Pipelines: each of the six serializers is run raw and followed by zstd -1, -3, -6, -19 and wirefold's
-  `compress()`. Each pipeline is round-trip checked before it is timed and runs in its own process. A run
+  `compress()`; `Collapse` is also run with its columns compressed one by one (plain, encoded for their types, and
+  byte-shuffled). Each pipeline is round-trip checked before it is timed and runs in its own process. A run
   is the median of 9 repetitions (5 for `compress()`, 3 for zstd -19); the encode and decode totals are the mean
   of 3 runs with the range shown, and the stage columns are the mean of the same runs.
 - Every serializer is measured as bytes out of the records and records back out of bytes. wirefold and rkyv go
@@ -80,8 +77,8 @@ fields are stored as one row-major array of records and its variable-length fiel
 
 ## Results
 
-20,000 records. The rows are the pipelines described under Setup; `raw` is the serializer alone. The
-`columns` rows are described under [Columns and zstd](#columns-and-zstd).
+20,000 records. The rows are the pipelines described under Setup; `raw` is the serializer alone. The `columns`
+rows split the buffer into its columns and are described under [Layout, columns and blocks](#layout-columns-and-blocks).
 
 #### Telemetry-shaped records (20000 records)
 
@@ -89,62 +86,67 @@ Encode is serialize then compress; decode is decompress then deserialize. Millis
 
 | pipeline | size (bytes) | bytes/record | encode (ms) | serialize | compress | decode (ms) | decompress | deserialize | encode allocs (MiB) | decode allocs (MiB) |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| wirefold Collapse raw | 713116 | 35.7 | 0.18 (0.18 to 0.19) | 0.18 | 0.00 | 1.03 (1.02 to 1.04) | 0.00 | 1.03 | 3 (1.4) | 20001 (1.0) |
-| wirefold Collapse + zstd -1 | 237083 | 11.9 | 2.30 (2.25 to 2.33) | 0.19 | 2.11 | 2.10 (2.03 to 2.19) | 0.88 | 1.21 | 8 (1.9) | 20010 (3.1) |
-| wirefold Collapse + zstd -3 | 234791 | 11.7 | 3.06 (2.90 to 3.33) | 0.20 | 2.86 | 2.13 (2.00 to 2.33) | 0.94 | 1.19 | 8 (1.9) | 20010 (3.1) |
-| wirefold Collapse + zstd -6 | 218018 | 10.9 | 7.93 (7.49 to 8.59) | 0.20 | 7.73 | 1.97 (1.92 to 2.00) | 0.81 | 1.15 | 8 (1.9) | 20010 (3.1) |
-| wirefold Collapse + zstd -19 | 207470 | 10.4 | 238.40 (228.93 to 256.75) | 0.31 | 238.09 | 2.15 (2.10 to 2.22) | 0.93 | 1.22 | 8 (1.9) | 20010 (3.1) |
-| wirefold Collapse + wirefold compress() | 243203 | 12.2 | 129.34 (123.73 to 135.61) | 0.30 | 129.04 | 3.98 (3.80 to 4.08) | 2.36 | 1.62 | 1595 (33.9) | 20052 (3.3) |
-| wirefold Collapse + columns, zstd -1 | 178831 | 8.9 | 3.76 (3.39 to 4.46) | 0.58 | 3.18 | 2.31 (2.08 to 2.42) | 1.10 | 1.21 | 108 (4.3) | 20044 (4.6) |
-| wirefold Collapse + columns, zstd -3 | 166713 | 8.3 | 3.54 (3.38 to 3.81) | 0.20 | 3.35 | 2.11 (2.05 to 2.23) | 1.01 | 1.10 | 108 (4.2) | 20044 (4.6) |
-| wirefold Collapse + columns, zstd -6 | 163277 | 8.2 | 10.17 (8.84 to 12.82) | 0.22 | 9.95 | 2.24 (2.16 to 2.33) | 1.04 | 1.21 | 107 (4.1) | 20044 (4.6) |
-| wirefold Collapse + columns, zstd -19 | 151213 | 7.6 | 644.43 (629.58 to 663.00) | 0.30 | 644.12 | 2.56 (2.11 to 3.31) | 1.14 | 1.42 | 107 (4.1) | 20044 (4.6) |
-| wirefold Collapse + columns, shuffle, zstd -1 | 200571 | 10.0 | 2.29 (2.21 to 2.38) | 0.50 | 1.79 | 2.11 (2.04 to 2.24) | 1.00 | 1.11 | 114 (4.8) | 20050 (5.2) |
-| wirefold Collapse + columns, shuffle, zstd -3 | 201532 | 10.1 | 2.67 (2.18 to 3.22) | 0.22 | 2.44 | 2.86 (2.28 to 3.44) | 1.37 | 1.48 | 114 (4.8) | 20050 (5.2) |
-| wirefold Collapse + columns, shuffle, zstd -6 | 197755 | 9.9 | 4.77 (4.59 to 5.06) | 0.20 | 4.57 | 2.27 (2.12 to 2.41) | 1.08 | 1.20 | 114 (4.8) | 20050 (5.2) |
-| wirefold Collapse + columns, shuffle, zstd -19 | 178525 | 8.9 | 453.75 (445.23 to 463.80) | 0.29 | 453.46 | 2.52 (2.07 to 3.25) | 1.17 | 1.34 | 113 (4.7) | 20050 (5.2) |
-| bincode 1.3 raw | 713060 | 35.7 | 0.16 (0.15 to 0.18) | 0.16 | 0.00 | 0.87 (0.83 to 0.90) | 0.00 | 0.87 | 1 (0.7) | 20001 (1.0) |
-| bincode 1.3 + zstd -1 | 234749 | 11.7 | 2.72 (2.27 to 3.49) | 0.22 | 2.50 | 1.94 (1.63 to 2.52) | 0.94 | 0.99 | 6 (1.2) | 20010 (3.1) |
-| bincode 1.3 + zstd -3 | 219402 | 11.0 | 2.99 (2.92 to 3.04) | 0.20 | 2.80 | 1.75 (1.69 to 1.88) | 0.82 | 0.94 | 6 (1.2) | 20010 (3.1) |
-| bincode 1.3 + zstd -6 | 203248 | 10.2 | 8.54 (8.02 to 9.41) | 0.20 | 8.34 | 1.84 (1.61 to 2.26) | 0.81 | 1.02 | 6 (1.2) | 20010 (3.1) |
-| bincode 1.3 + zstd -19 | 199079 | 10.0 | 268.28 (254.12 to 278.80) | 0.32 | 267.96 | 1.70 (1.60 to 1.80) | 0.83 | 0.87 | 6 (1.2) | 20010 (3.1) |
-| bincode 1.3 + wirefold compress() | 238005 | 11.9 | 48.59 (46.09 to 51.58) | 0.25 | 48.35 | 3.18 (2.79 to 3.79) | 1.90 | 1.28 | 895 (20.0) | 20052 (3.2) |
-| postcard raw | 492525 | 24.6 | 0.45 (0.39 to 0.51) | 0.45 | 0.00 | 1.02 (0.93 to 1.19) | 0.00 | 1.02 | 17 (1.0) | 20001 (1.0) |
-| postcard + zstd -1 | 263942 | 13.2 | 2.06 (1.97 to 2.12) | 0.41 | 1.65 | 1.64 (1.58 to 1.72) | 0.67 | 0.97 | 23 (2.0) | 20009 (2.1) |
-| postcard + zstd -3 | 207314 | 10.4 | 2.65 (2.63 to 2.68) | 0.40 | 2.25 | 1.61 (1.60 to 1.62) | 0.67 | 0.94 | 22 (1.5) | 20009 (2.1) |
-| postcard + zstd -6 | 195023 | 9.8 | 7.06 (6.44 to 8.08) | 0.41 | 6.65 | 1.54 (1.49 to 1.62) | 0.57 | 0.96 | 22 (1.5) | 20009 (2.1) |
-| postcard + zstd -19 | 194386 | 9.7 | 163.85 (162.08 to 164.98) | 0.48 | 163.37 | 2.38 (1.72 to 3.58) | 0.81 | 1.57 | 22 (1.5) | 20009 (2.1) |
-| postcard + wirefold compress() | 215656 | 10.8 | 53.22 (50.76 to 57.48) | 0.47 | 52.74 | 3.38 (2.88 to 4.30) | 1.85 | 1.53 | 953 (21.7) | 20031 (2.5) |
-| rmp-serde (MessagePack) raw | 611506 | 30.6 | 0.68 (0.58 to 0.80) | 0.68 | 0.00 | 1.91 (1.71 to 2.29) | 0.00 | 1.91 | 18 (2.0) | 20001 (1.0) |
-| rmp-serde (MessagePack) + zstd -1 | 227528 | 11.4 | 2.20 (2.16 to 2.25) | 0.59 | 1.61 | 2.42 (2.34 to 2.58) | 0.66 | 1.76 | 23 (2.5) | 20010 (3.1) |
-| rmp-serde (MessagePack) + zstd -3 | 220582 | 11.0 | 3.73 (2.58 to 4.36) | 0.79 | 2.94 | 2.69 (2.28 to 3.42) | 0.70 | 1.99 | 23 (2.5) | 20010 (3.1) |
-| rmp-serde (MessagePack) + zstd -6 | 215972 | 10.8 | 7.89 (7.41 to 8.18) | 0.59 | 7.30 | 2.75 (2.60 to 2.84) | 0.75 | 2.00 | 23 (2.5) | 20010 (3.1) |
-| rmp-serde (MessagePack) + zstd -19 | 202583 | 10.1 | 177.84 (170.81 to 188.42) | 0.68 | 177.17 | 2.27 (2.07 to 2.39) | 0.59 | 1.69 | 23 (2.5) | 20010 (3.1) |
-| rmp-serde (MessagePack) + wirefold compress() | 220043 | 11.0 | 53.16 (51.62 to 55.29) | 0.63 | 52.53 | 3.14 (2.95 to 3.32) | 0.95 | 2.19 | 911 (21.6) | 20031 (2.2) |
-| rkyv 0.8 (validated) raw | 800008 | 40.0 | 0.23 (0.23 to 0.23) | 0.23 | 0.00 | 1.02 (0.95 to 1.09) | 0.00 | 1.02 | 16 (2.8) | 20002 (2.0) |
-| rkyv 0.8 (validated) + zstd -1 | 273202 | 13.7 | 2.84 (2.41 to 3.64) | 0.26 | 2.59 | 2.82 (2.49 to 3.22) | 1.53 | 1.29 | 22 (3.8) | 20011 (4.1) |
-| rkyv 0.8 (validated) + zstd -3 | 225765 | 11.3 | 2.77 (2.64 to 2.99) | 0.24 | 2.53 | 1.95 (1.80 to 2.08) | 0.91 | 1.03 | 21 (3.3) | 20011 (4.1) |
-| rkyv 0.8 (validated) + zstd -6 | 220282 | 11.0 | 11.18 (9.27 to 13.70) | 0.28 | 10.90 | 2.16 (1.84 to 2.73) | 0.96 | 1.20 | 21 (3.3) | 20011 (4.1) |
-| rkyv 0.8 (validated) + zstd -19 | 187121 | 9.4 | 290.31 (287.27 to 294.62) | 0.40 | 289.90 | 2.01 (1.88 to 2.12) | 0.91 | 1.10 | 21 (3.3) | 20011 (4.1) |
-| rkyv 0.8 (validated) + wirefold compress() | 218413 | 10.9 | 133.25 (124.44 to 145.80) | 0.33 | 132.92 | 2.77 (2.76 to 2.77) | 1.33 | 1.43 | 1428 (30.0) | 20032 (3.4) |
-| serde_json raw | 1646252 | 82.3 | 2.17 (2.00 to 2.34) | 2.17 | 0.00 | 4.83 (4.57 to 5.02) | 0.00 | 4.83 | 15 (4.0) | 20014 (3.1) |
-| serde_json + zstd -1 | 260706 | 13.0 | 6.01 (5.91 to 6.07) | 2.10 | 3.90 | 7.11 (6.91 to 7.30) | 2.01 | 5.10 | 20 (4.5) | 20024 (7.2) |
-| serde_json + zstd -3 | 265783 | 13.3 | 7.84 (6.89 to 9.35) | 2.45 | 5.38 | 6.55 (5.96 to 7.54) | 1.32 | 5.23 | 21 (5.0) | 20024 (7.2) |
-| serde_json + zstd -6 | 240484 | 12.0 | 17.38 (16.93 to 17.61) | 2.05 | 15.33 | 5.32 (5.24 to 5.42) | 0.98 | 4.34 | 20 (4.5) | 20024 (7.2) |
-| serde_json + zstd -19 | 201563 | 10.1 | 877.27 (850.42 to 929.84) | 2.20 | 875.07 | 7.14 (5.80 to 9.70) | 1.17 | 5.97 | 20 (4.5) | 20024 (7.2) |
-| serde_json + wirefold compress() | 244651 | 12.2 | 54.34 (52.78 to 57.28) | 1.95 | 52.40 | 5.78 (5.68 to 5.94) | 1.25 | 4.53 | 893 (26.5) | 20044 (5.3) |
+| wirefold Collapse raw | 713212 | 35.7 | 0.20 (0.20 to 0.21) | 0.20 | 0.00 | 1.25 (1.21 to 1.30) | 0.00 | 1.25 | 3 (1.4) | 20001 (1.0) |
+| wirefold Collapse + zstd -1 | 199392 | 10.0 | 3.12 (2.50 to 3.46) | 0.28 | 2.84 | 3.55 (3.30 to 3.85) | 1.54 | 2.02 | 8 (1.9) | 20010 (3.1) |
+| wirefold Collapse + zstd -3 | 189754 | 9.5 | 3.13 (3.05 to 3.24) | 0.21 | 2.92 | 2.16 (2.07 to 2.26) | 0.91 | 1.25 | 8 (1.9) | 20010 (3.1) |
+| wirefold Collapse + zstd -6 | 180132 | 9.0 | 10.29 (8.05 to 14.64) | 0.26 | 10.03 | 2.69 (2.13 to 3.77) | 1.20 | 1.49 | 8 (1.9) | 20010 (3.1) |
+| wirefold Collapse + zstd -19 | 167132 | 8.4 | 240.08 (229.06 to 248.36) | 0.32 | 239.76 | 2.33 (2.17 to 2.49) | 1.10 | 1.23 | 8 (1.9) | 20010 (3.1) |
+| wirefold Collapse + wirefold compress() | 222540 | 11.1 | 89.08 (83.61 to 96.98) | 0.28 | 88.80 | 3.82 (3.51 to 4.17) | 2.24 | 1.58 | 1412 (34.1) | 20052 (3.3) |
+| wirefold Collapse + columns, zstd -1 | 178207 | 8.9 | 2.93 (2.78 to 3.21) | 0.52 | 2.41 | 2.25 (2.08 to 2.34) | 1.04 | 1.21 | 59 (4.1) | 20055 (5.3) |
+| wirefold Collapse + columns, zstd -3 | 167109 | 8.4 | 3.11 (3.04 to 3.20) | 0.20 | 2.90 | 2.22 (2.13 to 2.31) | 1.03 | 1.19 | 59 (4.1) | 20055 (5.3) |
+| wirefold Collapse + columns, zstd -6 | 163356 | 8.2 | 8.01 (7.77 to 8.27) | 0.20 | 7.81 | 2.17 (2.12 to 2.22) | 0.99 | 1.18 | 58 (4.0) | 20055 (5.3) |
+| wirefold Collapse + columns, zstd -19 | 151261 | 7.6 | 661.89 (659.19 to 666.95) | 0.33 | 661.56 | 2.25 (2.21 to 2.31) | 0.96 | 1.29 | 58 (4.0) | 20055 (5.3) |
+| wirefold Collapse + columns, encoded planes, zstd -1 | 105790 | 5.3 | 2.28 (2.20 to 2.39) | 0.21 | 2.07 | 1.99 (1.96 to 2.01) | 0.75 | 1.24 | 133 (5.5) | 20091 (4.9) |
+| wirefold Collapse + columns, encoded planes, zstd -3 | 107638 | 5.4 | 2.46 (2.33 to 2.62) | 0.20 | 2.25 | 2.04 (2.00 to 2.12) | 0.80 | 1.24 | 133 (5.5) | 20091 (4.9) |
+| wirefold Collapse + columns, encoded planes, zstd -6 | 106939 | 5.3 | 3.64 (3.53 to 3.73) | 0.21 | 3.43 | 1.93 (1.85 to 2.00) | 0.75 | 1.18 | 133 (5.5) | 20091 (4.9) |
+| wirefold Collapse + columns, encoded planes, zstd -19 | 104729 | 5.2 | 318.76 (310.37 to 327.26) | 0.32 | 318.44 | 2.38 (2.04 to 3.00) | 0.93 | 1.45 | 133 (5.5) | 20091 (4.9) |
+| wirefold Collapse + columns, byte shuffle, zstd -3 | 201596 | 10.1 | 1.86 (1.73 to 1.96) | 0.20 | 1.66 | 2.43 (2.37 to 2.50) | 1.17 | 1.26 | 64 (4.5) | 20055 (5.3) |
+| bincode 1.3 raw | 713060 | 35.7 | 0.16 (0.15 to 0.19) | 0.16 | 0.00 | 0.92 (0.88 to 0.98) | 0.00 | 0.92 | 1 (0.7) | 20001 (1.0) |
+| bincode 1.3 + zstd -1 | 234749 | 11.7 | 2.34 (2.28 to 2.40) | 0.18 | 2.16 | 1.66 (1.62 to 1.74) | 0.81 | 0.86 | 6 (1.2) | 20010 (3.1) |
+| bincode 1.3 + zstd -3 | 219402 | 11.0 | 2.90 (2.78 to 3.08) | 0.18 | 2.72 | 1.76 (1.74 to 1.79) | 0.85 | 0.91 | 6 (1.2) | 20010 (3.1) |
+| bincode 1.3 + zstd -6 | 203248 | 10.2 | 8.18 (7.92 to 8.52) | 0.20 | 7.99 | 1.62 (1.56 to 1.70) | 0.72 | 0.90 | 6 (1.2) | 20010 (3.1) |
+| bincode 1.3 + zstd -19 | 199079 | 10.0 | 261.79 (255.09 to 271.59) | 0.29 | 261.50 | 1.82 (1.77 to 1.86) | 0.90 | 0.91 | 6 (1.2) | 20010 (3.1) |
+| bincode 1.3 + wirefold compress() | 238005 | 11.9 | 50.26 (47.43 to 52.67) | 0.23 | 50.03 | 3.07 (2.87 to 3.19) | 1.77 | 1.30 | 895 (20.0) | 20052 (3.2) |
+| postcard raw | 492525 | 24.6 | 0.42 (0.40 to 0.43) | 0.42 | 0.00 | 1.02 (0.98 to 1.03) | 0.00 | 1.02 | 17 (1.0) | 20001 (1.0) |
+| postcard + zstd -1 | 263942 | 13.2 | 2.13 (1.98 to 2.25) | 0.43 | 1.70 | 1.84 (1.83 to 1.86) | 0.75 | 1.10 | 23 (2.0) | 20009 (2.1) |
+| postcard + zstd -3 | 207314 | 10.4 | 2.97 (2.91 to 3.05) | 0.44 | 2.52 | 1.84 (1.80 to 1.87) | 0.76 | 1.08 | 22 (1.5) | 20009 (2.1) |
+| postcard + zstd -6 | 195023 | 9.8 | 7.15 (7.05 to 7.25) | 0.42 | 6.73 | 1.68 (1.62 to 1.75) | 0.62 | 1.06 | 22 (1.5) | 20009 (2.1) |
+| postcard + zstd -19 | 194386 | 9.7 | 164.23 (160.24 to 169.63) | 0.46 | 163.77 | 1.88 (1.70 to 2.02) | 0.80 | 1.08 | 22 (1.5) | 20009 (2.1) |
+| postcard + wirefold compress() | 215656 | 10.8 | 48.03 (45.64 to 51.12) | 0.46 | 47.57 | 3.28 (2.87 to 4.02) | 1.79 | 1.50 | 953 (21.7) | 20031 (2.5) |
+| rmp-serde (MessagePack) raw | 611506 | 30.6 | 0.57 (0.56 to 0.57) | 0.57 | 0.00 | 1.65 (1.62 to 1.69) | 0.00 | 1.65 | 18 (2.0) | 20001 (1.0) |
+| rmp-serde (MessagePack) + zstd -1 | 227528 | 11.4 | 2.26 (2.23 to 2.29) | 0.59 | 1.67 | 2.40 (2.22 to 2.50) | 0.66 | 1.74 | 23 (2.5) | 20010 (3.1) |
+| rmp-serde (MessagePack) + zstd -3 | 220582 | 11.0 | 2.53 (2.43 to 2.68) | 0.52 | 2.01 | 2.22 (2.09 to 2.43) | 0.59 | 1.62 | 23 (2.5) | 20010 (3.1) |
+| rmp-serde (MessagePack) + zstd -6 | 215972 | 10.8 | 7.18 (7.12 to 7.28) | 0.56 | 6.62 | 2.30 (2.11 to 2.45) | 0.63 | 1.67 | 23 (2.5) | 20010 (3.1) |
+| rmp-serde (MessagePack) + zstd -19 | 202583 | 10.1 | 188.08 (175.84 to 197.97) | 0.61 | 187.47 | 2.81 (2.46 to 3.47) | 0.72 | 2.09 | 23 (2.5) | 20010 (3.1) |
+| rmp-serde (MessagePack) + wirefold compress() | 220043 | 11.0 | 47.95 (47.37 to 48.74) | 0.53 | 47.41 | 3.00 (2.71 to 3.15) | 0.91 | 2.09 | 911 (21.6) | 20031 (2.2) |
+| rkyv 0.8 (validated) raw | 800008 | 40.0 | 0.29 (0.27 to 0.32) | 0.29 | 0.00 | 1.16 (1.09 to 1.29) | 0.00 | 1.16 | 16 (2.8) | 20002 (2.0) |
+| rkyv 0.8 (validated) + zstd -1 | 273202 | 13.7 | 3.11 (2.67 to 3.67) | 0.28 | 2.82 | 2.78 (2.70 to 2.84) | 1.49 | 1.30 | 22 (3.8) | 20011 (4.1) |
+| rkyv 0.8 (validated) + zstd -3 | 225765 | 11.3 | 2.90 (2.65 to 3.07) | 0.26 | 2.64 | 1.85 (1.76 to 1.99) | 0.86 | 0.99 | 21 (3.3) | 20011 (4.1) |
+| rkyv 0.8 (validated) + zstd -6 | 220282 | 11.0 | 10.04 (9.58 to 10.87) | 0.28 | 9.76 | 1.95 (1.83 to 2.07) | 0.87 | 1.08 | 21 (3.3) | 20011 (4.1) |
+| rkyv 0.8 (validated) + zstd -19 | 187121 | 9.4 | 299.75 (290.40 to 307.43) | 0.43 | 299.32 | 2.66 (2.17 to 3.12) | 1.21 | 1.45 | 21 (3.3) | 20011 (4.1) |
+| rkyv 0.8 (validated) + wirefold compress() | 218413 | 10.9 | 131.87 (124.38 to 137.54) | 0.35 | 131.53 | 2.79 (2.60 to 2.92) | 1.32 | 1.47 | 1428 (30.0) | 20032 (3.4) |
+| serde_json raw | 1646252 | 82.3 | 2.29 (1.92 to 2.98) | 2.29 | 0.00 | 4.54 (4.40 to 4.66) | 0.00 | 4.54 | 15 (4.0) | 20014 (3.1) |
+| serde_json + zstd -1 | 260706 | 13.0 | 5.81 (5.71 to 5.91) | 2.02 | 3.80 | 6.69 (6.62 to 6.75) | 1.94 | 4.75 | 20 (4.5) | 20024 (7.2) |
+| serde_json + zstd -3 | 265783 | 13.3 | 6.48 (6.00 to 6.75) | 2.01 | 4.48 | 5.98 (5.70 to 6.29) | 1.27 | 4.71 | 21 (5.0) | 20024 (7.2) |
+| serde_json + zstd -6 | 240484 | 12.0 | 17.51 (17.22 to 17.95) | 2.07 | 15.44 | 5.85 (5.78 to 5.97) | 1.11 | 4.74 | 20 (4.5) | 20024 (7.2) |
+| serde_json + zstd -19 | 201563 | 10.1 | 927.06 (880.32 to 973.25) | 2.20 | 924.86 | 6.41 (5.44 to 8.26) | 1.13 | 5.28 | 20 (4.5) | 20024 (7.2) |
+| serde_json + wirefold compress() | 244651 | 12.2 | 56.57 (53.96 to 58.90) | 2.45 | 54.12 | 6.51 (6.43 to 6.56) | 1.43 | 5.09 | 893 (26.5) | 20044 (5.3) |
 
 Sum one `f64` column of 20000 records (open + read, no full decode):
 
 | format | time (ms) |
 |---|---:|
-| wirefold view (open + column read) | 0.28 (0.28 to 0.30) |
-| rkyv 0.8 (validate + read) | 0.23 (0.20 to 0.27) |
-| bincode (decode all, then sum) | 0.80 (0.77 to 0.84) |
-| postcard (decode all, then sum) | 0.98 (0.91 to 1.08) |
-| whole buffer zstd -3: decompress all, then read | 1.12 (1.09 to 1.15) |
-| columns, zstd -3: decompress one column | 0.18 (0.18 to 0.19) |
-| columns, shuffle, zstd -3: decompress one column | 0.31 (0.28 to 0.33) |
+| wirefold open only (validates the table) | 0.33 (0.32 to 0.33) |
+| wirefold, view already open: per-element accessor | 0.01 (0.01 to 0.01) |
+| wirefold, view already open: column slice | 0.01 (0.01 to 0.01) |
+| wirefold view (open + per-element accessor) | 0.34 (0.34 to 0.35) |
+| wirefold view (open + column slice) | 0.35 (0.35 to 0.35) |
+| rkyv 0.8 (validate + read) | 0.26 (0.25 to 0.28) |
+| bincode (decode all, then sum) | 0.92 (0.89 to 0.95) |
+| postcard (decode all, then sum) | 1.11 (1.08 to 1.16) |
+| whole buffer zstd -3: decompress all, then read | 1.64 (1.28 to 1.84) |
+| columns, zstd -3: decompress one column | 0.24 (0.20 to 0.32) |
+| columns, encoded planes, zstd -3: decompress one column | 0.17 (0.15 to 0.22) |
 
 #### Random records (no structure to exploit) (20000 records)
 
@@ -152,91 +154,268 @@ Encode is serialize then compress; decode is decompress then deserialize. Millis
 
 | pipeline | size (bytes) | bytes/record | encode (ms) | serialize | compress | decode (ms) | decompress | deserialize | encode allocs (MiB) | decode allocs (MiB) |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| wirefold Collapse raw | 918696 | 45.9 | 0.73 (0.62 to 0.81) | 0.68 | 0.05 | 1.09 (0.93 to 1.39) | 0.00 | 1.09 | 3 (1.8) | 20001 (1.2) |
-| wirefold Collapse + zstd -1 | 627123 | 31.4 | 2.43 (2.11 to 3.05) | 0.40 | 2.03 | 1.71 (1.46 to 2.18) | 0.55 | 1.15 | 10 (3.8) | 20010 (3.3) |
-| wirefold Collapse + zstd -3 | 628869 | 31.4 | 3.09 (3.02 to 3.15) | 0.18 | 2.91 | 1.58 (1.55 to 1.60) | 0.59 | 0.99 | 10 (3.8) | 20010 (3.3) |
-| wirefold Collapse + zstd -6 | 630628 | 31.5 | 6.29 (6.01 to 6.78) | 0.18 | 6.11 | 1.62 (1.58 to 1.68) | 0.62 | 1.00 | 10 (3.8) | 20010 (3.3) |
-| wirefold Collapse + zstd -19 | 634681 | 31.7 | 176.49 (161.49 to 206.11) | 0.35 | 176.14 | 2.41 (2.30 to 2.63) | 1.38 | 1.03 | 10 (3.8) | 20010 (3.3) |
-| wirefold Collapse + wirefold compress() | 635363 | 31.8 | 149.30 (144.86 to 154.95) | 0.28 | 149.02 | 4.88 (4.27 to 5.78) | 3.39 | 1.49 | 1363 (47.7) | 20032 (4.8) |
-| wirefold Collapse + columns, zstd -1 | 591107 | 29.6 | 2.46 (2.35 to 2.53) | 0.47 | 2.00 | 2.43 (2.38 to 2.49) | 1.22 | 1.21 | 114 (6.7) | 20046 (5.8) |
-| wirefold Collapse + columns, zstd -3 | 589955 | 29.5 | 3.05 (2.91 to 3.18) | 0.18 | 2.87 | 1.98 (1.88 to 2.11) | 0.78 | 1.20 | 114 (6.7) | 20046 (5.8) |
-| wirefold Collapse + columns, zstd -6 | 592205 | 29.6 | 7.86 (6.45 to 9.56) | 0.20 | 7.66 | 2.04 (1.82 to 2.42) | 0.83 | 1.22 | 114 (6.7) | 20046 (5.8) |
-| wirefold Collapse + columns, zstd -19 | 584535 | 29.2 | 471.89 (459.50 to 493.05) | 0.31 | 471.58 | 1.66 (1.59 to 1.79) | 0.58 | 1.09 | 114 (6.7) | 20046 (5.8) |
-| wirefold Collapse + columns, shuffle, zstd -1 | 583550 | 29.2 | 2.52 (2.47 to 2.59) | 0.60 | 1.91 | 1.99 (1.82 to 2.15) | 0.90 | 1.09 | 120 (7.3) | 20052 (6.4) |
-| wirefold Collapse + columns, shuffle, zstd -3 | 588165 | 29.4 | 4.34 (3.75 to 5.49) | 0.21 | 4.13 | 2.46 (2.10 to 3.14) | 1.21 | 1.25 | 120 (7.3) | 20052 (6.4) |
-| wirefold Collapse + columns, shuffle, zstd -6 | 589409 | 29.5 | 8.18 (6.62 to 9.90) | 0.23 | 7.95 | 2.47 (1.90 to 3.36) | 1.23 | 1.24 | 120 (7.2) | 20052 (6.4) |
-| wirefold Collapse + columns, shuffle, zstd -19 | 582007 | 29.1 | 446.42 (427.80 to 478.48) | 0.32 | 446.10 | 2.08 (1.86 to 2.34) | 0.98 | 1.09 | 120 (7.2) | 20052 (6.4) |
-| bincode 1.3 raw | 918640 | 45.9 | 0.20 (0.17 to 0.22) | 0.20 | 0.00 | 0.89 (0.74 to 1.15) | 0.00 | 0.89 | 1 (0.9) | 20001 (1.2) |
-| bincode 1.3 + zstd -1 | 678272 | 33.9 | 3.31 (3.29 to 3.32) | 0.18 | 3.13 | 1.91 (1.84 to 1.99) | 1.15 | 0.76 | 8 (2.9) | 20010 (3.3) |
-| bincode 1.3 + zstd -3 | 683707 | 34.2 | 5.85 (5.02 to 6.97) | 0.22 | 5.63 | 1.98 (1.93 to 2.02) | 1.22 | 0.76 | 8 (2.9) | 20010 (3.3) |
-| bincode 1.3 + zstd -6 | 686931 | 34.3 | 12.48 (12.40 to 12.55) | 0.21 | 12.28 | 2.01 (1.92 to 2.06) | 1.23 | 0.78 | 8 (2.9) | 20010 (3.3) |
-| bincode 1.3 + zstd -19 | 673404 | 33.7 | 230.88 (216.71 to 248.78) | 0.30 | 230.58 | 1.98 (1.89 to 2.11) | 1.23 | 0.75 | 8 (2.9) | 20010 (3.3) |
-| bincode 1.3 + wirefold compress() | 660097 | 33.0 | 64.21 (61.63 to 68.44) | 0.27 | 63.94 | 4.25 (3.92 to 4.57) | 3.06 | 1.19 | 1015 (36.4) | 20031 (4.1) |
-| postcard raw | 827235 | 41.4 | 0.48 (0.46 to 0.51) | 0.48 | 0.00 | 1.14 (0.96 to 1.43) | 0.00 | 1.14 | 18 (2.0) | 20001 (1.2) |
-| postcard + zstd -1 | 740567 | 37.0 | 2.41 (2.26 to 2.54) | 0.71 | 1.69 | 2.18 (2.10 to 2.24) | 1.05 | 1.14 | 25 (4.0) | 20010 (3.3) |
-| postcard + zstd -3 | 740578 | 37.0 | 3.19 (2.87 to 3.72) | 0.53 | 2.66 | 2.26 (2.22 to 2.29) | 1.11 | 1.16 | 25 (4.0) | 20010 (3.3) |
-| postcard + zstd -6 | 729758 | 36.5 | 9.71 (9.06 to 10.68) | 0.51 | 9.19 | 2.47 (2.13 to 2.88) | 1.28 | 1.19 | 25 (4.0) | 20010 (3.3) |
-| postcard + zstd -19 | 692567 | 34.6 | 168.20 (164.26 to 172.15) | 0.55 | 167.65 | 2.88 (2.51 to 3.29) | 1.73 | 1.15 | 25 (4.0) | 20010 (3.3) |
-| postcard + wirefold compress() | 670280 | 33.5 | 67.67 (64.58 to 70.31) | 0.61 | 67.05 | 4.86 (4.12 to 6.25) | 3.23 | 1.63 | 1055 (45.6) | 20008 (3.1) |
-| rmp-serde (MessagePack) raw | 868558 | 43.4 | 0.95 (0.80 to 1.07) | 0.95 | 0.00 | 2.70 (2.62 to 2.77) | 0.00 | 2.70 | 18 (2.0) | 20001 (1.2) |
-| rmp-serde (MessagePack) + zstd -1 | 764693 | 38.2 | 3.11 (2.65 to 3.97) | 1.16 | 1.95 | 3.25 (2.83 to 4.01) | 1.15 | 2.10 | 25 (4.0) | 20010 (3.3) |
-| rmp-serde (MessagePack) + zstd -3 | 760886 | 38.0 | 5.53 (5.16 to 6.27) | 0.77 | 4.76 | 3.12 (3.10 to 3.16) | 1.23 | 1.89 | 25 (4.0) | 20010 (3.3) |
-| rmp-serde (MessagePack) + zstd -6 | 744722 | 37.2 | 14.45 (10.86 to 21.39) | 0.88 | 13.57 | 3.11 (2.88 to 3.45) | 1.31 | 1.80 | 25 (4.0) | 20010 (3.3) |
-| rmp-serde (MessagePack) + zstd -19 | 710596 | 35.5 | 185.67 (177.79 to 192.49) | 0.79 | 184.88 | 3.29 (3.07 to 3.52) | 1.63 | 1.66 | 25 (4.0) | 20010 (3.3) |
-| rmp-serde (MessagePack) + wirefold compress() | 676350 | 33.8 | 66.26 (62.45 to 68.60) | 0.85 | 65.41 | 5.22 (4.66 to 5.64) | 2.99 | 2.23 | 914 (39.1) | 20008 (3.2) |
-| rkyv 0.8 (validated) raw | 1118640 | 55.9 | 0.36 (0.35 to 0.36) | 0.36 | 0.00 | 0.83 (0.81 to 0.87) | 0.00 | 0.83 | 19 (5.1) | 20002 (3.2) |
-| rkyv 0.8 (validated) + zstd -1 | 700458 | 35.0 | 4.88 (3.97 to 6.16) | 0.96 | 3.92 | 2.99 (2.55 to 3.82) | 1.68 | 1.31 | 26 (7.1) | 20012 (7.3) |
-| rkyv 0.8 (validated) + zstd -3 | 702764 | 35.1 | 6.27 (6.05 to 6.51) | 0.32 | 5.95 | 2.37 (2.23 to 2.46) | 1.50 | 0.87 | 26 (7.1) | 20012 (7.3) |
-| rkyv 0.8 (validated) + zstd -6 | 705922 | 35.3 | 14.81 (14.19 to 15.73) | 0.32 | 14.49 | 2.22 (1.96 to 2.73) | 1.33 | 0.89 | 26 (7.1) | 20012 (7.3) |
-| rkyv 0.8 (validated) + zstd -19 | 647127 | 32.4 | 244.54 (231.47 to 270.58) | 0.51 | 244.02 | 1.89 (1.82 to 1.97) | 0.96 | 0.93 | 26 (7.1) | 20012 (7.3) |
-| rkyv 0.8 (validated) + wirefold compress() | 715062 | 35.8 | 120.68 (117.12 to 127.34) | 0.49 | 120.20 | 5.00 (4.65 to 5.51) | 3.76 | 1.25 | 1533 (56.5) | 20032 (6.5) |
-| serde_json raw | 2461362 | 123.1 | 2.45 (2.29 to 2.75) | 2.45 | 0.00 | 5.84 (5.71 to 5.96) | 0.00 | 5.84 | 16 (8.0) | 20149 (3.3) |
-| serde_json + zstd -1 | 831395 | 41.6 | 9.18 (9.02 to 9.27) | 2.20 | 6.98 | 8.98 (8.11 to 10.11) | 2.46 | 6.52 | 23 (10.0) | 20160 (11.4) |
-| serde_json + zstd -3 | 917434 | 45.9 | 17.93 (17.43 to 18.26) | 2.85 | 15.08 | 10.38 (10.16 to 10.72) | 3.80 | 6.58 | 23 (10.0) | 20160 (11.4) |
-| serde_json + zstd -6 | 872907 | 43.6 | 42.41 (39.38 to 47.70) | 2.99 | 39.42 | 8.83 (8.39 to 9.28) | 2.72 | 6.11 | 23 (10.0) | 20160 (11.4) |
-| serde_json + zstd -19 | 749105 | 37.5 | 1101.99 (1071.62 to 1134.06) | 2.64 | 1099.34 | 8.85 (7.62 to 10.23) | 2.47 | 6.39 | 23 (10.0) | 20160 (11.4) |
-| serde_json + wirefold compress() | 817820 | 40.9 | 130.73 (124.66 to 135.80) | 2.91 | 127.82 | 12.78 (9.77 to 18.63) | 4.63 | 8.15 | 1251 (60.8) | 20220 (9.1) |
+| wirefold Collapse raw | 918792 | 45.9 | 0.82 (0.73 to 1.00) | 0.77 | 0.06 | 1.31 (1.10 to 1.74) | 0.00 | 1.31 | 3 (1.8) | 20001 (1.2) |
+| wirefold Collapse + zstd -1 | 613402 | 30.7 | 2.52 (2.20 to 3.15) | 0.51 | 2.01 | 1.76 (1.67 to 1.83) | 0.61 | 1.15 | 10 (3.8) | 20010 (3.3) |
+| wirefold Collapse + zstd -3 | 624300 | 31.2 | 3.20 (3.14 to 3.29) | 0.23 | 2.97 | 1.90 (1.85 to 1.96) | 0.76 | 1.14 | 10 (3.8) | 20010 (3.3) |
+| wirefold Collapse + zstd -6 | 617234 | 30.9 | 6.90 (6.79 to 7.01) | 0.23 | 6.68 | 1.84 (1.81 to 1.86) | 0.71 | 1.13 | 10 (3.8) | 20010 (3.3) |
+| wirefold Collapse + zstd -19 | 624034 | 31.2 | 178.83 (169.89 to 192.47) | 0.37 | 178.46 | 2.26 (2.14 to 2.35) | 1.15 | 1.10 | 10 (3.8) | 20010 (3.3) |
+| wirefold Collapse + wirefold compress() | 664841 | 33.2 | 151.72 (145.51 to 155.16) | 0.30 | 151.42 | 3.10 (2.74 to 3.55) | 1.52 | 1.57 | 1303 (50.1) | 20045 (4.8) |
+| wirefold Collapse + columns, zstd -1 | 591178 | 29.6 | 2.06 (2.05 to 2.07) | 0.61 | 1.45 | 1.85 (1.82 to 1.90) | 0.76 | 1.10 | 65 (6.8) | 20057 (6.7) |
+| wirefold Collapse + columns, zstd -3 | 590820 | 29.5 | 2.77 (2.58 to 2.89) | 0.22 | 2.55 | 1.85 (1.78 to 1.91) | 0.74 | 1.10 | 65 (6.8) | 20057 (6.7) |
+| wirefold Collapse + columns, zstd -6 | 593085 | 29.7 | 6.62 (6.41 to 6.81) | 0.23 | 6.39 | 1.84 (1.79 to 1.87) | 0.74 | 1.10 | 65 (6.8) | 20057 (6.7) |
+| wirefold Collapse + columns, zstd -19 | 585556 | 29.3 | 455.53 (437.59 to 473.69) | 0.32 | 455.21 | 1.75 (1.73 to 1.77) | 0.61 | 1.14 | 65 (6.8) | 20057 (6.7) |
+| wirefold Collapse + columns, encoded planes, zstd -1 | 591198 | 29.6 | 3.45 (3.31 to 3.52) | 0.24 | 3.21 | 2.38 (2.34 to 2.42) | 1.26 | 1.12 | 134 (10.4) | 20074 (7.3) |
+| wirefold Collapse + columns, encoded planes, zstd -3 | 590840 | 29.5 | 5.00 (4.44 to 5.96) | 0.24 | 4.76 | 2.34 (2.27 to 2.47) | 1.21 | 1.13 | 134 (10.4) | 20074 (7.3) |
+| wirefold Collapse + columns, encoded planes, zstd -6 | 593105 | 29.7 | 8.91 (8.46 to 9.29) | 0.25 | 8.67 | 2.45 (2.41 to 2.50) | 1.29 | 1.17 | 134 (10.4) | 20074 (7.3) |
+| wirefold Collapse + columns, encoded planes, zstd -19 | 585576 | 29.3 | 481.47 (476.36 to 485.81) | 0.34 | 481.14 | 2.51 (2.17 to 2.90) | 1.20 | 1.31 | 134 (10.4) | 20074 (7.3) |
+| wirefold Collapse + columns, byte shuffle, zstd -3 | 589031 | 29.5 | 4.87 (4.09 to 5.30) | 0.28 | 4.59 | 3.10 (2.30 to 3.56) | 1.59 | 1.51 | 70 (7.2) | 20057 (6.7) |
+| bincode 1.3 raw | 918640 | 45.9 | 0.22 (0.18 to 0.28) | 0.22 | 0.00 | 0.99 (0.82 to 1.32) | 0.00 | 0.99 | 1 (0.9) | 20001 (1.2) |
+| bincode 1.3 + zstd -1 | 678272 | 33.9 | 4.51 (3.65 to 5.94) | 0.22 | 4.28 | 2.54 (2.11 to 2.83) | 1.41 | 1.13 | 8 (2.9) | 20010 (3.3) |
+| bincode 1.3 + zstd -3 | 683707 | 34.2 | 6.53 (5.27 to 8.88) | 0.25 | 6.28 | 2.46 (2.10 to 2.81) | 1.46 | 1.00 | 8 (2.9) | 20010 (3.3) |
+| bincode 1.3 + zstd -6 | 686931 | 34.3 | 15.83 (12.73 to 21.97) | 0.24 | 15.60 | 2.17 (2.15 to 2.19) | 1.33 | 0.83 | 8 (2.9) | 20010 (3.3) |
+| bincode 1.3 + zstd -19 | 673404 | 33.7 | 260.83 (237.72 to 297.62) | 0.32 | 260.51 | 2.32 (2.29 to 2.34) | 1.43 | 0.89 | 8 (2.9) | 20010 (3.3) |
+| bincode 1.3 + wirefold compress() | 660097 | 33.0 | 69.27 (65.54 to 74.23) | 0.31 | 68.96 | 4.56 (4.48 to 4.63) | 3.30 | 1.26 | 1015 (36.4) | 20031 (4.1) |
+| postcard raw | 827235 | 41.4 | 0.52 (0.49 to 0.55) | 0.52 | 0.00 | 1.17 (1.12 to 1.20) | 0.00 | 1.17 | 18 (2.0) | 20001 (1.2) |
+| postcard + zstd -1 | 740567 | 37.0 | 2.34 (2.26 to 2.44) | 0.74 | 1.60 | 2.26 (2.22 to 2.32) | 1.07 | 1.19 | 25 (4.0) | 20010 (3.3) |
+| postcard + zstd -3 | 740578 | 37.0 | 2.79 (2.67 to 2.88) | 0.50 | 2.30 | 2.22 (2.19 to 2.25) | 1.07 | 1.16 | 25 (4.0) | 20010 (3.3) |
+| postcard + zstd -6 | 729758 | 36.5 | 9.88 (9.56 to 10.14) | 0.53 | 9.34 | 2.44 (2.38 to 2.51) | 1.24 | 1.20 | 25 (4.0) | 20010 (3.3) |
+| postcard + zstd -19 | 692567 | 34.6 | 177.55 (169.44 to 181.69) | 0.60 | 176.95 | 2.84 (2.68 to 2.96) | 1.65 | 1.19 | 25 (4.0) | 20010 (3.3) |
+| postcard + wirefold compress() | 670280 | 33.5 | 70.14 (64.45 to 75.14) | 0.59 | 69.56 | 4.34 (4.15 to 4.51) | 2.88 | 1.46 | 1055 (45.6) | 20008 (3.1) |
+| rmp-serde (MessagePack) raw | 868558 | 43.4 | 0.82 (0.79 to 0.84) | 0.82 | 0.00 | 1.81 (1.79 to 1.84) | 0.00 | 1.81 | 18 (2.0) | 20001 (1.2) |
+| rmp-serde (MessagePack) + zstd -1 | 764693 | 38.2 | 2.81 (2.69 to 2.92) | 1.04 | 1.77 | 3.03 (2.96 to 3.11) | 1.16 | 1.86 | 25 (4.0) | 20010 (3.3) |
+| rmp-serde (MessagePack) + zstd -3 | 760886 | 38.0 | 5.53 (5.22 to 6.02) | 0.81 | 4.72 | 3.13 (3.07 to 3.19) | 1.27 | 1.86 | 25 (4.0) | 20010 (3.3) |
+| rmp-serde (MessagePack) + zstd -6 | 744722 | 37.2 | 11.68 (11.42 to 11.91) | 0.80 | 10.88 | 3.18 (3.11 to 3.23) | 1.34 | 1.84 | 25 (4.0) | 20010 (3.3) |
+| rmp-serde (MessagePack) + zstd -19 | 710596 | 35.5 | 203.95 (182.50 to 229.81) | 0.90 | 203.04 | 3.59 (3.43 to 3.77) | 1.73 | 1.86 | 25 (4.0) | 20010 (3.3) |
+| rmp-serde (MessagePack) + wirefold compress() | 676350 | 33.8 | 72.73 (68.51 to 78.24) | 0.86 | 71.87 | 5.57 (5.27 to 5.85) | 3.30 | 2.27 | 914 (39.1) | 20008 (3.2) |
+| rkyv 0.8 (validated) raw | 1118640 | 55.9 | 0.38 (0.35 to 0.41) | 0.38 | 0.00 | 0.98 (0.92 to 1.10) | 0.00 | 0.98 | 19 (5.1) | 20002 (3.2) |
+| rkyv 0.8 (validated) + zstd -1 | 700458 | 35.0 | 4.73 (4.54 to 4.93) | 0.96 | 3.76 | 2.97 (2.89 to 3.01) | 1.70 | 1.27 | 26 (7.1) | 20012 (7.3) |
+| rkyv 0.8 (validated) + zstd -3 | 702764 | 35.1 | 6.22 (5.80 to 6.44) | 0.33 | 5.89 | 2.38 (2.26 to 2.51) | 1.51 | 0.87 | 26 (7.1) | 20012 (7.3) |
+| rkyv 0.8 (validated) + zstd -6 | 705922 | 35.3 | 15.28 (14.48 to 15.76) | 0.33 | 14.95 | 2.17 (2.10 to 2.24) | 1.29 | 0.88 | 26 (7.1) | 20012 (7.3) |
+| rkyv 0.8 (validated) + zstd -19 | 647127 | 32.4 | 257.15 (254.54 to 259.45) | 0.54 | 256.60 | 2.23 (1.76 to 2.86) | 1.13 | 1.09 | 26 (7.1) | 20012 (7.3) |
+| rkyv 0.8 (validated) + wirefold compress() | 715062 | 35.8 | 122.79 (118.57 to 126.34) | 0.49 | 122.30 | 5.12 (5.02 to 5.20) | 3.81 | 1.31 | 1533 (56.5) | 20032 (6.5) |
+| serde_json raw | 2461362 | 123.1 | 2.68 (2.28 to 3.42) | 2.68 | 0.00 | 6.26 (5.95 to 6.70) | 0.00 | 6.26 | 16 (8.0) | 20149 (3.3) |
+| serde_json + zstd -1 | 831395 | 41.6 | 10.47 (9.76 to 11.87) | 2.31 | 8.16 | 9.03 (8.57 to 9.59) | 2.53 | 6.50 | 23 (10.0) | 20160 (11.4) |
+| serde_json + zstd -3 | 917434 | 45.9 | 18.28 (17.93 to 18.70) | 2.83 | 15.45 | 10.01 (9.48 to 10.52) | 3.76 | 6.25 | 23 (10.0) | 20160 (11.4) |
+| serde_json + zstd -6 | 872907 | 43.6 | 42.45 (41.38 to 44.28) | 3.01 | 39.44 | 8.88 (8.81 to 8.97) | 2.70 | 6.18 | 23 (10.0) | 20160 (11.4) |
+| serde_json + zstd -19 | 749105 | 37.5 | 1076.64 (1036.20 to 1129.87) | 2.46 | 1074.18 | 8.23 (7.69 to 8.84) | 2.24 | 5.99 | 23 (10.0) | 20160 (11.4) |
+| serde_json + wirefold compress() | 817820 | 40.9 | 132.55 (128.94 to 135.74) | 2.41 | 130.14 | 11.22 (10.88 to 11.46) | 4.41 | 6.81 | 1251 (60.8) | 20220 (9.1) |
 
 Sum one `f64` column of 20000 records (open + read, no full decode):
 
 | format | time (ms) |
 |---|---:|
-| wirefold view (open + column read) | 0.29 (0.28 to 0.30) |
-| rkyv 0.8 (validate + read) | 0.09 (0.09 to 0.10) |
-| bincode (decode all, then sum) | 0.77 (0.76 to 0.77) |
-| postcard (decode all, then sum) | 1.09 (1.06 to 1.14) |
-| whole buffer zstd -3: decompress all, then read | 0.86 (0.83 to 0.89) |
-| columns, zstd -3: decompress one column | 0.04 (0.04 to 0.05) |
-| columns, shuffle, zstd -3: decompress one column | 0.19 (0.16 to 0.25) |
+| wirefold open only (validates the table) | 0.28 (0.27 to 0.29) |
+| wirefold, view already open: per-element accessor | 0.01 (0.01 to 0.01) |
+| wirefold, view already open: column slice | 0.01 (0.01 to 0.01) |
+| wirefold view (open + per-element accessor) | 0.28 (0.28 to 0.29) |
+| wirefold view (open + column slice) | 0.28 (0.27 to 0.28) |
+| rkyv 0.8 (validate + read) | 0.08 (0.07 to 0.08) |
+| bincode (decode all, then sum) | 0.75 (0.70 to 0.79) |
+| postcard (decode all, then sum) | 1.12 (1.08 to 1.21) |
+| whole buffer zstd -3: decompress all, then read | 0.99 (0.98 to 1.01) |
+| columns, zstd -3: decompress one column | 0.05 (0.04 to 0.05) |
+| columns, encoded planes, zstd -3: decompress one column | 0.05 (0.04 to 0.05) |
 
-## Columns and zstd
+## Layout, columns and blocks
 
-What `Collapse` stores is a section table: the scalar fields of the records as one array of packed records (for
-this `Event`, 22 bytes each: `ts` 8, `user` 4, `kind` 1, `value` 8, `ok` 1, row after row), then each
-variable-length field as its own column (the strings, as offsets and bytes). So the fixed-width fields are row-major, and
-reading one of them strides through the record array.
+### The layout
 
-The `columns` rows take that buffer and split the record array into one plane per field (5 planes), turn the string
-offsets into lengths (so the strings are a lengths plane and a bytes plane), compress each of the 7 planes as its own zstd
-frame, and rebuild the exact buffer on decode (checked against the original before timing). The `shuffle` rows also
-byte-shuffle each multi-byte plane first. The split and rebuild are in `bench/src/main.rs` and know this record's
-field offsets; zstd stays out of the library.
+`Collapse` is a section table: one section per scalar field of the record, each a contiguous column
+(`[count][values]`, 8-aligned, `bool` as a byte), then one section per variable-length field (the strings, as offsets
+and bytes). It used to pack all the scalar fields of a record into one row-major block, which put one field's values
+22 bytes apart; the change is what moves the compressed sizes below. What it did to the other numbers, on the telemetry
+records:
 
-| telemetry, 20,000 records | zstd -1 | zstd -3 | zstd -19 |
-|---|---:|---:|---:|
-| `Collapse` as stored | 237,083 | 234,791 | 207,470 |
-| per-field planes | 178,831 | 166,713 | 151,213 |
-| per-field planes, byte-shuffled | 200,571 | 201,532 | 178,525 |
+| | before (scalars row-major) | after (a column per field) |
+|---|---:|---:|
+| raw size | 713,116 B | 713,212 B (the longer section table) |
+| raw encode | 0.18 ms | 0.20 ms |
+| raw decode, all records | 1.03 ms | 1.25 ms (+21%) |
+| `open` (validate the table) | not measured separately | 0.33 ms, almost all of it the 20,000 UTF-8 checks |
+| read the `f64` field, view open | not measured separately | 0.013 ms, by element or as `value_column()` |
+| zstd -1 on the whole buffer | 237,083 B | 199,392 B |
+| zstd -3 on the whole buffer | 234,791 B | 189,754 B |
+| zstd -19 on the whole buffer | 207,470 B | 167,132 B |
 
-Sizes in bytes. Per-field planes beat the whole buffer by 25% to 29% on this data, and also beat bincode, postcard, rkyv
-and MessagePack through zstd at every level, because each plane holds one field's values (increasing timestamps, small
-domains, repeated flags) and zstd finds structure that the interleaved rows hide. Byte-shuffling the planes made them
-larger here, so it is not used for the headline numbers. The cost is the split and rebuild, which is inside the 3.5 ms
-encode and 2.1 ms decode. The column read in the Results table (decompress one plane, then sum) is what a column store
-gives that zstd on rows cannot: the other planes stay compressed.
+Decoding every record got slower because it now reads five columns and the strings instead of one block and the strings.
+Each column is available as a zero-copy slice (`value_column()`), so a column can be summed, searched or handed to a
+compressor without touching the others.
 
-A layout that stores the scalar fields as contiguous columns in the first place would make each plane a slice of the
-buffer, so no split or rebuild step would be needed; that is a format change and is not part of these numbers.
+### Per column
+
+Where the bytes are, for each column: as stored and under zstd, then encoded for its type (delta coding for the
+increasing timestamps, exact-bit-width packing of integers, decimal floats stored as scaled integers, a dictionary for the
+strings) and under zstd. Each integer column is stored as the smaller of two forms, minimum-subtracted bytes at the
+narrowest byte width (which zstd then compresses) or bit-packed at the exact width (which it cannot).
+
+#### Per column, telemetry records (20000 records, 713212 bytes)
+
+| plane | raw (B) | zstd -1 | zstd -3 | zstd -19 | encoded (B) | encoded, zstd -1 | zstd -3 | zstd -19 | encoding |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| ts (u64) | 160000 | 24448 | 24448 | 24461 | 20018 | 14386 | 14386 | 14431 | delta, integer |
+| user (u32) | 80000 | 43956 | 41039 | 40228 | 32511 | 32520 | 32520 | 32520 | integer |
+| kind (u8) | 20000 | 6686 | 7736 | 6731 | 20001 | 6818 | 7736 | 6731 | as stored |
+| value (f64) | 160000 | 73452 | 67364 | 60197 | 42512 | 42521 | 42521 | 42521 | decimal scaled, integer |
+| ok (bool) | 20000 | 2553 | 2522 | 1599 | 20001 | 2553 | 2523 | 1597 | as stored |
+| name lengths | 160000 | 10058 | 6237 | 7599 | 20001 | 6783 | 7748 | 6726 | dictionary |
+| name bytes | 113052 | 17598 | 17287 | 10318 | 60 | 69 | 64 | 63 | dictionary |
+| **total** | 713052 | 178751 | 166633 | 151133 | 155104 | 105650 | 107498 | 104589 | |
+
+What the encodings reach, against what each column holds. `ts` is increasing by 1 to 50, so its differences carry
+about 5.6 bits each: 14.1 KB at the entropy bound, 14.4 KB achieved. `user` is uniform over 5,000 values, 12.3 bits each, a
+30.7 KB bound, and 32.5 KB is achieved (zstd on the bytes alone gets 40.2 KB). `value` is uniform over 100,000 cent values,
+16.6 bits each, a 41.5 KB bound, and 42.5 KB is achieved (zstd on the bytes alone: 60.2 KB; on the scaled integers as
+bytes: 53.3 KB, which is what bit packing beats). `kind` has 6 values (2.6 bits, 6.4 KB bound, 6.7 KB achieved) and `ok`
+is true nine times in ten (0.47 bits, 1.2 KB bound, 1.6 KB achieved). The six distinct names become one byte each plus a
+60-byte dictionary. The columns' bounds sum to about 100.4 KB and the achieved total is 104.6 KB at zstd -19, so
+about 4% is left on this data.
+
+Byte-shuffling the columns instead (grouping the first bytes of every value, then the second, and so on) made the
+whole buffer larger than not shuffling at every level here (201,596 against 167,109 bytes at -3), so it is not used.
+For 8-byte columns like these the encodings above are what works. Shuffling is what helps for floats whose
+fields do not align with bytes: see the weights below.
+
+#### Per column, random records (20000 records, 918792 bytes)
+
+| plane | raw (B) | zstd -1 | zstd -3 | zstd -19 | encoded (B) | encoded, zstd -1 | zstd -3 | zstd -19 | encoding |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| ts (u64) | 160000 | 160012 | 160012 | 160012 | 160011 | 160023 | 160023 | 160023 | delta, integer |
+| user (u32) | 80000 | 80009 | 80009 | 80009 | 80011 | 80020 | 80020 | 80020 | integer |
+| kind (u8) | 20000 | 20009 | 20009 | 20009 | 20001 | 20010 | 20010 | 20010 | as stored |
+| value (f64) | 160000 | 160012 | 160012 | 160012 | 160001 | 160013 | 160013 | 160013 | as stored |
+| ok (bool) | 20000 | 3865 | 3800 | 2578 | 20001 | 3865 | 3800 | 2578 | as stored |
+| name lengths | 160000 | 7729 | 1990 | 2073 | 160001 | 6763 | 1991 | 2062 | as stored |
+| name bytes | 318632 | 159391 | 164043 | 159762 | 318633 | 160364 | 164843 | 160730 | as stored |
+| **total** | 918632 | 591027 | 589875 | 584455 | 918659 | 591058 | 590700 | 585436 | |
+
+On the random data nothing helps: every column is incompressible except the `ok` column, the string lengths and the hex
+names, which zstd already halves.
+
+### Every level
+
+Size and time at every zstd level that matters, for the whole buffer, for each column as its own frame, for each
+encoded column as its own frame, and the encoded columns spread over 4 threads (column `i` on thread `i mod 4`).
+In-process medians of 5 runs (3 from level 15).
+
+#### Every level, telemetry records (20000 records, 713212 bytes)
+
+| level | whole: size | enc ms | dec ms | planes: size | enc ms | dec ms | encoded planes: size | enc ms | dec ms | enc ms, 4 threads |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 199392 | 2.02 | 0.81 | 178207 | 2.40 | 1.09 | 105790 | 2.06 | 0.79 | 2.56 |
+| 2 | 188471 | 2.76 | 1.01 | 166974 | 2.83 | 1.18 | 106589 | 2.11 | 0.86 | 2.36 |
+| 3 | 189754 | 4.58 | 1.46 | 167109 | 4.88 | 1.52 | 107638 | 2.42 | 0.86 | 3.26 |
+| 4 | 188665 | 4.95 | 1.36 | 165006 | 5.13 | 1.59 | 107633 | 3.45 | 1.10 | 4.23 |
+| 5 | 182619 | 5.45 | 1.02 | 159550 | 5.46 | 1.14 | 107161 | 3.29 | 0.86 | 4.49 |
+| 6 | 180132 | 7.94 | 0.98 | 163356 | 8.09 | 1.08 | 106939 | 4.01 | 1.15 | 4.51 |
+| 7 | 179090 | 8.39 | 0.91 | 161902 | 10.04 | 0.97 | 106853 | 4.17 | 0.81 | 5.82 |
+| 8 | 178386 | 11.42 | 0.93 | 161347 | 12.37 | 1.08 | 106798 | 4.56 | 0.82 | 7.03 |
+| 9 | 178438 | 11.78 | 0.91 | 161393 | 14.01 | 0.97 | 106798 | 5.96 | 0.82 | 8.63 |
+| 10 | 177437 | 16.33 | 0.95 | 160044 | 20.89 | 0.95 | 106755 | 8.85 | 0.80 | 5.88 |
+| 12 | 176574 | 53.11 | 0.90 | 158923 | 161.99 | 0.99 | 106710 | 138.18 | 0.90 | 46.49 |
+| 15 | 176744 | 97.24 | 0.90 | 158791 | 300.44 | 0.96 | 106607 | 235.68 | 1.21 | 86.16 |
+| 19 | 167132 | 239.67 | 1.09 | 151261 | 685.33 | 1.40 | 104729 | 313.60 | 0.77 | 113.13 |
+| 22 | 166783 | 623.89 | 1.37 | 151264 | 3082.75 | 1.82 | 104723 | 2648.73 | 0.92 | 995.20 |
+
+Reading the table: the encoded columns at zstd -1 are 47% smaller than the whole buffer at the same level, at the
+same encode time (2.06 against 2.02 ms) and the same decode time. The size barely moves from level 1 (105,790 B) to level 19 (104,729
+B) because the encodings have already removed what the higher levels find, so level 19 buys 1% for 150 times the encode
+time on this data. Splitting the columns over 4 threads helps only where the compression itself is slow: at level 19 it
+takes the encode from 314 to 113 ms (2.8 times) and at level 22 from 2,649 to 995 ms, and at levels 1 to 9 it
+is no faster than one thread.
+
+#### Every level, random records (20000 records, 918792 bytes)
+
+| level | whole: size | enc ms | dec ms | planes: size | enc ms | dec ms | encoded planes: size | enc ms | dec ms | enc ms, 4 threads |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 613402 | 1.14 | 0.61 | 591178 | 1.28 | 0.78 | 591198 | 3.04 | 1.25 | 2.86 |
+| 2 | 622553 | 1.22 | 0.69 | 591239 | 1.24 | 0.79 | 591259 | 3.02 | 1.26 | 2.77 |
+| 3 | 624300 | 5.36 | 1.15 | 590820 | 4.14 | 0.89 | 590840 | 4.85 | 1.58 | 5.12 |
+| 4 | 625868 | 5.59 | 1.07 | 592382 | 5.20 | 0.76 | 592402 | 6.92 | 1.78 | 7.74 |
+| 5 | 617414 | 5.41 | 0.77 | 592445 | 5.16 | 0.77 | 592465 | 7.22 | 1.31 | 6.89 |
+| 6 | 617234 | 6.70 | 0.80 | 593085 | 6.61 | 0.76 | 593105 | 10.72 | 1.26 | 11.18 |
+| 7 | 617191 | 7.45 | 0.72 | 592979 | 8.02 | 1.05 | 592999 | 13.47 | 1.70 | 10.77 |
+| 8 | 617330 | 7.69 | 0.74 | 592985 | 8.22 | 0.77 | 593005 | 9.65 | 1.21 | 12.32 |
+| 9 | 617330 | 8.59 | 0.77 | 592984 | 9.98 | 0.71 | 593004 | 11.43 | 1.16 | 13.41 |
+| 10 | 617157 | 10.63 | 0.77 | 592837 | 13.24 | 0.72 | 592857 | 14.88 | 2.01 | 17.31 |
+| 12 | 616948 | 36.34 | 0.76 | 592657 | 159.34 | 1.08 | 592677 | 166.80 | 1.21 | 58.36 |
+| 15 | 616572 | 87.02 | 0.89 | 592674 | 251.17 | 0.78 | 592694 | 268.44 | 1.34 | 99.76 |
+| 19 | 624034 | 188.39 | 1.15 | 585556 | 448.10 | 0.66 | 585576 | 467.32 | 1.09 | 197.72 |
+| 22 | 624034 | 564.04 | 1.69 | 585291 | 3266.85 | 1.03 | 585311 | 3199.52 | 1.55 | 1303.69 |
+
+### Blocks
+
+The same columns cut into fixed-size blocks, each compressed on its own, stored with a 16-byte pointer (checksum,
+logical and stored length), and identical blocks stored once. A block store of this kind is what a copy-on-write
+filesystem such as ZFS keeps, and the section table is already its table of pointers. For each block size: the stored size,
+encode and decode time, the time to read 100 rows of the `f64` column by decompressing only the blocks that cover them
+against decompressing the whole column, the bytes that sit in duplicate blocks, and the cost of an FNV-1a checksum
+over every block (a fast 64-bit non-cryptographic hash; it only times the cost of one).
+
+#### Blocks, telemetry records (20000 records)
+
+| block size | blocks | stored (B) | with pointers (B) | encode ms | decode ms | read 100 rows (ms) | whole plane read (ms) | duplicate bytes | checksum ms |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4 KiB | 40 | 107426 | 108066 | 1.82 | 0.70 | 0.014 | 0.019 | 0 | 0.21 |
+| 16 KiB | 14 | 107429 | 107653 | 1.21 | 0.45 | 0.021 | 0.025 | 0 | 0.21 |
+| 64 KiB | 7 | 107498 | 107610 | 0.87 | 0.32 | 0.027 | 0.026 | 0 | 0.21 |
+| 256 KiB | 7 | 107498 | 107610 | 0.85 | 0.31 | 0.026 | 0.026 | 0 | 0.21 |
+| whole plane | 7 | 107498 | 107610 | 0.85 | 0.32 | 0.026 | 0.026 | 0 | 0.21 |
+
+#### Blocks, telemetry records, scaled up (1000000 records)
+
+| block size | blocks | stored (B) | with pointers (B) | encode ms | decode ms | read 100 rows (ms) | whole plane read (ms) | duplicate bytes | checksum ms |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4 KiB | 1897 | 5364424 | 5394776 | 84.63 | 33.95 | 0.014 | 0.411 | 0 | 10.41 |
+| 16 KiB | 479 | 5365389 | 5373053 | 35.90 | 13.05 | 0.016 | 0.408 | 0 | 10.49 |
+| 64 KiB | 123 | 5374027 | 5375995 | 21.26 | 7.40 | 0.022 | 0.524 | 0 | 10.34 |
+| 256 KiB | 33 | 5375481 | 5376009 | 18.25 | 5.56 | 0.034 | 0.452 | 0 | 10.28 |
+| whole plane | 7 | 5382006 | 5382118 | 18.30 | 6.16 | 0.530 | 0.515 | 0 | 10.25 |
+
+#### Blocks, random records (20000 records)
+
+| block size | blocks | stored (B) | with pointers (B) | encode ms | decode ms | read 100 rows (ms) | whole plane read (ms) | duplicate bytes | checksum ms |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4 KiB | 228 | 592335 | 595983 | 11.55 | 5.07 | 0.018 | 0.039 | 0 | 1.29 |
+| 16 KiB | 59 | 587016 | 587960 | 3.94 | 1.21 | 0.015 | 0.031 | 0 | 1.32 |
+| 64 KiB | 18 | 586839 | 587127 | 1.94 | 0.73 | 0.022 | 0.031 | 0 | 1.30 |
+| 256 KiB | 8 | 589628 | 589756 | 2.84 | 0.64 | 0.034 | 0.034 | 0 | 1.30 |
+| whole plane | 7 | 590700 | 590812 | 2.52 | 0.61 | 0.032 | 0.032 | 0 | 1.29 |
+
+Finding: block size costs almost nothing in size (at 1,000,000 records the 4 KiB store is 0.3% smaller than whole columns,
+because each block adapts to its own data) and cuts the cost of reading a few rows from 0.53 ms to 0.014 to 0.034 ms
+(15 to 38 times) at that size, where at 20,000 records the columns are small enough that it makes no difference. The
+price is the per-block overhead in encode and decode: 4 KiB blocks take 4.6 times as long to encode and 5.5 times as long to
+decode as whole columns, 64 KiB blocks 16% and 20% longer. So 16 to 64 KiB is the useful range. No duplicate block
+turned up in either dataset: deduplication does nothing for a single set of records with this much variety, and would
+pay for repeated or versioned data, which these runs do not include.
+
+### Model weights
+
+`seed-format` stores model checkpoints (tensors as raw bytes with a dtype). The cheapest test of whether
+column-wise compression helps weights is bf16 values drawn from a normal distribution with standard deviation 0.02, as in an
+initialised or trained linear layer. This is synthetic: it shows the mechanism, not any real checkpoint.
+
+#### Model weights (bf16), synthetic normal (sd 0.02), 4000000 values, 8000000 bytes
+
+| representation | zstd -1 | zstd -3 | zstd -19 | share of raw at -3 |
+|---|---:|---:|---:|---:|
+| as stored (interleaved bytes) | 6238029 | 6238961 | 6240658 | 78.0% |
+| two byte planes (high, low), compressed separately | 5474415 | 5693916 | 5359504 | 71.2% |
+| high byte plane alone (sign and 7 exponent bits) | 1474316 | 1693817 | 1359405 | 21.2% |
+| low byte plane alone (1 exponent bit, 7 mantissa bits) | 4000099 | 4000099 | 4000099 | 50.0% |
+
+Splitting each 2-byte value into a high plane (sign and 7 exponent bits) and a low plane (1 exponent bit and 7 mantissa
+bits) takes zstd -3 from 78.0% to 71.2% of the raw size (67.0% at -19): the high plane compresses to 42% of itself and
+the mantissa plane does not compress at all. Here byte-shuffling is right, because the fields of a bf16 value really are
+split across the two bytes.
+
+### What is in the library and what is not
+
+The layout is in the library: `#[derive(Collapse)]` writes a column per scalar field and each view has
+`<field>_column()`. Everything else on this page that is not zstd is in `bench/src/main.rs` and knows the `Event`
+record: the encodings (delta, exact-bit-width packing, decimal scaling, dictionary), the per-column frames, the thread
+split and the block store. zstd stays out of the library. Making the encodings and the block layer library features is
+a separate piece of work.
 
 ## Parsing
 
@@ -420,6 +599,8 @@ is exactness, since `1.0`, `1e3` and `0.10` survive unchanged.
 - Stage times under about 1 ms vary between processes (allocator and page-fault effects: wirefold's serialize
   stage on the random data was 0.2 to 0.8 ms across rows doing the same work), so differences of a few tenths
   of a millisecond between serializers are not established.
+- The encodings, the per-column frames, the thread split and the block store are benchmark code (see
+  [Layout, columns and blocks](#layout-columns-and-blocks)); the bf16 weights are synthetic.
 - Every serializer here round-trips through a `Vec<u8>`; a caller that keeps rkyv or `Collapse` bytes in place
   avoids the copies counted in those pipelines.
 
@@ -429,6 +610,10 @@ is exactness, since `1.0`, `1e3` and `0.10` survive unchanged.
 cd bench
 cargo run --release -- 20000        # serialization tables: [records] [runs per cell, default 3]
 cargo run --release -- numbers       # ryu / itoa against std and against keeping the text
+cargo run --release -- planes ordered 20000    # the per-column table (also: random)
+cargo run --release -- levels ordered 20000    # every zstd level, whole buffer against columns
+cargo run --release -- blocks ordered 20000    # the block store (try 1000000 records)
+cargo run --release -- bf16 4000000            # synthetic bf16 weights
 ```
 
 ## Earlier benchmarks
