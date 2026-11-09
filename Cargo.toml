@@ -70,3 +70,7 @@ required-features = ["syntax"]
 [[test]]
 name = "parser_dos"
 required-features = ["syntax"]
+
+[[test]]
+name = "parse_behaviour"
+required-features = ["syntax"]

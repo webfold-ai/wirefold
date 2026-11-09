@@ -229,8 +229,10 @@ pub(super) fn parse_csv(input: &str) -> Result<SyntaxTerm, SyntaxError> {
     }
     let mut root = BuildNode::Empty;
     let mut fillers = filler_budget(input);
+    let mut cols: Vec<std::borrow::Cow<'_, str>> = Vec::with_capacity(3);
     for row in rows {
-        let cols = parse_csv_row(row)?;
+        cols.clear();
+        csv_columns(row, &mut cols)?;
         if cols.len() != 3 {
             return Err(SyntaxError::new("csv row must have exactly 3 columns"));
         }
@@ -254,6 +256,20 @@ pub(super) fn parse_csv(input: &str) -> Result<SyntaxTerm, SyntaxError> {
         insert_csv_node(&mut root, path, term, &mut fillers)?;
     }
     Ok(root.finish())
+}
+
+/// The columns of one row, borrowed from it when it has no quote character (no unescaping is
+/// possible then, so each column is just a slice between commas) and owned otherwise.
+fn csv_columns<'r>(
+    row: &'r str,
+    out: &mut Vec<std::borrow::Cow<'r, str>>,
+) -> Result<(), SyntaxError> {
+    if row.contains('"') {
+        out.extend(parse_csv_row(row)?.into_iter().map(std::borrow::Cow::Owned));
+    } else {
+        out.extend(row.split(',').map(std::borrow::Cow::Borrowed));
+    }
+    Ok(())
 }
 
 fn parse_csv_row(row: &str) -> Result<Vec<String>, SyntaxError> {
@@ -380,6 +396,7 @@ pub(super) fn parse_baml(input: &str) -> Result<SyntaxTerm, SyntaxError> {
 pub(super) fn parse_toon(input: &str) -> Result<SyntaxTerm, SyntaxError> {
     let mut root = BuildNode::Obj(Vec::new());
     let mut fillers = filler_budget(input);
+    let mut segs: Vec<Segment<'_>> = Vec::new();
     for line in input.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -388,7 +405,7 @@ pub(super) fn parse_toon(input: &str) -> Result<SyntaxTerm, SyntaxError> {
         let (path, value) = line
             .split_once('=')
             .ok_or_else(|| SyntaxError::new(format!("bad TOON line: {line}")))?;
-        let segs = parse_path(path.trim())?;
+        parse_path_into(path.trim(), &mut segs)?;
         let term = JsonParser::new(value.trim(), true).parse()?;
         root.insert(&segs, term, &mut fillers)?;
     }
@@ -401,10 +418,22 @@ pub(super) fn parse_poml(input: &str) -> Result<SyntaxTerm, SyntaxError> {
         .strip_prefix("<poml>")
         .and_then(|s| s.strip_suffix("</poml>"))
         .ok_or_else(|| SyntaxError::new("POML must be wrapped in <poml>"))?;
-    parse_poml_node(body.trim(), 0)
+    parse_poml_node(body.trim(), 0, &mut PomlScratch::default())
 }
 
-fn parse_poml_node(input: &str, depth: usize) -> Result<SyntaxTerm, SyntaxError> {
+/// Reusable stacks for the fields and items being built, so each object or list is allocated once
+/// at its final size instead of grown by pushing.
+#[derive(Default)]
+struct PomlScratch {
+    fields: Vec<(String, SyntaxTerm)>,
+    items: Vec<SyntaxTerm>,
+}
+
+fn parse_poml_node(
+    input: &str,
+    depth: usize,
+    scratch: &mut PomlScratch,
+) -> Result<SyntaxTerm, SyntaxError> {
     let input = input.trim();
     if input == "<nb/>" {
         return Ok(SyntaxTerm::Nb);
@@ -416,7 +445,7 @@ fn parse_poml_node(input: &str, depth: usize) -> Result<SyntaxTerm, SyntaxError>
         if depth >= MAX_NESTING_DEPTH {
             return Err(depth_error());
         }
-        let mut fields = Vec::new();
+        let base = scratch.fields.len();
         let mut rest = inner.trim();
         while !rest.is_empty() {
             let tag_end = rest
@@ -429,13 +458,14 @@ fn parse_poml_node(input: &str, depth: usize) -> Result<SyntaxTerm, SyntaxError>
                 .ok_or_else(|| SyntaxError::new("unclosed field"))?
                 + tag_end
                 + 1;
-            fields.push((
-                unescape_xml(&name),
-                parse_poml_node(&rest[tag_end + 1..end], depth + 1)?,
-            ));
+            let field = (
+                unescape_xml(name),
+                parse_poml_node(&rest[tag_end + 1..end], depth + 1, scratch)?,
+            );
+            scratch.fields.push(field);
             rest = rest[end + close.len()..].trim();
         }
-        return Ok(SyntaxTerm::Bu(fields));
+        return Ok(SyntaxTerm::Bu(scratch.fields.drain(base..).collect()));
     }
     if let Some(inner) = input
         .strip_prefix("<list>")
@@ -444,7 +474,7 @@ fn parse_poml_node(input: &str, depth: usize) -> Result<SyntaxTerm, SyntaxError>
         if depth >= MAX_NESTING_DEPTH {
             return Err(depth_error());
         }
-        let mut items = Vec::new();
+        let base = scratch.items.len();
         let mut rest = inner.trim();
         while !rest.is_empty() {
             let tag = "<item>";
@@ -454,10 +484,11 @@ fn parse_poml_node(input: &str, depth: usize) -> Result<SyntaxTerm, SyntaxError>
                 .ok_or_else(|| SyntaxError::new("bad list item"))?;
             let end = find_balanced_close(body, tag, close)
                 .ok_or_else(|| SyntaxError::new("unclosed item"))?;
-            items.push(parse_poml_node(&body[..end], depth + 1)?);
+            let item = parse_poml_node(&body[..end], depth + 1, scratch)?;
+            scratch.items.push(item);
             rest = body[end + close.len()..].trim();
         }
-        return Ok(SyntaxTerm::Fourth(items));
+        return Ok(SyntaxTerm::Fourth(scratch.items.drain(base..).collect()));
     }
     if input.starts_with("<b ") {
         let tag_end = input
@@ -469,7 +500,7 @@ fn parse_poml_node(input: &str, depth: usize) -> Result<SyntaxTerm, SyntaxError>
             .strip_suffix("</b>")
             .ok_or_else(|| SyntaxError::new("unclosed scalar"))?;
         let value = unescape_xml(value);
-        return Ok(SyntaxTerm::B(match kind.as_str() {
+        return Ok(SyntaxTerm::B(match kind {
             "bool" => Atom::Bool(value == "true"),
             "num" => Atom::Num(value),
             _ => Atom::Str(value),
@@ -479,8 +510,9 @@ fn parse_poml_node(input: &str, depth: usize) -> Result<SyntaxTerm, SyntaxError>
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Segment {
-    Key(String),
+enum Segment<'a> {
+    /// Borrowed from the path text: the key is copied only if inserting it creates a new field.
+    Key(&'a str),
     Index(usize),
 }
 
@@ -498,7 +530,7 @@ impl BuildNode {
     /// cannot ask for a list of a billion slots.
     fn insert(
         &mut self,
-        segs: &[Segment],
+        segs: &[Segment<'_>],
         value: SyntaxTerm,
         fillers: &mut usize,
     ) -> Result<(), SyntaxError> {
@@ -518,11 +550,11 @@ impl BuildNode {
                 let BuildNode::Obj(fields) = self else {
                     return Err(SyntaxError::new("path crosses non-object"));
                 };
-                let pos = fields.iter().position(|(k, _)| k == key);
+                let pos = fields.iter().position(|(k, _)| k.as_str() == *key);
                 let idx = if let Some(i) = pos {
                     i
                 } else {
-                    fields.push((key.clone(), BuildNode::Empty));
+                    fields.push(((*key).to_owned(), BuildNode::Empty));
                     fields.len() - 1
                 };
                 fields[idx].1.insert(&segs[1..], value, fillers)
@@ -565,48 +597,74 @@ fn filler_budget(input: &str) -> usize {
     (input.lines().count() + 1).saturating_mul(MAX_NESTING_DEPTH)
 }
 
-fn parse_path(path: &str) -> Result<Vec<Segment>, SyntaxError> {
-    if path == "$" {
-        return Ok(Vec::new());
-    }
+fn parse_path(path: &str) -> Result<Vec<Segment<'_>>, SyntaxError> {
     let mut segs = Vec::new();
-    for part in path.split('.') {
+    parse_path_into(path, &mut segs)?;
+    Ok(segs)
+}
+
+/// First index of `b` in `s`. Paths are a few bytes long, where a plain loop beats the general
+/// character searcher's setup cost.
+#[inline]
+fn find_byte(s: &[u8], b: u8) -> Option<usize> {
+    s.iter().position(|&x| x == b)
+}
+
+/// [`parse_path`] into a caller-owned buffer (cleared first), so a parser that reads one path per
+/// line can reuse a single allocation. The buffer keeps the segments borrowed from `path`.
+fn parse_path_into<'p>(path: &'p str, segs: &mut Vec<Segment<'p>>) -> Result<(), SyntaxError> {
+    segs.clear();
+    if path == "$" {
+        return Ok(());
+    }
+    let bytes = path.as_bytes();
+    let mut start = 0;
+    loop {
+        // One `.`-separated part (empty parts are skipped, as `split('.')` yielded them).
+        let end = find_byte(&bytes[start..], b'.').map_or(bytes.len(), |i| start + i);
+        let part = &path[start..end];
         if segs.len() > MAX_NESTING_DEPTH {
             return Err(depth_error());
         }
         let mut rem = part;
-        if let Some(key_end) = rem.find('[') {
+        let mut keyed_only = false;
+        if let Some(key_end) = find_byte(rem.as_bytes(), b'[') {
             if key_end > 0 {
-                segs.push(Segment::Key(rem[..key_end].to_string()));
+                segs.push(Segment::Key(&rem[..key_end]));
             }
             rem = &rem[key_end..];
         } else if !rem.is_empty() {
-            segs.push(Segment::Key(rem.to_string()));
-            continue;
+            segs.push(Segment::Key(rem));
+            keyed_only = true;
         }
-        while let Some(body) = rem.strip_prefix('[') {
-            let end = body
-                .find(']')
-                .ok_or_else(|| SyntaxError::new("bad index path"))?;
-            segs.push(Segment::Index(
-                body[..end]
-                    .parse()
-                    .map_err(|_| SyntaxError::new("bad index"))?,
-            ));
-            rem = &body[end + 1..];
-            // each segment is a level of the tree built (then finished and dropped) from this path
-            if segs.len() > MAX_NESTING_DEPTH {
-                return Err(depth_error());
+        if !keyed_only {
+            while let Some(body) = rem.strip_prefix('[') {
+                let close = find_byte(body.as_bytes(), b']')
+                    .ok_or_else(|| SyntaxError::new("bad index path"))?;
+                segs.push(Segment::Index(
+                    body[..close]
+                        .parse()
+                        .map_err(|_| SyntaxError::new("bad index"))?,
+                ));
+                rem = &body[close + 1..];
+                // each segment is a level of the tree built (then finished and dropped) from this path
+                if segs.len() > MAX_NESTING_DEPTH {
+                    return Err(depth_error());
+                }
+            }
+            if !rem.is_empty() {
+                return Err(SyntaxError::new("bad path tail"));
             }
         }
-        if !rem.is_empty() {
-            return Err(SyntaxError::new("bad path tail"));
+        if end == bytes.len() {
+            break;
         }
+        start = end + 1;
     }
     if segs.len() > MAX_NESTING_DEPTH {
         return Err(depth_error());
     }
-    Ok(segs)
+    Ok(())
 }
 
 /// How many arrays/objects may be open at once while parsing (`serde_json`'s default). The parsers
@@ -627,21 +685,32 @@ pub(super) fn depth_error() -> SyntaxError {
 /// receiver, and parsers disagree on which one wins; refusing them keeps every reader of the same
 /// bytes on the same document). `loose == true` is the lenient dialect BAML and TOON values use.
 pub(super) struct JsonParser<'a> {
+    /// The input as text: any slice that starts and ends on an ASCII delimiter is valid UTF-8, so
+    /// strings and numbers are copied out without being validated again.
+    text: &'a str,
     s: &'a [u8],
     pos: usize,
     loose: bool,
     depth: usize,
     max_depth: usize,
+    /// Scratch stacks for the object fields and array items being built. Children are pushed here
+    /// and moved into a `Vec` of exactly the right size when the container closes, so building a
+    /// container is one allocation instead of a push-and-grow sequence of them.
+    fields: Vec<(String, SyntaxTerm)>,
+    items: Vec<SyntaxTerm>,
 }
 
 impl<'a> JsonParser<'a> {
     pub(super) fn new(input: &'a str, loose: bool) -> Self {
         Self {
+            text: input,
             s: input.as_bytes(),
             pos: 0,
             loose,
             depth: 0,
             max_depth: MAX_NESTING_DEPTH,
+            fields: Vec::new(),
+            items: Vec::new(),
         }
     }
 
@@ -704,8 +773,12 @@ impl<'a> JsonParser<'a> {
 
     fn object(&mut self) -> Result<SyntaxTerm, SyntaxError> {
         self.expect(b'{')?;
-        let mut fields = Vec::new();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let base = self.fields.len();
+        // Duplicate detection: a linear scan of the keys so far is fastest for the small objects
+        // that dominate real documents; an object that grows past `LINEAR_KEY_LIMIT` keys switches
+        // to a hash set so a hostile wide object stays linear overall.
+        const LINEAR_KEY_LIMIT: usize = 16;
+        let mut seen: Option<std::collections::HashSet<String>> = None;
         let mut after_comma = false;
         loop {
             self.ws();
@@ -726,11 +799,26 @@ impl<'a> JsonParser<'a> {
             if !(self.take(b':') || (self.loose && self.take(b'='))) {
                 return Err(SyntaxError::new("expected object separator"));
             }
-            if !self.loose && !seen.insert(key.clone()) {
-                return Err(SyntaxError::new(format!("duplicate object key {key:?}")));
+            if !self.loose {
+                let duplicate = if let Some(set) = seen.as_mut() {
+                    !set.insert(key.clone())
+                } else {
+                    let mine = &self.fields[base..];
+                    let dup = mine.iter().any(|(k, _)| *k == key);
+                    if !dup && mine.len() + 1 >= LINEAR_KEY_LIMIT {
+                        let mut set: std::collections::HashSet<String> =
+                            mine.iter().map(|(k, _)| k.clone()).collect();
+                        set.insert(key.clone());
+                        seen = Some(set);
+                    }
+                    dup
+                };
+                if duplicate {
+                    return Err(SyntaxError::new(format!("duplicate object key {key:?}")));
+                }
             }
             let val = self.value()?;
-            fields.push((key, val));
+            self.fields.push((key, val));
             self.ws();
             if self.take(b'}') {
                 break;
@@ -743,12 +831,12 @@ impl<'a> JsonParser<'a> {
                 }
             }
         }
-        Ok(SyntaxTerm::Bu(fields))
+        Ok(SyntaxTerm::Bu(self.fields.drain(base..).collect()))
     }
 
     fn array(&mut self) -> Result<SyntaxTerm, SyntaxError> {
         self.expect(b'[')?;
-        let mut items = Vec::new();
+        let base = self.items.len();
         let mut after_comma = false;
         loop {
             self.ws();
@@ -758,7 +846,8 @@ impl<'a> JsonParser<'a> {
                 }
                 break;
             }
-            items.push(self.value()?);
+            let item = self.value()?;
+            self.items.push(item);
             self.ws();
             if self.take(b']') {
                 break;
@@ -766,7 +855,7 @@ impl<'a> JsonParser<'a> {
             self.expect(b',')?;
             after_comma = true;
         }
-        Ok(SyntaxTerm::Fourth(items))
+        Ok(SyntaxTerm::Fourth(self.items.drain(base..).collect()))
     }
 
     /// A JSON string. Bytes are collected raw (not widened one-at-a-time to `char`, which mangled
@@ -784,7 +873,25 @@ impl<'a> JsonParser<'a> {
     /// UTF-8 bytes) collapses back to one char. One decode, here, is the whole contract.
     fn string(&mut self) -> Result<String, SyntaxError> {
         self.expect(b'"')?;
-        let mut out: Vec<u8> = Vec::new();
+        // Fast path: scan to the closing quote. With no escape and no rejected control byte, the
+        // string is one slice of the input, copied once and already known to be valid UTF-8.
+        let start = self.pos;
+        let mut i = start;
+        while let Some(&b) = self.s.get(i) {
+            if b == b'"' {
+                self.pos = i + 1;
+                return Ok(self.text[start..i].to_owned());
+            }
+            if b == b'\\' || (b < 0x20 && !self.loose) {
+                break;
+            }
+            i += 1;
+        }
+        // Slow path (an escape, a control byte, or no closing quote): carry on from where the scan
+        // stopped, with everything scanned so far already in the buffer.
+        let mut out: Vec<u8> = Vec::with_capacity(i - start + 16);
+        out.extend_from_slice(&self.s[start..i]);
+        self.pos = i;
         while let Some(b) = self.next() {
             match b {
                 b'"' => {
@@ -891,8 +998,7 @@ impl<'a> JsonParser<'a> {
                 return Err(SyntaxError::new("bad number"));
             }
         }
-        String::from_utf8(self.s[start..self.pos].to_vec())
-            .map_err(|_| SyntaxError::new("bad number"))
+        Ok(self.text[start..self.pos].to_owned())
     }
 
     fn word(&mut self) -> String {
@@ -950,11 +1056,39 @@ impl<'a> JsonParser<'a> {
     }
 }
 
-fn attr(tag: &str, name: &str) -> Option<String> {
-    let needle = format!("{name}=\"");
-    let start = tag.find(&needle)? + needle.len();
-    let end = tag[start..].find('"')?;
-    Some(tag[start..start + end].to_string())
+/// The value of `name="..."` inside a tag: the first place `name="` occurs, up to the next quote.
+fn attr<'t>(tag: &'t str, name: &str) -> Option<&'t str> {
+    let hay = tag.as_bytes();
+    let name = name.as_bytes();
+    let need = name.len() + 2;
+    let mut i = 0;
+    while i + need <= hay.len() {
+        if hay[i..].starts_with(name)
+            && hay[i + name.len()] == b'='
+            && hay[i + name.len() + 1] == b'"'
+        {
+            let start = i + need;
+            let end = tag[start..].find('"')?;
+            return Some(&tag[start..start + end]);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// First index at or after `from` where `pat` occurs, for a `pat` that starts with `<`. Finds the
+/// `<` with the fast single-character search and checks the rest in place, instead of building a
+/// substring searcher for every call.
+fn find_lt(s: &str, pat: &str, from: usize) -> Option<usize> {
+    let mut at = from;
+    while let Some(i) = s[at..].find('<') {
+        let p = at + i;
+        if s[p..].starts_with(pat) {
+            return Some(p);
+        }
+        at = p + 1;
+    }
+    None
 }
 
 fn find_balanced_close(s: &str, open: &str, close: &str) -> Option<usize> {
@@ -964,14 +1098,14 @@ fn find_balanced_close(s: &str, open: &str, close: &str) -> Option<usize> {
     // it, so the whole scan reads `s` once. (Searching both from `cursor` on every step re-read the
     // far-away match each time: quadratic on `<item>` x N followed by `</item>` x N.) A search that
     // found nothing stays "nothing": `cursor` only moves forward.
-    let mut next_open = s.find(open);
-    let mut next_close = s.find(close);
+    let mut next_open = find_lt(s, open, 0);
+    let mut next_close = find_lt(s, close, 0);
     loop {
         if next_open.is_some_and(|o| o < cursor) {
-            next_open = s[cursor..].find(open).map(|i| cursor + i);
+            next_open = find_lt(s, open, cursor);
         }
         if next_close.is_some_and(|c| c < cursor) {
-            next_close = s[cursor..].find(close).map(|i| cursor + i);
+            next_close = find_lt(s, close, cursor);
         }
         match (next_open, next_close) {
             (_, Some(c)) if next_open.is_none_or(|o| c < o) => {
@@ -1019,6 +1153,10 @@ fn escape_xml(s: &str) -> String {
 }
 
 fn unescape_xml(s: &str) -> String {
+    // No `&` means no entity: one copy instead of four replace passes (the common case).
+    if !s.contains('&') {
+        return s.to_owned();
+    }
     s.replace("&quot;", "\"")
         .replace("&lt;", "<")
         .replace("&gt;", ">")

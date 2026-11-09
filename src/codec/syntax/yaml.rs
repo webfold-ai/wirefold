@@ -28,6 +28,8 @@ pub fn parse_yaml(input: &str) -> Result<SyntaxTerm, SyntaxError> {
         lines,
         pos: 0,
         depth: 0,
+        fields: Vec::new(),
+        items: Vec::new(),
     };
     match p.peek_indent() {
         Some(indent) => p.parse_block(indent),
@@ -40,6 +42,23 @@ fn line_indent(line: &str) -> usize {
 }
 
 fn is_yaml_noise(line: &str) -> bool {
+    // Fast path for the overwhelmingly common case: the first byte after any spaces/tabs is an
+    // ordinary ASCII character that cannot start a blank, a comment or a `---`/`...` marker. The
+    // Unicode-aware `trim` below handles everything else.
+    let b = line.as_bytes();
+    let mut i = 0;
+    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+        i += 1;
+    }
+    if let Some(&c) = b.get(i) {
+        if c.is_ascii_graphic() && c != b'#' {
+            // `-` and `.` only matter as the start of a `---` / `...` marker.
+            let marker = (c == b'-' || c == b'.') && b.get(i + 1) == Some(&c);
+            if !marker {
+                return false;
+            }
+        }
+    }
     let t = line.trim();
     t.is_empty() || t.starts_with('#') || t == "---" || t == "..."
 }
@@ -93,15 +112,18 @@ fn strip_unquoted_comment(s: &str) -> &str {
 }
 
 fn looks_numeric(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars().enumerate().all(|(i, c)| {
+    // Bytes, not chars: any non-ASCII byte fails the character test below, so the answer is the
+    // same, and the index of an accepted byte is its index as a character.
+    let b = s.as_bytes();
+    !b.is_empty()
+        && b.iter().enumerate().all(|(i, &c)| {
             c.is_ascii_digit()
-                || c == '.'
-                || (i == 0 && (c == '-' || c == '+'))
-                || c == 'e'
-                || c == 'E'
+                || c == b'.'
+                || (i == 0 && (c == b'-' || c == b'+'))
+                || c == b'e'
+                || c == b'E'
         })
-        && s.chars().any(|c| c.is_ascii_digit())
+        && b.iter().any(u8::is_ascii_digit)
 }
 
 fn scalar_from_plain(s: &str) -> SyntaxTerm {
@@ -157,6 +179,10 @@ struct YamlParser<'a> {
     pos: usize,
     /// Open block collections; bounded by [`MAX_NESTING_DEPTH`] (the parser recurses per level).
     depth: usize,
+    /// Scratch stacks for the mapping fields and sequence items being built, so each collection
+    /// is allocated once at its final size instead of grown by pushing.
+    fields: Vec<(String, SyntaxTerm)>,
+    items: Vec<SyntaxTerm>,
 }
 
 impl YamlParser<'_> {
@@ -225,7 +251,7 @@ impl YamlParser<'_> {
     }
 
     fn parse_sequence(&mut self, indent: usize) -> Result<SyntaxTerm, SyntaxError> {
-        let mut items = Vec::new();
+        let base = self.items.len();
         while let Some(cur) = self.peek_indent() {
             if cur != indent {
                 break;
@@ -241,22 +267,24 @@ impl YamlParser<'_> {
                     .peek_indent()
                     .filter(|&d| d > indent)
                     .unwrap_or(indent + 2);
-                items.push(self.parse_block(next)?);
+                let item = self.parse_block(next)?;
+                self.items.push(item);
                 continue;
             }
             let rest = content[1..].trim_start();
             let dash_col = indent + (content.len() - rest.len());
-            if Self::looks_like_mapping_line(rest) {
-                items.push(self.parse_mapping_from_first_line(rest, dash_col)?);
+            let item = if Self::looks_like_mapping_line(rest) {
+                self.parse_mapping_from_first_line(rest, dash_col)?
             } else {
-                items.push(self.parse_inline_value(rest, dash_col)?);
-            }
+                self.parse_inline_value(rest, dash_col)?
+            };
+            self.items.push(item);
         }
-        Ok(SyntaxTerm::Fourth(items))
+        Ok(SyntaxTerm::Fourth(self.items.drain(base..).collect()))
     }
 
     fn parse_mapping(&mut self, indent: usize) -> Result<SyntaxTerm, SyntaxError> {
-        let mut fields = Vec::new();
+        let base = self.fields.len();
         while let Some(cur) = self.peek_indent() {
             if cur != indent {
                 break;
@@ -266,9 +294,10 @@ impl YamlParser<'_> {
                 break;
             }
             self.pos += 1;
-            fields.push(self.parse_key_value(content, indent)?);
+            let field = self.parse_key_value(content, indent)?;
+            self.fields.push(field);
         }
-        Ok(SyntaxTerm::Bu(fields))
+        Ok(SyntaxTerm::Bu(self.fields.drain(base..).collect()))
     }
 
     /// A mapping whose FIRST key:value pair already sat on a `- ` sequence-item line (the
@@ -279,7 +308,9 @@ impl YamlParser<'_> {
         first: &str,
         indent: usize,
     ) -> Result<SyntaxTerm, SyntaxError> {
-        let mut fields = vec![self.parse_key_value(first, indent)?];
+        let base = self.fields.len();
+        let first_field = self.parse_key_value(first, indent)?;
+        self.fields.push(first_field);
         while let Some(cur) = self.peek_indent() {
             if cur != indent {
                 break;
@@ -292,9 +323,10 @@ impl YamlParser<'_> {
                 break;
             }
             self.pos += 1;
-            fields.push(self.parse_key_value(content, indent)?);
+            let field = self.parse_key_value(content, indent)?;
+            self.fields.push(field);
         }
-        Ok(SyntaxTerm::Bu(fields))
+        Ok(SyntaxTerm::Bu(self.fields.drain(base..).collect()))
     }
 
     /// `content` is one `key: value` (or bare `key:`) line's text, already past its indent;
