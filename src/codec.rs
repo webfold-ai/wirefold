@@ -51,12 +51,47 @@ pub mod cm {
     //!
     //! Before coding, a 2-D stride is looked for (below): if replacing the stream by its median-edge
     //! residual at some row stride codes smaller on a sample, the residual is coded instead.
-    //! Format: `[byteLen][k][stride][tANS stream]`.
+    //! Format: `[version][byteLen][order][stride][tANS stream]` (`[version]` is one byte, the rest varints).
+    //!
+    //! Experimental: this is a dependency-free option, not a speed or size advantage over zstd (see
+    //! `docs/BENCHMARKS.md`). The serialization formats do not depend on it.
 
     use super::{read_uvarint, DecodeError};
 
-    /// The highest context order: 0 is order-0 tANS, 1 the order-1 family. Higher requests are capped.
-    const MAX_ORDER: usize = 1;
+    /// The version byte that begins every stream this module writes. A reader accepts exactly this
+    /// value and returns [`DecodeError::UnsupportedVersion`] for any other, so a change of format
+    /// bumps it and old streams are refused rather than misread. Streams written before the byte
+    /// existed are not supported.
+    pub const VERSION: u8 = 1;
+
+    /// The context order of the model: how much of the preceding bytes the table is keyed by.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub enum Order {
+        /// One table for the whole stream (order-0 tANS).
+        Zero,
+        /// A table per class of the previous byte (the class-shaped order-1 tANS family).
+        #[default]
+        One,
+    }
+
+    impl Order {
+        /// The value written in the stream header.
+        fn wire(self) -> u64 {
+            match self {
+                Order::Zero => 0,
+                Order::One => 1,
+            }
+        }
+
+        /// The order a header value names, if it names one.
+        fn from_wire(v: u64) -> Option<Order> {
+            match v {
+                0 => Some(Order::Zero),
+                1 => Some(Order::One),
+                _ => None,
+            }
+        }
+    }
 
     // ── varint header (LEB128, the operational Seed.serWord) ──
     fn put_varint(out: &mut Vec<u8>, mut n: u64) {
@@ -215,28 +250,25 @@ pub mod cm {
         out
     }
 
-    /// The tANS stream of `stream` under context order `k` (0 or 1).
-    fn code(k: usize, stream: &[u8]) -> Vec<u8> {
-        if k == 0 {
-            super::tans::compress4(stream)
-        } else {
-            super::tans::compress4_o1(stream)
+    /// The tANS stream of `stream` under `order`.
+    fn code(order: Order, stream: &[u8]) -> Vec<u8> {
+        match order {
+            Order::Zero => super::tans::compress4(stream),
+            Order::One => super::tans::compress4_o1(stream),
         }
     }
 
-    /// The coded size of `stream` at order `k` — used to DECIDE the spatial transform by measuring, on a
-    /// bounded sample, rather than trusting the order-0 proxy.
-    fn coded_size(k: usize, stream: &[u8]) -> usize {
-        code(k, stream).len()
+    /// The coded size of `stream` under `order` — used to DECIDE the spatial transform by measuring, on
+    /// a bounded sample, rather than trusting the order-0 proxy.
+    fn coded_size(order: Order, stream: &[u8]) -> usize {
+        code(order, stream).len()
     }
 
-    /// Context-order-`k` compress: `[byteLen][k][stride][tANS stream]`; `k` is capped at 1 (see
-    /// [`MAX_ORDER`]). When a 2-D stride is proposed AND actually codes smaller on a sample, the pixels
+    /// Compress under `order`: `[version][byteLen][order][stride][tANS stream]`. When a 2-D stride is proposed AND actually codes smaller on a sample, the pixels
     /// are replaced by their MED spatial residual (the `encircle` floor) before coding — the byte coder
     /// then rides the residual `U`. Otherwise `stride = 0` and the raw stream is coded (never a regression).
     #[must_use]
-    pub fn compress(k: usize, data: &[u8]) -> Vec<u8> {
-        let k = k.min(MAX_ORDER);
+    pub fn compress(order: Order, data: &[u8]) -> Vec<u8> {
         // settle the transform by CODING a bounded sample: raw vs MED at each proposed stride, smallest
         // wins. A prefix sample, so `med_forward` on it matches the full transform's prefix. The trials
         // are independent coding passes, so they run as one static batch on the pool and the winner is
@@ -250,9 +282,9 @@ pub mod cm {
                 .collect();
             super::par_tasks(sizes.len(), |t| {
                 let size = if t == 0 {
-                    coded_size(k, s)
+                    coded_size(order, s)
                 } else {
-                    coded_size(k, &med_forward(s, cands[t - 1]))
+                    coded_size(order, &med_forward(s, cands[t - 1]))
                 };
                 *sizes[t]
                     .lock()
@@ -278,11 +310,11 @@ pub mod cm {
         } else {
             data
         };
-        let mut out = Vec::new();
+        let mut out = vec![VERSION];
         put_varint(&mut out, data.len() as u64);
-        put_varint(&mut out, k as u64);
+        put_varint(&mut out, order.wire());
         put_varint(&mut out, stride as u64);
-        out.extend_from_slice(&code(k, stream));
+        out.extend_from_slice(&code(order, stream));
         out
     }
 
@@ -295,12 +327,17 @@ pub mod cm {
         try_decompress(bs).unwrap_or_default()
     }
 
-    /// Checked [`decompress`]: `Err` for truncated or inconsistent input. The declared length is
+    /// Checked [`decompress`]: `Err` for truncated or inconsistent input, and
+    /// [`DecodeError::UnsupportedVersion`] for a stream of another version. The declared length is
     /// bounded by [`super::DEFAULT_MAX_OUTPUT`] and must equal what the stream decodes to.
     pub fn try_decompress(bs: &[u8]) -> Result<Vec<u8>, DecodeError> {
-        let mut p = 0usize;
+        let version = *bs.first().ok_or(DecodeError::Truncated)?;
+        if version != VERSION {
+            return Err(DecodeError::UnsupportedVersion(version));
+        }
+        let mut p = 1usize;
         let n = get_varint(bs, &mut p)?;
-        let k = get_varint(bs, &mut p)?;
+        let order = get_varint(bs, &mut p)?;
         let stride = get_varint(bs, &mut p)?;
         if n == 0 {
             return Ok(Vec::new());
@@ -309,15 +346,11 @@ pub mod cm {
         if n > super::DEFAULT_MAX_OUTPUT {
             return Err(DecodeError::TooLarge);
         }
-        let k = usize::try_from(k).map_err(|_| DecodeError::Malformed)?;
-        if k > MAX_ORDER {
-            return Err(DecodeError::Malformed);
-        }
+        let order = Order::from_wire(order).ok_or(DecodeError::Malformed)?;
         let stride = usize::try_from(stride).map_err(|_| DecodeError::Malformed)?;
-        let stream = if k == 0 {
-            super::tans::try_decompress4(&bs[p..])?
-        } else {
-            super::tans::try_decompress4_o1(&bs[p..])?
+        let stream = match order {
+            Order::Zero => super::tans::try_decompress4(&bs[p..])?,
+            Order::One => super::tans::try_decompress4_o1(&bs[p..])?,
         };
         if stream.len() != n {
             return Err(DecodeError::Malformed);
@@ -354,7 +387,7 @@ pub mod cm {
         /// header and the body, and cut the stream at every depth.
         #[test]
         fn damaged_streams_do_not_panic() {
-            let enc = compress(1, &structured(200_000));
+            let enc = compress(Order::One, &structured(200_000));
             for at in (0..enc.len()).step_by(enc.len() / 97 + 1) {
                 let mut bad = enc.clone();
                 bad[at] ^= 0xA5;
@@ -385,14 +418,14 @@ pub mod cm {
                     prev
                 })
                 .collect();
-            let o0 = compress(0, &data).len();
-            let o1 = compress(1, &data).len();
+            let o0 = compress(Order::Zero, &data).len();
+            let o1 = compress(Order::One, &data).len();
             assert!(
                 o1 * 2 < o0,
                 "order-1 {o1} must be far smaller than order-0 {o0}"
             );
-            assert_eq!(decompress(&compress(0, &data)), data);
-            assert_eq!(decompress(&compress(1, &data)), data);
+            assert_eq!(decompress(&compress(Order::Zero, &data)), data);
+            assert_eq!(decompress(&compress(Order::One, &data)), data);
         }
 
         /// The parallel stride search must pick exactly what a plain sequential scan picks. The
@@ -408,18 +441,18 @@ pub mod cm {
                 let cands = propose_strides(&data);
                 let s = &data[..data.len().min(1 << 16)];
                 let mut want = 0usize;
-                let mut best = coded_size(1, s);
+                let mut best = coded_size(Order::One, s);
                 for &c in &cands {
-                    let size = coded_size(1, &med_forward(s, c));
+                    let size = coded_size(Order::One, &med_forward(s, c));
                     if size < best {
                         best = size;
                         want = c;
                     }
                 }
-                let enc = compress(1, &data);
-                let mut at = 0;
+                let enc = compress(Order::One, &data);
+                let mut at = 1; // past the version byte
                 let _len = get_varint(&enc, &mut at);
-                let _k = get_varint(&enc, &mut at);
+                let _order = get_varint(&enc, &mut at);
                 assert_eq!(get_varint(&enc, &mut at), Ok(want as u64), "width {w}");
                 assert_eq!(decompress(&enc), data);
                 if cands.iter().position(|&c| c == want).is_some_and(|i| i > 0) {
@@ -439,12 +472,12 @@ pub mod cm {
                 b"the quick brown fox jumps over the lazy dog. ".repeat(200),
                 (0..=255u8).cycle().take(9000).collect(),
             ] {
-                for k in [1usize, 3, 5] {
-                    let enc = compress(k, &case);
+                for order in [Order::Zero, Order::One] {
+                    let enc = compress(order, &case);
                     assert_eq!(
                         decompress(&enc),
                         case,
-                        "cm round-trip failed at k={k}, len={}",
+                        "cm round-trip failed at {order:?}, len={}",
                         case.len()
                     );
                 }
@@ -462,7 +495,7 @@ pub mod cm {
                 .collect();
             // the spatial floor must be lossless, and must actually shrink the 2-D image vs 1-D coding
             assert_eq!(
-                decompress(&compress(5, &img)),
+                decompress(&compress(Order::One, &img)),
                 img,
                 "image round-trip failed"
             );
@@ -481,7 +514,7 @@ pub mod cm {
                 })
                 .collect();
             assert_eq!(
-                decompress(&compress(5, &noise)),
+                decompress(&compress(Order::One, &noise)),
                 noise,
                 "noise round-trip failed"
             );
@@ -1681,7 +1714,7 @@ pub mod lz {
             let mut trail: &[u8] = &[];
             let litc = if lit_mode == 2 {
                 self.lits.extend_from_slice(&data[lst..]);
-                crate::codec::compress_at(crate::codec::DEFAULT_ORDER, &self.lits)
+                crate::codec::compress_at(crate::codec::cm::Order::default(), &self.lits)
             } else if lit_mode == 5 {
                 // the FAST face's literals — the stateless corner BY FACE POLICY
                 // (`PrefixCodeReadout`: no inter-symbol state, the decode chain is a shift; the
@@ -2410,7 +2443,7 @@ pub mod lz {
         if em.lits.len() < 4096 {
             return LIT_EST as f64;
         }
-        let litc = crate::codec::cm::compress(crate::codec::DEFAULT_ORDER, &em.lits);
+        let litc = crate::codec::cm::compress(crate::codec::cm::Order::default(), &em.lits);
         (8.0 * litc.len() as f64 / em.lits.len() as f64).clamp(0.5, 8.0)
     }
 
@@ -2914,7 +2947,7 @@ pub mod readout {
             out.push(best.tag());
             put_uvarint(&mut out, u64::from(kbytes));
             out.extend_from_slice(&crate::codec::cm::compress(
-                crate::codec::DEFAULT_ORDER,
+                crate::codec::cm::Order::default(),
                 &best_r,
             ));
         }
@@ -8546,9 +8579,6 @@ pub use syntax::{
     HttpCall, LintLevel, Surface, SyntaxError, SyntaxLint, SyntaxTerm,
 };
 
-/// The default context order — r5 is the upstream sweet spot (past gzip -9).
-pub const DEFAULT_ORDER: usize = 5;
-
 thread_local! {
     /// Set while this thread is running a task started by [`par_tasks`].
     static IN_PAR_TASK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -8603,17 +8633,15 @@ pub fn try_decompress(bytes: &[u8]) -> Result<Vec<u8>, DecodeError> {
     try_decompress_shaped(bytes)
 }
 
-/// Entropy-code `bytes` at order `k` with the context-mixing coder. The stream is coded as
-/// fixed-size chunks in waves, the chunks of a wave concurrently on the crate's schedule-free worker
-/// pool ([`crate::par::Pool`], `Web.preduceAt_schedule_free`), each reading the counts folded from the
-/// waves before it, so there is no model restart and the output does not depend on the pool width.
-/// See [`cm::compress`] for the layout.
+/// Entropy-code `bytes` under `order` with the static table-driven coder (experimental; see
+/// [`cm`]). The stream begins with the version byte [`cm::VERSION`]; see [`cm::compress`] for the layout.
 #[must_use]
-pub fn compress_at(k: usize, bytes: &[u8]) -> Vec<u8> {
-    cm::compress(k, bytes)
+pub fn compress_at(order: cm::Order, bytes: &[u8]) -> Vec<u8> {
+    cm::compress(order, bytes)
 }
 
-/// Inverse of [`compress_at`]: the raw cm stream (no face tag); the public [`decompress`] adds the tag.
+/// Inverse of [`compress_at`]: the raw cm stream (no face tag); the public [`decompress`] adds the tag. A
+/// stream of another version is refused ([`DecodeError::UnsupportedVersion`]).
 ///
 /// Malformed input yields an empty `Vec` (never a panic); [`try_decompress_framed`] says why.
 #[must_use]
@@ -8695,7 +8723,7 @@ fn calib_sample(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
 /// the caller keeps the winner and never recompresses.
 fn face_bodies(sample: &[u8]) -> [Vec<u8>; 3] {
     let code = |face: usize| match face {
-        0 => compress_at(DEFAULT_ORDER, sample),
+        0 => compress_at(cm::Order::default(), sample),
         1 => lz::compress(sample),
         _ => lz::compress_hybrid(sample),
     };
@@ -8758,7 +8786,7 @@ pub fn compress_shaped(bias: Bias, bytes: &[u8]) -> Vec<u8> {
         match face {
             FACE_LZ => out.extend_from_slice(&lz::compress(bytes)),
             FACE_HYBRID => out.extend_from_slice(&lz::compress_hybrid(bytes)),
-            _ => out.extend_from_slice(&compress_at(DEFAULT_ORDER, bytes)),
+            _ => out.extend_from_slice(&compress_at(cm::Order::default(), bytes)),
         }
     }
     out
@@ -9075,7 +9103,7 @@ pub fn encode_i64(vals: &[i64]) -> Vec<u8> {
     let order = best_floor_by_proxy(vals);
     let mut out = vec![order];
     out.extend_from_slice(&cm::compress(
-        DEFAULT_ORDER,
+        cm::Order::default(),
         &residual_bytes_at(order, vals),
     ));
     out
@@ -9191,6 +9219,8 @@ pub enum DecodeError {
     /// A declared length exceeds the decode limit (or the input-size bound that applies to it) or
     /// the allocation for it could not be made. Nothing was allocated for it.
     TooLarge,
+    /// The stream names a format version this build does not read. The payload is the version byte.
+    UnsupportedVersion(u8),
 }
 
 impl std::fmt::Display for DecodeError {
@@ -9199,6 +9229,7 @@ impl std::fmt::Display for DecodeError {
             DecodeError::Truncated => "truncated input",
             DecodeError::Malformed => "malformed input",
             DecodeError::TooLarge => "declared length exceeds the decode limit",
+            DecodeError::UnsupportedVersion(_) => "unsupported stream version",
         })
     }
 }
@@ -9473,7 +9504,7 @@ mod tests {
         // Fast must actually route to the lz face on repetitive data; Dense must never exceed cm.
         assert_eq!(compress_shaped(Bias::Fast, &repeat)[0], FACE_LZ);
         let dense = compress_shaped(Bias::Dense, &prose);
-        assert!(dense.len() <= 1 + compress_at(DEFAULT_ORDER, &prose).len());
+        assert!(dense.len() <= 1 + compress_at(cm::Order::default(), &prose).len());
     }
 
     #[test]

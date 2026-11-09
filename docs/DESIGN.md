@@ -91,7 +91,7 @@ accumulation, with the address regenerating the key). So the model is the stream
 coding is a lookup against a fixed table: tANS (`codec::tans`) in order-0 and a class-shaped order-1 family,
 four interleaved streams, plus a 4-stream Huffman face (`codec::huf`). Nothing is carried from one symbol's
 prediction to the next, so there is no per-bit mixing, no adaptive state and no second pass to keep encode and
-decode in step. `cm::compress` is this coder preceded by the 2-D stride search (median-edge residual at the
+decode in step. `cm::compress` is this coder (an explicit `Order`, zero or one; a version byte starts the stream) preceded by the 2-D stride search (median-edge residual at the
 row stride that codes smallest on a sample; the trials run as one static batch on the pool).
 `compress_shaped` measures three faces on the input (order-1 tANS, lz, and the lz-plus-tANS hybrid) and takes
 the fastest within a size tolerance of the smallest; they run as one static batch too.

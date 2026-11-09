@@ -11,10 +11,15 @@ All notable changes to this crate are documented in this file. The format follow
 - `docs/DESIGN.md` (the apeiron basis against serde, bincode, ryu and itoa) and fresh serialization and
   number-formatting benchmarks.
 - `codec::cm` is now a static, table-driven coder (order-0 or order-1 tANS over four interleaved streams, behind the
-  2-D stride search) instead of an adaptive context-mixing coder. `compress()` encodes the telemetry benchmark in
-  127 ms (was 3.5 s) and decodes it in 2.0 ms (was 1.5 s), at 39% larger output on that data. zstd -1 does the same in
-  2.0 ms and 1.2 ms with 237,083 bytes, so compress with zstd when compression matters. The stream
-  format changed, context orders above 1 are capped, and `compress_at` and `decompress_framed` are thin wrappers.
+  2-D stride search) instead of an adaptive context-mixing coder, and is documented as experimental. `compress()`
+  encodes the telemetry benchmark in 127 ms (was 3.5 s) and decodes it in 2.0 ms (was 1.5 s), at 39% larger
+  output on that data. zstd -1 does the same in 2.0 ms and 1.2 ms with 237,083 bytes, so compress with zstd when
+  compression matters. `Collapse` serialization is unchanged and independent of it.
+- Breaking, `compress` feature: the stream begins with a version byte (`cm::VERSION`, now 1) and a reader refuses any
+  other version with `DecodeError::UnsupportedVersion`. Streams from the previous coder, which had no version byte,
+  are intentionally not supported. The `k: usize` argument is replaced by `cm::Order::{Zero, One}` (`compress_at`
+  takes the enum too) and a header order value outside the enum is `DecodeError::Malformed`; the `DEFAULT_ORDER`
+  constant is removed (`Order::default()` is `One`). `compress_at` and `decompress_framed` are thin wrappers.
 - The stride search and the face measurement run as parallel batches with the same choice; nested pool dispatch
   from inside a task now runs inline instead of deadlocking.
 

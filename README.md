@@ -12,7 +12,7 @@ wirefold = { git = "https://github.com/webfold-ai/wirefold", features = ["derive
 | Feature | What it adds |
 |---------|-------------|
 | `codec` (default) | Zero-copy wire format (`codec::web`), universal Term, integer column codec |
-| `compress` | Static table-driven entropy coder (`codec::cm`, tANS) |
+| `compress` | Experimental dependency-free entropy coder (`codec::cm`, tANS); not faster or smaller than zstd |
 | `syntax` | Collapsed syntax AST (`codec::syntax`) for JSON, YAML, TOON, POML, RDF and other surfaces |
 | `derive` | `#[derive(Collapse)]` and `#[derive(Term)]` |
 | `error` | `Error`, `Result`, `Context` and `#[derive(Error)]` |

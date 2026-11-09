@@ -56,7 +56,7 @@ writes JSON, YAML, TOON, POML, MessagePack and others, and an optional coder tha
 20,000 records, each row in a fresh process, mean of 3 runs with the range in brackets. The `compress()` row
 is the mean and range over three whole processes. `compress()` is wirefold's own entropy path (the face
 selector over order-1 tANS, lz and the lz-plus-tANS hybrid; see [DESIGN.md](DESIGN.md#the-entropy-coder)). zstd is
-measured at levels 1, 3, 6 and 19, because level 19 alone is the slowest setting and says nothing about speed.
+measured at levels 1, 3, 6 and 19, because level 19, the high-compression setting tested earlier, alone says nothing about speed.
 
 #### Telemetry-shaped records (20000 records)
 

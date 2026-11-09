@@ -106,9 +106,15 @@ let z = wirefold::codec::compress(&bytes);
 let same = wirefold::codec::decompress(&z);
 ```
 
-`compress` is a static, table-driven coder (tANS, with lz and a hybrid chosen by measurement). It encodes
-faster than zstd -19 and decodes within a small factor of it, with larger output on structured data; the
-numbers are in [BENCHMARKS.md](BENCHMARKS.md). For bytes you did
+`compress` is an experimental, dependency-free coder (tANS, with lz and a hybrid chosen by measurement). It is
+not faster or smaller than zstd on the benchmark data (numbers in [BENCHMARKS.md](BENCHMARKS.md)), so if you
+need compression, compress the bytes `Collapse` gives you with zstd; the serialization formats do not depend on
+`compress`.
+
+The raw coder is `codec::compress_at(codec::cm::Order::One, &bytes)` (or `Order::Zero`). Its stream starts with
+a version byte (`codec::cm::VERSION`); a reader accepts exactly that version and returns
+`DecodeError::UnsupportedVersion` for any other, so streams from a different version, including those written
+before the byte existed, are refused rather than misread. For bytes you did
 not produce yourself, use `codec::try_decompress_framed`, which returns an error on malformed input.
 
 ## MessagePack

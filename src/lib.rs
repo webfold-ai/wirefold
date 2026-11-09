@@ -6,7 +6,7 @@
 //! | Feature | What it adds |
 //! |---------|-------------|
 //! | `codec` (default) | Zero-copy wire format ([`codec::web`]), universal Term, integer column codec |
-//! | `compress` | Static table-driven entropy coder ([`codec::cm`], tANS) |
+//! | `compress` | Experimental dependency-free entropy coder ([`codec::cm`], tANS) |
 //! | `syntax` | Collapsed syntax AST ([`codec::syntax`]): JSON, YAML, TOON, POML, RDF and other surfaces |
 //! | `derive` | `#[derive(Collapse)]` and `#[derive(Term)]` for columnar zero-copy serialization |
 //! | `error` | `Error`, `Result` and `Context`, plus `#[derive(Error)]` |
