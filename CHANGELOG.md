@@ -17,6 +17,10 @@ All notable changes to this crate are documented in this file. The format follow
 
 ### Changed
 
+- Faster parsers for every text surface, with identical results: JSON −18%, YAML −16%, TOON −16%, POML −44%,
+  CSV −24%, BAML −5% wall-clock on 20,000 records (instruction counts down 38%, 13%, 28%, 47% and 39% for JSON,
+  YAML, TOON, POML and CSV). JSON parsing is now level with `serde_json::Value`. See `docs/BENCHMARKS.md`.
+
 - Minimum supported Rust version is 1.89 (the derive crate already required it).
 - `clippy -D warnings` is clean for the whole crate; a short list of inherited style lints is allowed by
   name in `src/lib.rs`.

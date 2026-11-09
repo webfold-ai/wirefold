@@ -301,7 +301,68 @@ fn json_values(data: &[Event]) {
     println!("| serde_json `Value` | {:.2} | {:.0} |", sj, mbs(sj));
 }
 
+/// Parse speed of every text surface on the same records, with serde_json as the JSON reference.
+/// Each surface is timed from the same rendered document; run one surface per process if you need
+/// to rule out heap-layout effects between surfaces (`cargo run --release -- parse json`, and `parse serde` for the serde_json reference alone; a third argument sets the record count).
+fn parse_surfaces(n: usize, only: Option<&str>) {
+    let data = ordered(n);
+    let json = String::from_utf8(serde_json::to_vec(&data).unwrap()).unwrap();
+    let serde_only = only.is_some_and(|o| o.eq_ignore_ascii_case("serde"));
+    let term = if serde_only {
+        wirefold::codec::syntax::SyntaxTerm::Nb
+    } else {
+        parse_surface(Surface::Json, &json).unwrap()
+    };
+    println!("\n### Parsing {n} records into a generic tree\n");
+    println!("| surface | size (bytes) | parse (ms) | MB/s |");
+    println!("|---|---:|---:|---:|");
+    for (name, sf) in [
+        ("JSON", Surface::Json),
+        ("YAML", Surface::Yaml),
+        ("TOON", Surface::Toon),
+        ("POML", Surface::Poml),
+        ("CSV", Surface::Csv),
+        ("BAML", Surface::Baml),
+    ] {
+        if only.is_some_and(|o| !name.eq_ignore_ascii_case(o)) || serde_only {
+            continue;
+        }
+        let text = wirefold::codec::syntax::render_surface(&term, sf);
+        assert!(
+            parse_surface(sf, &text).is_ok(),
+            "{name} parses its own render"
+        );
+        let t = ms(15, || parse_surface(sf, &text).unwrap());
+        println!(
+            "| {name} | {} | {:.1} | {:.0} |",
+            text.len(),
+            t,
+            text.len() as f64 / 1e6 / (t / 1e3)
+        );
+    }
+    if only.is_none_or(|o| o.eq_ignore_ascii_case("json") || o.eq_ignore_ascii_case("serde")) {
+        let t = ms(15, || {
+            serde_json::from_str::<serde_json::Value>(&json).unwrap()
+        });
+        println!(
+            "| JSON, serde_json `Value` (reference) | {} | {:.1} | {:.0} |",
+            json.len(),
+            t,
+            json.len() as f64 / 1e6 / (t / 1e3)
+        );
+    }
+}
+
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("parse") {
+        let only = std::env::args().nth(2);
+        let n = std::env::args()
+            .nth(3)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20_000);
+        parse_surfaces(n, only.as_deref());
+        return;
+    }
     let n: usize = std::env::args()
         .nth(1)
         .and_then(|s| s.parse().ok())

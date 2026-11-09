@@ -13,6 +13,14 @@ It prints markdown tables. Every encoder is round-trip checked before it is time
 median of 9 runs (fewer for the slow coders). Run it on an otherwise idle machine: other CPU work changes
 the numbers. The cm coder takes tens of seconds per dataset, so a full run takes about five minutes.
 
+Parser speed for every text surface, with serde_json as the JSON reference:
+
+```bash
+cargo run --release -- parse            # all surfaces, 20000 records
+cargo run --release -- parse yaml       # one surface per process (the fair way to compare surfaces)
+cargo run --release -- parse serde 100000   # the serde_json reference alone, any record count
+```
+
 Results and how to read them: [`../docs/BENCHMARKS.md`](../docs/BENCHMARKS.md).
 
 ## What it measures

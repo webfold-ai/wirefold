@@ -1,7 +1,8 @@
 # Benchmarks
 
 wirefold against serde_json, bincode, postcard, rmp-serde, rkyv and zstd on the same records. The harness
-is [`bench/`](../bench/README.md); every number below comes from one run of it.
+is [`bench/`](../bench/README.md). The serialization tables come from one run of it; the [parsing](#parsing) numbers
+from runs described there.
 
 ## Summary
 
@@ -18,8 +19,9 @@ is [`bench/`](../bench/README.md); every number below comes from one run of it.
   `Collapse + zstd -19` on random data. It costs 44 to 72 seconds to encode 100,000 records (zstd -19:
   about 1 second) and 16 to 24 seconds to decode (zstd: about 4 to 8 ms). Use it when ratio matters more than
   time, for example archival.
-- **JSON text into a generic tree:** wirefold's parser is slower than serde_json: 143 ms against 88 ms,
-  57 MB/s against 94 MB/s.
+- **Parsing text into a generic tree:** wirefold's JSON parser is level with `serde_json::Value`: 101 to 105 ms
+  against 110 to 113 ms for 100,000 records (8.2 MB), each measured in its own process. The other surfaces
+  parse at 74 to 112 MB/s. See [Parsing](#parsing) for the table and what changed.
 
 So wirefold is not a faster serde. What it offers is a different combination: no dependencies beyond
 apeiron, a columnar layout whose open step validates without walking the rows, one `Term` that reads and
@@ -85,22 +87,50 @@ Sum one `f64` column of 100000 records (open + read, no full decode):
 | bincode (decode all, then sum) | 5.194 |
 | postcard (decode all, then sum) | 6.569 |
 
-#### JSON text into a generic tree (100000 records, 8233460 bytes)
+## Parsing
 
-| parser | time (ms) | MB/s |
-|---|---:|---:|
-| wirefold `parse_surface(Json)` | 143.47 | 57 |
-| serde_json `Value` | 88.00 | 94 |
+Speed of each text surface turning a document into a generic tree (`parse_surface`), 20,000 records
+(1.6 to 6.5 MB depending on the surface), median of 15 runs, from `cd bench && cargo run --release -- parse`.
+The "before" column is the parsers as first split from hashtrinity (commit `7a9c900`, which you can check out and run the
+same command against).
 
-[exited with code 0]
+| surface | size (bytes) | before (ms) | now (ms) | now (MB/s) |
+|---|---:|---:|---:|---:|
+| JSON | 1,646,252 | 19.6 | 16.0 | 98 |
+| YAML | 1,686,251 | 24.1 | 20.1 | 74 |
+| TOON | 2,619,591 | 34.9 | 29.3 | 83 |
+| POML | 6,466,278 | 97.3 | 54.1 | 112 |
+| CSV | 2,948,507 | 48.5 | 37.0 | 98 |
+| BAML | 1,946,257 | 17.0 | 16.3 | 108 |
+
+At 100,000 records (8.2 MB of JSON) wirefold takes 101 to 105 ms and `serde_json::Value` 110 to 113 ms.
+
+What was slow, found by profiling with callgrind: `malloc` and `free` were 40% of the JSON parse, POML built a
+substring searcher for every tag it looked for, and TOON and CSV ran several character searches and an
+allocation per line just to read a path. The fixes are bulk-copying strings that need no unescaping, building
+each object, list and mapping at its exact size from a reusable stack, searching for tags and path separators
+byte by byte, and not allocating for the CSV columns and TOON path segments. Instruction counts for the same
+inputs fell by 38% (JSON), 13% (YAML), 28% (TOON), 47% (POML) and 39% (CSV).
+
+How to read these numbers:
+
+- The term type owns a `String` for every key and every scalar, so every parser still allocates for them. The
+  remaining time is mostly that allocation and dropping the tree, which is why YAML and BAML moved least.
+  Removing it needs a borrowed term type, which would be a new API.
+- Compare surfaces in separate processes. The heap state left by one parse changes the speed of the next by
+  10 to 20%, in both directions, so `cargo run --release -- parse yaml` and so on is the fair way to measure one
+  surface; the all-surfaces run is for a quick look.
+- Behaviour is unchanged. The old and new parsers were compared on about two million generated and mutated
+  inputs across the surfaces with no difference in result or error message, and `tests/parse_behaviour.rs`
+  pins the edge cases.
 
 ## Limits of these numbers
 
-- One run on one shared virtual machine, so expect noise of several percent; differences under about 10%
+- One run on one shared virtual machine (the parsing table is the median of 15 runs on the same machine), so expect noise of several percent; differences under about 10%
   (bincode against Collapse, for example) should be read as ties.
 - One record shape. Records with many strings, deep nesting or optional fields behave differently.
-- The JSON row compares parsers building a generic tree. serde_json can also deserialise straight into a
-  typed struct, which wirefold does not do, so that case is not measured.
+- The JSON parsing comparison is parser against parser, each building a generic tree. serde_json can also
+  deserialise straight into a typed struct, which wirefold does not do, so that case is not measured.
 - The wirefold and rkyv column reads include the open step. A loop that opens once and reads many columns
   amortises it.
 - zstd was tried at level 19 only. Lower levels are much faster and compress less.
