@@ -224,7 +224,7 @@ the re-rank both reach recall 1.00; binary (0.23) and 2-bit (0.93) do not. int4 
 12.1M against 6.9M rows per second per core in DRAM.
 
 **6. Cost is cores, and batching is the biggest lever on them.** Queries per pass over the DRAM column, ns per row
-per query (all 4 cores, 95% CIs in the per-run files):
+per query (all 4 cores; the `batch` run prints each cell's 95% interval as well):
 
 | format | 1 q/pass: ns/row/query | 4 q/pass: ns/row/query | 16 q/pass: ns/row/query | 64 q/pass: ns/row/query |
 | --- | ---: | ---: | ---: | ---: |
