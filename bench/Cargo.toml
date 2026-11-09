@@ -19,6 +19,8 @@ postcard = { version = "1", features = ["use-std"] }
 rmp-serde = "1"
 rkyv = { version = "0.8", default-features = false, features = ["std", "bytecheck", "alloc"] }
 zstd = "0.13"
+ryu = "1"
+itoa = "1"
 
 [profile.release]
 opt-level = 3

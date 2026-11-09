@@ -1,13 +1,13 @@
 //! wirefold against serde_json, bincode, postcard, rmp-serde and rkyv on the same records.
 //!
-//! Run: `cargo run --release -- [records]` (default 100000). Prints markdown tables.
-//! Every encoder is round-trip checked before it is timed. Timings are the median of 9 runs (one
-//! run for the context-mixing coder, which takes tens of seconds).
+//! Run: `cargo run --release -- [records] [runs]` (default 20000 records, 3 runs). Prints markdown tables.
+//! Every encoder is round-trip checked before it is timed. Each row and operation runs in its own
+//! process, `runs` times, and is reported as mean (minimum to maximum); a run is the median of 9
+//! repetitions (fewer for zstd, one for the context-mixing coder, which takes seconds).
 
 use std::hint::black_box;
 use std::time::Instant;
 use wirefold::codec::syntax::{parse_surface, Surface};
-use wirefold::codec::web::CollapseElem;
 
 #[derive(
     Clone,
@@ -76,6 +76,10 @@ fn random(n: usize) -> Vec<Event> {
 
 /// Median wall time of `runs` executions of `f`, in milliseconds.
 fn ms<R>(runs: usize, mut f: impl FnMut() -> R) -> f64 {
+    if std::env::var("WARMCURVE").is_ok() {
+        let v: Vec<f64> = (0..runs).map(|_| { let s = Instant::now(); black_box(f()); s.elapsed().as_secs_f64() * 1e3 }).collect();
+        eprintln!("per-run ms: {}", v.iter().map(|x| format!("{x:.2}")).collect::<Vec<_>>().join(" "));
+    }
     let mut t: Vec<f64> = (0..runs)
         .map(|_| {
             let s = Instant::now();
@@ -87,218 +91,362 @@ fn ms<R>(runs: usize, mut f: impl FnMut() -> R) -> f64 {
     t[t.len() / 2]
 }
 
-struct Row {
-    name: &'static str,
-    bytes: usize,
-    enc: f64,
-    dec: f64,
-}
-
-fn report(title: &str, n: usize, rows: &[Row]) {
-    println!("\n### {title} ({n} records)\n");
-    println!("| format | size (bytes) | bytes/record | encode (ms) | decode all (ms) |");
-    println!("|---|---:|---:|---:|---:|");
-    for r in rows {
-        println!(
-            "| {} | {} | {:.1} | {:.2} | {:.2} |",
-            r.name,
-            r.bytes,
-            r.bytes as f64 / n as f64,
-            r.enc,
-            r.dec
-        );
+fn dataset_by_name(name: &str, n: usize) -> Vec<Event> {
+    if name == "random" {
+        random(n)
+    } else {
+        ordered(n)
     }
 }
 
-fn dataset(title: &str, data: &Vec<Event>) {
-    let n = data.len();
-    let mut rows = Vec::new();
-
-    // wirefold: columnar Collapse. Decode all = materialise every record from the view.
-    let seed = Event::collapse_pack(data);
-    let bytes = seed.as_bytes().to_vec();
-    assert!(
-        EventView::collapse_open(&bytes).unwrap().collapse_to_vec() == *data,
-        "wirefold round trip"
-    );
-    rows.push(Row {
-        name: "wirefold Collapse",
-        bytes: bytes.len(),
-        enc: ms(9, || Event::collapse_pack(data)),
-        dec: ms(9, || {
-            EventView::collapse_open(&bytes).unwrap().collapse_to_vec()
-        }),
-    });
-
-    // wirefold Collapse + the context-mixing coder over the packed bytes.
-    let z = wirefold::codec::compress(&bytes);
-    assert_eq!(wirefold::codec::decompress(&z), bytes);
-    rows.push(Row {
-        name: "wirefold Collapse + cm coder",
-        bytes: z.len(),
-        enc: ms(1, || wirefold::codec::compress(&bytes)),
-        dec: ms(1, || wirefold::codec::decompress(&z)),
-    });
-
-    // zstd -19 over the same bytes: the usual "serialize, then compress" competitor to the cm coder.
-    let zw = zstd::encode_all(&bytes[..], 19).unwrap();
-    assert!(
-        zstd::decode_all(&zw[..]).unwrap() == bytes,
-        "zstd round trip"
-    );
-    rows.push(Row {
-        name: "wirefold Collapse + zstd -19",
-        bytes: zw.len(),
-        enc: ms(3, || zstd::encode_all(&bytes[..], 19).unwrap()),
-        dec: ms(9, || zstd::decode_all(&zw[..]).unwrap()),
-    });
-
-    let b = bincode::serialize(data).unwrap();
-    assert!(
-        bincode::deserialize::<Vec<Event>>(&b).unwrap() == *data,
-        "bincode round trip"
-    );
-    rows.push(Row {
-        name: "bincode 1.3",
-        bytes: b.len(),
-        enc: ms(9, || bincode::serialize(data).unwrap()),
-        dec: ms(9, || bincode::deserialize::<Vec<Event>>(&b).unwrap()),
-    });
-
-    let p = postcard::to_stdvec(data).unwrap();
-    assert!(
-        postcard::from_bytes::<Vec<Event>>(&p).unwrap() == *data,
-        "postcard round trip"
-    );
-    rows.push(Row {
-        name: "postcard",
-        bytes: p.len(),
-        enc: ms(9, || postcard::to_stdvec(data).unwrap()),
-        dec: ms(9, || postcard::from_bytes::<Vec<Event>>(&p).unwrap()),
-    });
-
-    let pz = zstd::encode_all(&p[..], 19).unwrap();
-    assert!(
-        zstd::decode_all(&pz[..]).unwrap() == p,
-        "postcard+zstd round trip"
-    );
-    rows.push(Row {
-        name: "postcard + zstd -19",
-        bytes: pz.len(),
-        enc: ms(3, || zstd::encode_all(&p[..], 19).unwrap()),
-        dec: ms(9, || zstd::decode_all(&pz[..]).unwrap()),
-    });
-
-    let m = rmp_serde::to_vec(data).unwrap();
-    assert!(
-        rmp_serde::from_slice::<Vec<Event>>(&m).unwrap() == *data,
-        "rmp round trip"
-    );
-    rows.push(Row {
-        name: "rmp-serde (MessagePack)",
-        bytes: m.len(),
-        enc: ms(9, || rmp_serde::to_vec(data).unwrap()),
-        dec: ms(9, || rmp_serde::from_slice::<Vec<Event>>(&m).unwrap()),
-    });
-
-    let r = rkyv::to_bytes::<rkyv::rancor::Error>(data).unwrap();
-    assert!(
-        rkyv::from_bytes::<Vec<Event>, rkyv::rancor::Error>(&r).unwrap() == *data,
-        "rkyv round trip"
-    );
-    rows.push(Row {
-        name: "rkyv 0.8 (validated)",
-        bytes: r.len(),
-        enc: ms(9, || rkyv::to_bytes::<rkyv::rancor::Error>(data).unwrap()),
-        dec: ms(9, || {
-            rkyv::from_bytes::<Vec<Event>, rkyv::rancor::Error>(&r).unwrap()
-        }),
-    });
-
-    let j = serde_json::to_vec(data).unwrap();
-    assert!(
-        serde_json::from_slice::<Vec<Event>>(&j).unwrap() == *data,
-        "serde_json round trip"
-    );
-    rows.push(Row {
-        name: "serde_json",
-        bytes: j.len(),
-        enc: ms(9, || serde_json::to_vec(data).unwrap()),
-        dec: ms(9, || serde_json::from_slice::<Vec<Event>>(&j).unwrap()),
-    });
-
-    report(title, n, &rows);
-
-    // Reading one column without decoding the rest. Wirefold and rkyv read in place; the serde
-    // formats have to decode every record first.
+/// One serialization row, measured in this process: prints `| name | size | ms |`.
+///
+/// `row` picks the format and `op` is `encode`, `decode` or (for the `col-*` rows) `read`. The input
+/// is built, encoded and round-trip checked before the timer starts.
+fn serialize_row(dataset: &str, n: usize, row: &str, op: &str) {
+    use wirefold::codec::web::CollapseElem as _;
+    let data: &'static Vec<Event> = Box::leak(Box::new(dataset_by_name(dataset, n)));
+    let packed = Event::collapse_pack(data);
+    let wf: Vec<u8> = packed.as_bytes().to_vec();
     let want: f64 = data.iter().map(|e| e.value).sum();
-    let view = EventView::collapse_open(&bytes).unwrap();
-    let sum_wf = |v: &EventView| (0..v.collapse_len()).map(|i| v.value(i)).sum::<f64>();
-    assert_eq!(sum_wf(&view), want);
-    let arch =
-        rkyv::access::<rkyv::vec::ArchivedVec<ArchivedEvent>, rkyv::rancor::Error>(&r).unwrap();
-    let sum_rk = |a: &rkyv::vec::ArchivedVec<ArchivedEvent>| {
-        a.iter().map(|e| f64::from(e.value)).sum::<f64>()
+    let runs = 9;
+    // (display name, encoded size, milliseconds)
+    let (name, size, t): (&str, usize, f64) = match (row, op) {
+        ("collapse", _) => {
+            assert!(EventView::collapse_open(&wf).unwrap().collapse_to_vec() == *data);
+            let t = if op == "encode" {
+                ms(runs, || Event::collapse_pack(data))
+            } else {
+                ms(runs, || {
+                    EventView::collapse_open(&wf).unwrap().collapse_to_vec()
+                })
+            };
+            ("wirefold Collapse", wf.len(), t)
+        }
+        ("collapse-cm", _) => {
+            let z = wirefold::codec::compress(&wf);
+            assert!(wirefold::codec::decompress(&z) == wf);
+            let t = if op == "encode" {
+                ms(1, || wirefold::codec::compress(&wf))
+            } else {
+                ms(1, || wirefold::codec::decompress(&z))
+            };
+            ("wirefold Collapse + cm coder", z.len(), t)
+        }
+        ("collapse-zstd", _) => {
+            let z = zstd::encode_all(&wf[..], 19).unwrap();
+            assert!(zstd::decode_all(&z[..]).unwrap() == wf);
+            let t = if op == "encode" {
+                ms(3, || zstd::encode_all(&wf[..], 19).unwrap())
+            } else {
+                ms(runs, || zstd::decode_all(&z[..]).unwrap())
+            };
+            ("wirefold Collapse + zstd -19", z.len(), t)
+        }
+        ("bincode", _) => {
+            let b = bincode::serialize(data).unwrap();
+            assert!(bincode::deserialize::<Vec<Event>>(&b).unwrap() == *data);
+            let t = if op == "encode" {
+                ms(runs, || bincode::serialize(data).unwrap())
+            } else {
+                ms(runs, || bincode::deserialize::<Vec<Event>>(&b).unwrap())
+            };
+            ("bincode 1.3", b.len(), t)
+        }
+        ("postcard", _) => {
+            let b = postcard::to_stdvec(data).unwrap();
+            assert!(postcard::from_bytes::<Vec<Event>>(&b).unwrap() == *data);
+            let t = if op == "encode" {
+                ms(runs, || postcard::to_stdvec(data).unwrap())
+            } else {
+                ms(runs, || postcard::from_bytes::<Vec<Event>>(&b).unwrap())
+            };
+            ("postcard", b.len(), t)
+        }
+        ("postcard-zstd", _) => {
+            let b = postcard::to_stdvec(data).unwrap();
+            let z = zstd::encode_all(&b[..], 19).unwrap();
+            assert!(zstd::decode_all(&z[..]).unwrap() == b);
+            let t = if op == "encode" {
+                ms(3, || zstd::encode_all(&b[..], 19).unwrap())
+            } else {
+                ms(runs, || zstd::decode_all(&z[..]).unwrap())
+            };
+            ("postcard + zstd -19", z.len(), t)
+        }
+        ("rmp", _) => {
+            let b = rmp_serde::to_vec(data).unwrap();
+            assert!(rmp_serde::from_slice::<Vec<Event>>(&b).unwrap() == *data);
+            let t = if op == "encode" {
+                ms(runs, || rmp_serde::to_vec(data).unwrap())
+            } else {
+                ms(runs, || rmp_serde::from_slice::<Vec<Event>>(&b).unwrap())
+            };
+            ("rmp-serde (MessagePack)", b.len(), t)
+        }
+        ("rkyv", _) => {
+            let b = rkyv::to_bytes::<rkyv::rancor::Error>(data).unwrap();
+            assert!(rkyv::from_bytes::<Vec<Event>, rkyv::rancor::Error>(&b).unwrap() == *data);
+            let t = if op == "encode" {
+                ms(runs, || {
+                    rkyv::to_bytes::<rkyv::rancor::Error>(data).unwrap()
+                })
+            } else {
+                ms(runs, || {
+                    rkyv::from_bytes::<Vec<Event>, rkyv::rancor::Error>(&b).unwrap()
+                })
+            };
+            ("rkyv 0.8 (validated)", b.len(), t)
+        }
+        ("json", _) => {
+            let b = serde_json::to_vec(data).unwrap();
+            assert!(serde_json::from_slice::<Vec<Event>>(&b).unwrap() == *data);
+            let t = if op == "encode" {
+                ms(runs, || serde_json::to_vec(data).unwrap())
+            } else {
+                ms(runs, || serde_json::from_slice::<Vec<Event>>(&b).unwrap())
+            };
+            ("serde_json", b.len(), t)
+        }
+        // Reading one f64 column without decoding the rest.
+        ("col-collapse", _) => {
+            let sum = |v: &EventView| (0..v.collapse_len()).map(|i| v.value(i)).sum::<f64>();
+            assert_eq!(sum(&EventView::collapse_open(&wf).unwrap()), want);
+            let t = ms(runs, || sum(&EventView::collapse_open(&wf).unwrap()));
+            ("wirefold view (open + column read)", wf.len(), t)
+        }
+        ("col-rkyv", _) => {
+            let b = rkyv::to_bytes::<rkyv::rancor::Error>(data).unwrap();
+            let sum = |a: &rkyv::vec::ArchivedVec<ArchivedEvent>| {
+                a.iter().map(|e| f64::from(e.value)).sum::<f64>()
+            };
+            let access = || {
+                rkyv::access::<rkyv::vec::ArchivedVec<ArchivedEvent>, rkyv::rancor::Error>(&b)
+                    .unwrap()
+            };
+            assert_eq!(sum(access()), want);
+            let t = ms(runs, || sum(access()));
+            ("rkyv 0.8 (validate + read)", b.len(), t)
+        }
+        ("col-bincode", _) => {
+            let b = bincode::serialize(data).unwrap();
+            let t = ms(runs, || {
+                bincode::deserialize::<Vec<Event>>(&b)
+                    .unwrap()
+                    .iter()
+                    .map(|e| e.value)
+                    .sum::<f64>()
+            });
+            ("bincode (decode all, then sum)", b.len(), t)
+        }
+        ("col-postcard", _) => {
+            let b = postcard::to_stdvec(data).unwrap();
+            let t = ms(runs, || {
+                postcard::from_bytes::<Vec<Event>>(&b)
+                    .unwrap()
+                    .iter()
+                    .map(|e| e.value)
+                    .sum::<f64>()
+            });
+            ("postcard (decode all, then sum)", b.len(), t)
+        }
+        other => panic!("unknown serialization row {other:?}"),
     };
-    assert_eq!(sum_rk(arch), want);
-    println!("\nSum one `f64` column of {n} records (open + read, no full decode):\n");
-    println!("| format | time (ms) |");
-    println!("|---|---:|");
-    println!(
-        "| wirefold view (open + column read) | {:.3} |",
-        ms(9, || {
-            let v = EventView::collapse_open(&bytes).unwrap();
-            sum_wf(&v)
-        })
-    );
-    println!(
-        "| rkyv 0.8 (validate + read) | {:.3} |",
-        ms(9, || {
-            let a = rkyv::access::<rkyv::vec::ArchivedVec<ArchivedEvent>, rkyv::rancor::Error>(&r)
-                .unwrap();
-            sum_rk(a)
-        })
-    );
-    println!(
-        "| bincode (decode all, then sum) | {:.3} |",
-        ms(9, || bincode::deserialize::<Vec<Event>>(&b)
-            .unwrap()
-            .iter()
-            .map(|e| e.value)
-            .sum::<f64>())
-    );
-    println!(
-        "| postcard (decode all, then sum) | {:.3} |",
-        ms(9, || postcard::from_bytes::<Vec<Event>>(&p)
-            .unwrap()
-            .iter()
-            .map(|e| e.value)
-            .sum::<f64>())
-    );
+    println!("| {name} | {size} | {t:.3} |");
 }
 
-/// JSON text into a generic tree: wirefold's syntax surface against serde_json::Value.
-fn json_values(data: &[Event]) {
-    let text = String::from_utf8(serde_json::to_vec(data).unwrap()).unwrap();
-    assert!(parse_surface(Surface::Json, &text).is_ok());
-    let wf = ms(9, || parse_surface(Surface::Json, &text).unwrap());
-    let sj = ms(9, || {
-        serde_json::from_str::<serde_json::Value>(&text).unwrap()
-    });
+/// Mean, minimum and maximum of a set of timings.
+fn spread(v: &[f64]) -> (f64, f64, f64) {
+    let mean = v.iter().sum::<f64>() / v.len() as f64;
+    let min = v.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = v.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    (mean, min, max)
+}
+
+/// Run one serialization row `runs` times, each in its own process; returns name, size and timings.
+fn collect_row(
+    dataset: &str,
+    n: usize,
+    row: &str,
+    op: &str,
+    runs: usize,
+) -> (String, usize, Vec<f64>) {
+    let exe = std::env::current_exe().expect("own path");
+    let (mut name, mut size, mut times) = (String::new(), 0usize, Vec::new());
+    for _ in 0..runs {
+        let out = std::process::Command::new(&exe)
+            .args(["serialize", dataset, &n.to_string(), row, op])
+            .output()
+            .expect("child run");
+        assert!(out.status.success(), "{row} {op} child failed");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("| "))
+            .expect("a result row");
+        let cols: Vec<&str> = line.split('|').map(str::trim).collect();
+        name = cols[1].to_string();
+        size = cols[2].parse().unwrap();
+        times.push(cols[3].parse().unwrap());
+    }
+    (name, size, times)
+}
+
+/// The serialization comparison: every format on the same records, each row and operation in its own
+/// process, repeated `runs` times, reported as mean (minimum to maximum).
+fn serialize_tables(n: usize, runs: usize) {
     println!(
-        "\n### JSON text into a generic tree ({} records, {} bytes)\n",
-        data.len(),
-        text.len()
+        "wirefold {} against serde_json 1, bincode 1.3, postcard 1, rmp-serde 1, rkyv 0.8 and zstd; {n} records, {runs} runs per cell",
+        env!("CARGO_PKG_VERSION")
     );
-    println!("| parser | time (ms) | MB/s |");
+    let fmt = |v: &[f64]| {
+        let (m, lo, hi) = spread(v);
+        format!("{m:.2} ({lo:.2} to {hi:.2})")
+    };
+    for (title, dataset) in [
+        ("Telemetry-shaped records", "ordered"),
+        ("Random records (worst case for a columnar model)", "random"),
+    ] {
+        println!("\n### {title} ({n} records)\n");
+        println!("| format | size (bytes) | bytes/record | encode (ms) | decode all (ms) |");
+        println!("|---|---:|---:|---:|---:|");
+        for row in [
+            "collapse",
+            "collapse-cm",
+            "collapse-zstd",
+            "bincode",
+            "postcard",
+            "postcard-zstd",
+            "rmp",
+            "rkyv",
+            "json",
+        ] {
+            // the context-mixing coder takes seconds per run: one run per cell
+            let r = if row == "collapse-cm" { 1 } else { runs };
+            let (name, size, enc) = collect_row(dataset, n, row, "encode", r);
+            let (_, _, dec) = collect_row(dataset, n, row, "decode", r);
+            println!(
+                "| {name} | {size} | {:.1} | {} | {} |",
+                size as f64 / n as f64,
+                fmt(&enc),
+                fmt(&dec)
+            );
+        }
+        println!("\nSum one `f64` column of {n} records (open + read, no full decode):\n");
+        println!("| format | time (ms) |");
+        println!("|---|---:|");
+        for row in ["col-collapse", "col-rkyv", "col-bincode", "col-postcard"] {
+            let (name, _, t) = collect_row(dataset, n, row, "read", runs);
+            println!("| {name} | {} |", fmt(&t));
+        }
+    }
+}
+
+/// Number formatting, which every text format pays for: std against `ryu` and `itoa`, and against
+/// keeping the number's text as it arrived (what the term does for JSON and YAML).
+fn number_formatting(only: Option<&str>) {
+    let count = 1_000_000usize;
+    let floats: Vec<f64> = (0..count).map(|i| (i as f64 * 7.0 + 3.0) / 100.0).collect();
+    let ints: Vec<u64> = (0..count as u64)
+        .map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20)
+        .collect();
+    let texts: Vec<String> = floats.iter().map(|f| f.to_string()).collect();
+    let want = only.unwrap_or("");
+    println!("\n### Number formatting and parsing ({count} values)\n");
+    println!("| operation | time (ms) | ns/value |");
     println!("|---|---:|---:|");
-    let mbs = |t: f64| text.len() as f64 / 1e6 / (t / 1e3);
-    println!(
-        "| wirefold `parse_surface(Json)` | {:.2} | {:.0} |",
-        wf,
-        mbs(wf)
-    );
-    println!("| serde_json `Value` | {:.2} | {:.0} |", sj, mbs(sj));
+    let row = |name: &str, key: &str, t: f64| {
+        if want.is_empty() || want == key {
+            println!("| {name} | {t:.1} | {:.1} |", t * 1e6 / count as f64);
+        }
+    };
+    let mut buf = String::new();
+    if want.is_empty() || want == "f64-std" {
+        row(
+            "f64 to text, std `Display`",
+            "f64-std",
+            ms(5, || {
+                let mut total = 0usize;
+                for f in &floats {
+                    buf.clear();
+                    use std::fmt::Write as _;
+                    write!(buf, "{f}").unwrap();
+                    total += buf.len();
+                }
+                total
+            }),
+        );
+    }
+    if want.is_empty() || want == "f64-ryu" {
+        row(
+            "f64 to text, `ryu`",
+            "f64-ryu",
+            ms(5, || {
+                let mut b = ryu::Buffer::new();
+                let mut total = 0usize;
+                for f in &floats {
+                    total += b.format(*f).len();
+                }
+                total
+            }),
+        );
+    }
+    if want.is_empty() || want == "u64-std" {
+        row(
+            "u64 to text, std `Display`",
+            "u64-std",
+            ms(5, || {
+                let mut total = 0usize;
+                for v in &ints {
+                    buf.clear();
+                    use std::fmt::Write as _;
+                    write!(buf, "{v}").unwrap();
+                    total += buf.len();
+                }
+                total
+            }),
+        );
+    }
+    if want.is_empty() || want == "u64-itoa" {
+        row(
+            "u64 to text, `itoa`",
+            "u64-itoa",
+            ms(5, || {
+                let mut b = itoa::Buffer::new();
+                let mut total = 0usize;
+                for v in &ints {
+                    total += b.format(*v).len();
+                }
+                total
+            }),
+        );
+    }
+    if want.is_empty() || want == "f64-parse" {
+        row(
+            "text to f64, std `parse`",
+            "f64-parse",
+            ms(5, || {
+                let mut total = 0.0f64;
+                for t in &texts {
+                    total += t.parse::<f64>().unwrap();
+                }
+                total
+            }),
+        );
+    }
+    if want.is_empty() || want == "text-kept" {
+        row(
+            "text kept as it arrived (the term's `Atom::Num`: one copy)",
+            "text-kept",
+            ms(5, || {
+                let mut total = 0usize;
+                for t in &texts {
+                    total += t.clone().len();
+                }
+                total
+            }),
+        );
+    }
 }
 
 /// Parse speed of every text surface on the same records, with serde_json as the JSON reference.
@@ -573,19 +721,18 @@ fn main() {
         parse_surfaces(n, only.as_deref());
         return;
     }
-    let n: usize = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(100_000);
-    println!(
-        "wirefold {} vs serde_json 1, bincode 1.3, postcard 1, rmp-serde 1, rkyv 0.8; rustc {}",
-        env!("CARGO_PKG_VERSION"),
-        option_env!("RUSTC_VERSION").unwrap_or("see `rustc -V`")
-    );
-    dataset("Telemetry-shaped records", &ordered(n));
-    dataset(
-        "Random records (worst case for a columnar model)",
-        &random(n),
-    );
-    json_values(&ordered(n));
+    let args: Vec<String> = std::env::args().collect();
+    // `serialize <dataset> <n> <row> <op>` is one measured row (run by `serialize_tables` as a child).
+    if args.get(1).map(String::as_str) == Some("serialize") && args.len() == 6 {
+        serialize_row(&args[2], args[3].parse().unwrap(), &args[4], &args[5]);
+        return;
+    }
+    if args.get(1).map(String::as_str) == Some("numbers") {
+        number_formatting(args.get(2).map(String::as_str));
+        return;
+    }
+    // default: the serialization comparison. `[records] [runs]`.
+    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(20_000);
+    let runs: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(3);
+    serialize_tables(n, runs);
 }

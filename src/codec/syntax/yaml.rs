@@ -102,7 +102,7 @@ where
     let ranges: Vec<(usize, usize)> = starts.windows(2).map(|w| (w[0], w[1])).collect();
     let slots: Vec<Mutex<Option<Result<Vec<B::Term>, SyntaxError>>>> =
         ranges.iter().map(|_| Mutex::new(None)).collect();
-    pool.dispatch(ranges.len(), |t| {
+    crate::codec::par_tasks(ranges.len(), |t| {
         let (a, b) = ranges[t];
         if a == b {
             // a share that held no margin dash: this piece is empty

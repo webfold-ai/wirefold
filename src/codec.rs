@@ -520,10 +520,21 @@ pub mod cm {
 
     impl Model {
         fn new(k: usize, nbytes: usize) -> Self {
-            let lr = std::env::var("MIX_LR")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(MIX_LR);
+            // The two tuning knobs are read from the environment once per process, not once per
+            // coding pass (the stride search runs several passes).
+            static KNOBS: std::sync::OnceLock<(f64, f64)> = std::sync::OnceLock::new();
+            let (lr, gate) = *KNOBS.get_or_init(|| {
+                (
+                    std::env::var("MIX_LR")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(MIX_LR),
+                    std::env::var("GATE")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(1.0 / PROB_M as f64),
+                )
+            });
             Model {
                 store: new_store(k, nbytes),
                 hi: (0..N_HI).map(|_| FreqMap::with_capacity(1 << 12)).collect(),
@@ -536,10 +547,7 @@ pub mod cm {
                 k,
                 mods: bin_mods(k),
                 lr,
-                gate: std::env::var("GATE")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(1.0 / PROB_M as f64),
+                gate,
             }
         }
 
@@ -1079,11 +1087,32 @@ pub mod cm {
         let cands = propose_strides(data);
         if !cands.is_empty() {
             let s = &data[..data.len().min(1 << 16)];
-            let mut best = coded_size(k, s);
-            for w in cands {
-                let sz = coded_size(k, &med_forward(s, w));
-                if sz < best {
-                    best = sz;
+            // Each trial (the raw sample, then the sample under each proposed stride) is a whole
+            // coding pass and independent of the others, so they run as one static batch on the
+            // pool; the winner is then picked in the same order as before (first strictly
+            // smallest), so the choice, and the output, are identical.
+            let sizes: Vec<std::sync::Mutex<usize>> = (0..=cands.len())
+                .map(|_| std::sync::Mutex::new(0))
+                .collect();
+            super::par_tasks(sizes.len(), |t| {
+                let size = if t == 0 {
+                    coded_size(k, s)
+                } else {
+                    coded_size(k, &med_forward(s, cands[t - 1]))
+                };
+                *sizes[t]
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = size;
+            });
+            let size_of = |t: usize| {
+                *sizes[t]
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            };
+            let mut best = size_of(0);
+            for (i, &w) in cands.iter().enumerate() {
+                if size_of(i + 1) < best {
+                    best = size_of(i + 1);
                     stride = w;
                 }
             }
@@ -1151,6 +1180,42 @@ pub mod cm {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// The parallel stride search must pick exactly what a plain sequential scan picks. The
+        /// input is an image-like gradient so a non-zero stride really wins (a check that always
+        /// saw stride 0 could not tell the two apart).
+        #[test]
+        fn stride_search_matches_sequential_scan() {
+            let mut later_winner = false;
+            for w in [48usize, 75, 89, 124] {
+                let data: Vec<u8> = (0..w * 60)
+                    .map(|i| (((i % w) * 2 + (i / w) * 3) as u8) ^ ((i * 7 % 5) as u8))
+                    .collect();
+                let cands = propose_strides(&data);
+                let s = &data[..data.len().min(1 << 16)];
+                let mut want = 0usize;
+                let mut best = coded_size(3, s);
+                for &c in &cands {
+                    let size = coded_size(3, &med_forward(s, c));
+                    if size < best {
+                        best = size;
+                        want = c;
+                    }
+                }
+                let enc = compress(3, &data);
+                let mut at = 0;
+                let _len = get_varint(&enc, &mut at);
+                let _k = get_varint(&enc, &mut at);
+                assert_eq!(get_varint(&enc, &mut at), Ok(want as u64), "width {w}");
+                assert_eq!(decompress(&enc), data);
+                if cands.iter().position(|&c| c == want).is_some_and(|i| i > 0) {
+                    later_winner = true;
+                }
+            }
+            // a winner that is not the first candidate is what separates a correct pick from "always
+            // the first stride", so the inputs must include one
+            assert!(later_winner, "no input had a later-candidate winner");
+        }
 
         #[test]
         fn cm_roundtrip() {
@@ -9294,6 +9359,38 @@ pub use syntax::{
 /// The default context order — r5 is the upstream sweet spot (past gzip -9).
 pub const DEFAULT_ORDER: usize = 5;
 
+thread_local! {
+    /// Set while this thread is running a task started by [`par_tasks`].
+    static IN_PAR_TASK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f(i)` for every `i in 0..tasks` on apeiron's shared pool, or inline when that cannot work.
+///
+/// The pool's `dispatch` is not reentrant: it holds a lock for the whole batch, so a task that
+/// dispatched again would wait forever on the lock its own dispatcher holds. Every parallel path in
+/// this crate goes through here, and a task started here runs anything nested inline, so a parallel
+/// compressor chunk can still use a parallel stride search without deadlock. The results are the
+/// same either way; only the schedule differs.
+pub(crate) fn par_tasks<F: Fn(usize) + Sync>(tasks: usize, f: F) {
+    if tasks < 2 || IN_PAR_TASK.with(std::cell::Cell::get) {
+        for i in 0..tasks {
+            f(i);
+        }
+        return;
+    }
+    /// Restores the flag even if the task panics.
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            IN_PAR_TASK.with(|c| c.set(self.0));
+        }
+    }
+    crate::par::Pool::global().dispatch(tasks, |i| {
+        let _restore = Restore(IN_PAR_TASK.with(|c| c.replace(true)));
+        f(i);
+    });
+}
+
 /// Chunk size for the parallel split: ≥ this per chunk keeps the cross-chunk ratio loss small (each
 /// chunk restarts the adaptive model, so bigger chunks lose less context). Below it, one chunk.
 const PAR_CHUNK: usize = 1 << 20;
@@ -9346,7 +9443,7 @@ pub fn compress_at(k: usize, bytes: &[u8]) -> Vec<u8> {
         let mut base = 0;
         while base < nch {
             let this = wave.min(nch - base);
-            pool.dispatch(this, |t| {
+            par_tasks(this, |t| {
                 let i = base + t;
                 let lo = i * chunk;
                 if lo < bytes.len() {
@@ -9381,7 +9478,7 @@ pub fn decompress_framed(bytes: &[u8]) -> Vec<u8> {
 /// Checked [`decompress_framed`]. The chunk count and every chunk length are validated against the
 /// input before anything is allocated, and each chunk is decoded by the bounded [`cm::try_decompress`].
 pub fn try_decompress_framed(bytes: &[u8]) -> Result<Vec<u8>, DecodeError> {
-    use crate::par::{Pool, SendPtr};
+    use crate::par::SendPtr;
     let mut pos = 0usize;
     let nch = read_len(bytes, &mut pos)?;
     if nch == 0 {
@@ -9409,7 +9506,6 @@ pub fn try_decompress_framed(bytes: &[u8]) -> Result<Vec<u8>, DecodeError> {
     if nch <= 1 {
         parts[0] = cm::try_decompress(&bytes[offs[0].0..offs[0].1]);
     } else {
-        let pool = Pool::global();
         // wave-cap by the largest chunk so decode DRAM stays bounded too (the tables are per-chunk).
         let maxc = lens.iter().copied().max().unwrap_or(1).max(1);
         let wave = (MEM_BUDGET / (256 * maxc)).clamp(1, nch);
@@ -9417,7 +9513,7 @@ pub fn try_decompress_framed(bytes: &[u8]) -> Result<Vec<u8>, DecodeError> {
         let mut base = 0;
         while base < nch {
             let this = wave.min(nch - base);
-            pool.dispatch(this, |t| {
+            par_tasks(this, |t| {
                 let (a, b) = offs[base + t];
                 // SAFETY: task t writes only parts[base+t]; distinct t ⇒ disjoint.
                 unsafe { *pptr.add(base + t) = cm::try_decompress(&bytes[a..b]) };
@@ -10192,6 +10288,27 @@ pub fn lift_to_tokens<A: Clone>(stream: &[A]) -> Option<Vec<Token<A>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `par_tasks` call made from inside a `par_tasks` task must run inline rather than re-enter
+    /// the pool (whose dispatch lock is not reentrant, so re-entry would deadlock), and every index
+    /// of both levels must still run exactly once.
+    #[test]
+    fn par_tasks_nested_runs_inline_and_completes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits: Vec<AtomicUsize> = (0..8 * 8).map(|_| AtomicUsize::new(0)).collect();
+        par_tasks(8, |i| {
+            par_tasks(8, |j| {
+                hits[i * 8 + j].fetch_add(1, Ordering::Relaxed);
+            });
+        });
+        assert!(hits.iter().all(|h| h.load(Ordering::Relaxed) == 1));
+        // and the guard is released afterwards: a fresh top-level call still fans out
+        let after = AtomicUsize::new(0);
+        par_tasks(4, |_| {
+            after.fetch_add(1, Ordering::Relaxed);
+        });
+        assert_eq!(after.load(Ordering::Relaxed), 4);
+    }
 
     #[test]
     fn term_roundtrip_matches_lean() {

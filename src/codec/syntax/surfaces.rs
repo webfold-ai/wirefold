@@ -942,7 +942,7 @@ where
     };
     let summaries: Vec<Mutex<Option<ChunkSummary>>> =
         (0..pieces).map(|_| Mutex::new(None)).collect();
-    pool.dispatch(pieces, |k| {
+    crate::codec::par_tasks(pieces, |k| {
         let (a, b) = chunk_of(k);
         *summaries[k]
             .lock()
@@ -980,7 +980,7 @@ where
     ranges.push((start, hi));
     let slots: Vec<Mutex<Option<Result<Vec<B::Term>, SyntaxError>>>> =
         ranges.iter().map(|_| Mutex::new(None)).collect();
-    pool.dispatch(ranges.len(), |t| {
+    crate::codec::par_tasks(ranges.len(), |t| {
         let (a, b) = ranges[t];
         let parsed = JsonParser::<B>::new(&input[a..b], false)
             .starting_at_depth(1)
