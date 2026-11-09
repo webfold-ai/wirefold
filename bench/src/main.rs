@@ -76,10 +76,6 @@ fn random(n: usize) -> Vec<Event> {
 
 /// Median wall time of `runs` executions of `f`, in milliseconds.
 fn ms<R>(runs: usize, mut f: impl FnMut() -> R) -> f64 {
-    if std::env::var("WARMCURVE").is_ok() {
-        let v: Vec<f64> = (0..runs).map(|_| { let s = Instant::now(); black_box(f()); s.elapsed().as_secs_f64() * 1e3 }).collect();
-        eprintln!("per-run ms: {}", v.iter().map(|x| format!("{x:.2}")).collect::<Vec<_>>().join(" "));
-    }
     let mut t: Vec<f64> = (0..runs)
         .map(|_| {
             let s = Instant::now();

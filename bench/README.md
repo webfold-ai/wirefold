@@ -6,11 +6,11 @@ the usual "serialize, then compress" baseline. It lives outside the library work
 
 ```bash
 cd bench
-cargo run --release -- 100000      # number of records; default 100000
+cargo run --release -- 20000       # records [and runs per cell]; default 20000 records, 3 runs
 ```
 
-It prints markdown tables. Every encoder is round-trip checked before it is timed, and timings are the
-median of 9 runs (fewer for the slow coders). Run it on an otherwise idle machine: other CPU work changes
+It prints markdown tables. Every encoder is round-trip checked before it is timed, and each cell runs in a fresh process and
+the table gives the mean of 3 runs with the range. Run it on an otherwise idle machine: other CPU work changes
 the numbers. The cm coder takes tens of seconds per dataset, so a full run takes about five minutes.
 
 Parser speed for every text surface, with serde_json as the JSON reference:
@@ -27,6 +27,7 @@ Rendering and the binary codecs, each row in its own process:
 
 ```bash
 cargo run --release -- render           # every surface rendered from the same tree
+cargo run --release -- numbers          # ryu and itoa against std formatting and against keeping the text
 cargo run --release -- binary           # MessagePack (against rmp-serde) and protobuf, encode and decode
 ```
 

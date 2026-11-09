@@ -1,24 +1,27 @@
 # Benchmarks
 
 wirefold against serde_json, bincode, postcard, rmp-serde, rkyv and zstd on the same records. The harness
-is [`bench/`](../bench/README.md). The serialization tables come from one run of it; the [parsing](#parsing) numbers
+is [`bench/`](../bench/README.md). The serialization tables come from the run described under Results; the [parsing](#parsing) numbers
 from runs described there.
 
 ## Summary
 
-- **Plain encode and decode:** wirefold `Collapse` is the same as bincode (3,566,664 against 3,566,608
-  bytes, about 1 ms to encode and 5 ms to decode 100,000 records). It is not faster than bincode, rkyv or
-  postcard at decoding everything. It is about 2.3 times smaller than serde_json, about 10 times faster to
-  encode and about 4 times faster to decode. postcard is smaller (2.46 MB against 3.57 MB) and takes about
-  twice as long to encode.
+- **Plain encode and decode:** wirefold `Collapse` and bincode are the same size (713,116 against 713,060
+  bytes for 20,000 telemetry records) and the same speed to encode (0.15 against 0.17 ms). Decoding everything,
+  wirefold is slower than bincode and rkyv on this data (1.3 against 0.7 and 1.0 ms), roughly a tie on the random
+  data. It is about 2.3 times smaller than serde_json, about 14 times faster to encode and about 3 times faster to
+  decode. postcard is smaller (24.6 against 35.7 bytes per record) and takes about three times as long to encode.
+  An earlier version of this page said wirefold tied bincode on decode; in fresh processes it does not on the
+  telemetry data.
 - **Reading one column without decoding the rest:** wirefold's validated open plus a column read is about
-  3 to 4 times faster than bincode or postcard (decode everything, then read) and slower than rkyv: 1.5 ms
-  against 1.2 ms on the telemetry data and 1.6 ms against 0.5 ms on the random data.
-- **Size with an entropy coder:** wirefold's context-mixing coder produced the smallest output, 21% below
-  `postcard + zstd -19` and 26% below `Collapse + zstd -19` on the telemetry data, and 5% below
-  `Collapse + zstd -19` on random data. It costs 44 to 72 seconds to encode 100,000 records (zstd -19:
-  about 1 second) and 16 to 24 seconds to decode (zstd: about 4 to 8 ms). Use it when ratio matters more than
-  time, for example archival.
+  3 times faster than bincode or postcard (decode everything, then read) and slower than rkyv: 0.34 against
+  0.22 ms on the telemetry data and 0.26 against 0.11 ms on the random data.
+- **Size with an entropy coder:** wirefold's context-mixing coder produced the smallest output, 14% below
+  `postcard + zstd -19` and 19% below `Collapse + zstd -19` on the telemetry data, and 1% below
+  `Collapse + zstd -19` on random data. It costs about 17.7 s to encode 20,000 telemetry records (zstd -19: about
+  0.25 s) and 8.4 s to decode (zstd: about 1 ms), so 25 and 12 microseconds per byte. Use it when ratio matters
+  more than time, for example archival. Its stride search now runs its trials in parallel with byte-identical
+  output (see [DESIGN.md](DESIGN.md)).
 - **Parsing text into a generic tree:** wirefold's owned JSON parser is level with `serde_json::Value`, and
   `parse_surface_ref`, which borrows strings from the input, is about 1.8 times faster than it on one thread,
   and about 5 times faster on a pool of 4 for documents over 512 KiB (23 ms against about 110 ms for 100,000
@@ -35,63 +38,66 @@ writes JSON, YAML, TOON, POML, MessagePack and others, and an optional coder tha
 
 ## Setup
 
-- 100,000 records of one shape (`u64`, `u32`, `u8`, `f64`, `bool`, `String`), in two datasets: telemetry-shaped
+- 20,000 records of one shape (`u64`, `u32`, `u8`, `f64`, `bool`, `String`), in two datasets: telemetry-shaped
   (increasing timestamps, small domains, six repeated names) and random (full-range integers and floats,
   random-looking names), which is the worst case for a columnar model.
 - Machine: 4 vCPU Intel Xeon @ 2.10 GHz virtual machine, rustc 1.97.0, release build with `lto = true` and
   `codegen-units = 1`, run on an otherwise idle machine.
 - Versions: serde_json 1 (with `float_roundtrip` so floats are exact), bincode 1.3, postcard 1,
   rmp-serde 1, rkyv 0.8 (validated), zstd 0.13 at level 19.
-- Each encoder's output is decoded and compared with the input before it is timed. Timings are the median
-  of 9 runs, 3 for zstd encoding and 1 for the cm coder.
+- Each encoder's output is decoded and compared with the input before it is timed. Timings are the mean of 3 runs
+  per cell, each cell in a fresh process, with the range shown.
 
 ## Results
 
-#### Telemetry-shaped records (100000 records)
+20,000 records, each row in a fresh process, mean of 3 runs with the range in brackets. The cm coder row is
+instead the mean and range over three whole processes, one run each, because a run takes tens of seconds.
+
+#### Telemetry-shaped records (20000 records)
 
 | format | size (bytes) | bytes/record | encode (ms) | decode all (ms) |
 |---|---:|---:|---:|---:|
-| wirefold Collapse | 3566664 | 35.7 | 0.96 | 5.67 |
-| wirefold Collapse + cm coder | 743641 | 7.4 | 44099.82 | 16064.95 |
-| wirefold Collapse + zstd -19 | 1002091 | 10.0 | 1307.79 | 4.36 |
-| bincode 1.3 | 3566608 | 35.7 | 0.89 | 4.83 |
-| postcard | 2464061 | 24.6 | 2.11 | 5.79 |
-| postcard + zstd -19 | 936513 | 9.4 | 882.29 | 3.59 |
-| rmp-serde (MessagePack) | 3058959 | 30.6 | 2.78 | 9.67 |
-| rkyv 0.8 (validated) | 4000008 | 40.0 | 1.02 | 5.20 |
-| serde_json | 8233460 | 82.3 | 9.82 | 21.18 |
+| wirefold Collapse | 713116 | 35.7 | 0.15 (0.14 to 0.17) | 1.34 (1.14 to 1.67) |
+| wirefold Collapse + cm coder | 168148 | 8.4 | 17,700 (16,451 to 18,642) | 8,422 (8,312 to 8,541) |
+| wirefold Collapse + zstd -19 | 207470 | 10.4 | 258.61 (246.48 to 273.54) | 0.84 (0.75 to 0.94) |
+| bincode 1.3 | 713060 | 35.7 | 0.17 (0.15 to 0.18) | 0.74 (0.72 to 0.78) |
+| postcard | 492525 | 24.6 | 0.45 (0.44 to 0.46) | 0.91 (0.89 to 0.94) |
+| postcard + zstd -19 | 194386 | 9.7 | 177.88 (157.20 to 209.26) | 0.72 (0.69 to 0.78) |
+| rmp-serde (MessagePack) | 611506 | 30.6 | 0.65 (0.60 to 0.68) | 1.74 (1.52 to 2.19) |
+| rkyv 0.8 (validated) | 800008 | 40.0 | 0.22 (0.20 to 0.25) | 0.98 (0.90 to 1.10) |
+| serde_json | 1646252 | 82.3 | 2.09 (1.95 to 2.27) | 4.19 (3.97 to 4.40) |
 
-Sum one `f64` column of 100000 records (open + read, no full decode):
+Sum one `f64` column of 20000 records (open + read, no full decode):
 
 | format | time (ms) |
 |---|---:|
-| wirefold view (open + column read) | 1.493 |
-| rkyv 0.8 (validate + read) | 1.205 |
-| bincode (decode all, then sum) | 5.078 |
-| postcard (decode all, then sum) | 6.167 |
+| wirefold view (open + column read) | 0.34 (0.31 to 0.41) |
+| rkyv 0.8 (validate + read) | 0.22 (0.22 to 0.23) |
+| bincode (decode all, then sum) | 1.02 (0.80 to 1.34) |
+| postcard (decode all, then sum) | 1.28 (0.99 to 1.65) |
 
-#### Random records (worst case for a columnar model) (100000 records)
+#### Random records (worst case for a columnar model) (20000 records)
 
 | format | size (bytes) | bytes/record | encode (ms) | decode all (ms) |
 |---|---:|---:|---:|---:|
-| wirefold Collapse | 4593280 | 45.9 | 0.80 | 6.29 |
-| wirefold Collapse + cm coder | 2995987 | 30.0 | 72411.98 | 24192.49 |
-| wirefold Collapse + zstd -19 | 3154168 | 31.5 | 966.48 | 6.65 |
-| bincode 1.3 | 4593224 | 45.9 | 0.93 | 4.60 |
-| postcard | 4136643 | 41.4 | 2.63 | 6.30 |
-| postcard + zstd -19 | 3403678 | 34.0 | 1041.07 | 7.82 |
-| rmp-serde (MessagePack) | 4343065 | 43.4 | 3.36 | 9.56 |
-| rkyv 0.8 (validated) | 5593224 | 55.9 | 1.53 | 4.71 |
-| serde_json | 12309176 | 123.1 | 12.69 | 50.80 |
+| wirefold Collapse | 918696 | 45.9 | 0.16 (0.13 to 0.17) | 1.23 (1.01 to 1.55) |
+| wirefold Collapse + cm coder | 626037 | 31.3 | 33,389 (32,931 to 34,142) | 10,458 (9,949 to 10,743) |
+| wirefold Collapse + zstd -19 | 634681 | 31.7 | 185.42 (163.17 to 223.57) | 1.74 (1.26 to 2.14) |
+| bincode 1.3 | 918640 | 45.9 | 0.17 (0.16 to 0.18) | 0.82 (0.64 to 1.15) |
+| postcard | 827235 | 41.4 | 0.67 (0.54 to 0.79) | 1.06 (1.00 to 1.16) |
+| postcard + zstd -19 | 692567 | 34.6 | 168.40 (155.34 to 191.49) | 1.60 (1.34 to 1.97) |
+| rmp-serde (MessagePack) | 868558 | 43.4 | 0.72 (0.71 to 0.72) | 1.53 (1.50 to 1.56) |
+| rkyv 0.8 (validated) | 1118640 | 55.9 | 0.28 (0.26 to 0.29) | 0.76 (0.59 to 0.92) |
+| serde_json | 2461362 | 123.1 | 3.02 (2.30 to 3.73) | 6.94 (5.47 to 9.09) |
 
-Sum one `f64` column of 100000 records (open + read, no full decode):
+Sum one `f64` column of 20000 records (open + read, no full decode):
 
 | format | time (ms) |
 |---|---:|
-| wirefold view (open + column read) | 1.621 |
-| rkyv 0.8 (validate + read) | 0.514 |
-| bincode (decode all, then sum) | 5.194 |
-| postcard (decode all, then sum) | 6.569 |
+| wirefold view (open + column read) | 0.26 (0.22 to 0.34) |
+| rkyv 0.8 (validate + read) | 0.11 (0.07 to 0.13) |
+| bincode (decode all, then sum) | 0.90 (0.83 to 0.94) |
+| postcard (decode all, then sum) | 1.29 (0.96 to 1.55) |
 
 ## Parsing
 
@@ -242,6 +248,26 @@ Encoded bytes are identical to before: compared on over a million random terms a
 nested messages past 128 bytes and 16 KB where the length prefix grows to two and three bytes, and millions of
 decimal-number texts.
 
+## Number formatting
+
+Why wirefold does not use `ryu` or `itoa` ([DESIGN.md](DESIGN.md#numbers-why-not-ryu-and-itoa)): JSON and YAML keep a
+number's text verbatim, so there is no formatting step. Cost of the alternatives, 1,000,000 values, mean of 3
+runs (`cargo run --release -- numbers`):
+
+| operation | ns/value (range) |
+|---|---:|
+| f64 to text, std `Display` | 82.8 (81.2 to 84.9) |
+| f64 to text, `ryu` | 44.3 (37.7 to 56.1) |
+| u64 to text, std `Display` | 20.2 (19.1 to 21.2) |
+| u64 to text, `itoa` | 7.2 (5.9 to 9.1) |
+| text to f64, std `parse` | 10.1 (9.3 to 11.0) |
+| text kept as it arrived (`Atom::Num`: one copy) | 11.1 (10.9 to 11.3) |
+
+`ryu` is about 1.9 times and `itoa` about 2.8 times faster than std. The one place wirefold formats numbers is
+the MessagePack and protobuf decoders, which still use std; that is the measured cost it leaves on the table.
+Keeping the text also costs the same as parsing it (11.1 against 10.1 ns), so it saves nothing there; what it buys
+is exactness, since `1.0`, `1e3` and `0.10` survive unchanged.
+
 ## Limits of these numbers
 
 - One run on one shared virtual machine (the parsing table is the median of 15 runs on the same machine), so expect noise of several percent; differences under about 10%
@@ -257,7 +283,8 @@ decimal-number texts.
 
 ```bash
 cd bench
-cargo run --release -- 100000
+cargo run --release -- 20000        # serialization tables: [records] [runs per cell, default 3]
+cargo run --release -- numbers       # ryu / itoa against std and against keeping the text
 ```
 
 ## Earlier benchmarks

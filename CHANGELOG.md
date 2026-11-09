@@ -8,6 +8,11 @@ All notable changes to this crate are documented in this file. The format follow
 
 ### Added
 
+- `docs/DESIGN.md` (the apeiron basis against serde, bincode, ryu and itoa) and fresh serialization and
+  number-formatting benchmarks.
+- The cm coder's stride search runs its trials in parallel with byte-identical output; nested pool dispatch
+  from inside a task now runs inline instead of deadlocking.
+
 - Initial release of wirefold: the serialization core split out of `hashtrinity` and renamed. It contains
   `codec` (zero-copy wire format, universal `Term`, integer column codec, context-mixing coder and the
   structured-text surfaces), the `Collapse`, `Term`, `Validate` and `Error` derives, and the `error` and
