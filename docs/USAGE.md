@@ -111,6 +111,17 @@ not faster or smaller than zstd on the benchmark data (numbers in [BENCHMARKS.md
 need compression, compress the bytes `Collapse` gives you with zstd; the serialization formats do not depend on
 `compress`.
 
+To compress `Collapse` output with zstd, add `zstd` to your own `Cargo.toml` (wirefold does not depend on it).
+The packed bytes are plain bytes; these are the same calls the benchmark pipelines time, and they are
+not part of `examples/usage.rs` because they need that dependency:
+
+```rust
+let bytes = Event::collapse_pack(&records).as_bytes().to_vec();
+let packed = zstd::encode_all(&bytes[..], 3)?;           // level 3: about 2.5 ms for 20,000 records
+let bytes = zstd::decode_all(&packed[..])?;
+let records = EventView::collapse_open(&bytes)?.collapse_to_vec();
+```
+
 The raw coder is `codec::compress_at(codec::cm::Order::One, &bytes)` (or `Order::Zero`). Its stream starts with
 a version byte (`codec::cm::VERSION`); a reader accepts exactly that version and returns
 `DecodeError::UnsupportedVersion` for any other, so streams from a different version, including those written
