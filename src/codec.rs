@@ -4393,12 +4393,92 @@ pub mod msgpack {
             return;
         }
         if let Ok(f) = s.parse::<f64>() {
-            if f.to_string() == s || format!("{f}") == s {
+            if float_text_is(f, s) {
                 put_be64(out, 0xcb, f.to_bits());
                 return;
             }
         }
         encode_str(out, s);
+    }
+
+    /// Whether `s` is a decimal that is its own shortest round-trip form, decided from the text alone
+    /// so no formatting is needed: `-?digits.digits`, no leading zero (a lone `0` aside), a nonzero
+    /// last fraction digit, at most 15 significant digits, and at most 17 characters. Up to 15
+    /// significant digits survive a trip through `f64` unchanged and no shorter form reads back to
+    /// the same float, and the length bound keeps the value out of the subnormal range, where that
+    /// stops being true. Anything else takes the exact check.
+    fn is_plain_short_decimal(s: &str) -> bool {
+        let b = s.as_bytes();
+        if b.len() > 17 {
+            return false;
+        }
+        let b = b.strip_prefix(b"-").unwrap_or(b);
+        let Some(dot) = b.iter().position(|&c| c == b'.') else {
+            return false;
+        };
+        let (int, frac) = (&b[..dot], &b[dot + 1..]);
+        if int.is_empty()
+            || frac.is_empty()
+            || !int.iter().all(u8::is_ascii_digit)
+            || !frac.iter().all(u8::is_ascii_digit)
+            || (int.len() > 1 && int[0] == b'0')
+            || frac[frac.len() - 1] == b'0'
+        {
+            return false;
+        }
+        // Significant digits: all of them, less the leading zeros of a value below one.
+        let digits = if int == b"0" {
+            frac.len() - frac.iter().take_while(|&&c| c == b'0').count()
+        } else {
+            int.len() + frac.len()
+        };
+        digits <= 15
+    }
+
+    /// Whether `f` prints (with `Display`, the shortest round-trip form) as exactly `s`, so the
+    /// float can stand for the text. Written into a stack buffer: no allocation for the check.
+    fn float_text_is(f: f64, s: &str) -> bool {
+        use core::fmt::Write as _;
+        if is_plain_short_decimal(s) {
+            return true;
+        }
+        struct Buf {
+            bytes: [u8; 40],
+            len: usize,
+        }
+        impl core::fmt::Write for Buf {
+            fn write_str(&mut self, t: &str) -> core::fmt::Result {
+                let end = self.len + t.len();
+                self.bytes
+                    .get_mut(self.len..end)
+                    .ok_or(core::fmt::Error)?
+                    .copy_from_slice(t.as_bytes());
+                self.len = end;
+                Ok(())
+            }
+        }
+        let mut buf = Buf {
+            bytes: [0; 40],
+            len: 0,
+        };
+        if write!(buf, "{f}").is_ok() {
+            return &buf.bytes[..buf.len] == s.as_bytes();
+        }
+        // A float too long for the buffer (only a very large or very small magnitude): the slow way.
+        f.to_string() == s
+    }
+
+    /// `a > b` in byte order (the order `str` compares in), by a short loop: map keys are a few bytes
+    /// long and the general comparison pays a `memcmp` call for each pair.
+    #[inline]
+    fn key_gt(a: &str, b: &str) -> bool {
+        let (a, b) = (a.as_bytes(), b.as_bytes());
+        for (x, y) in a.iter().zip(b) {
+            if x != y {
+                return x > y;
+            }
+        }
+        a.len() > b.len()
     }
 
     fn encode_into(term: &SyntaxTerm, out: &mut Vec<u8>) {
@@ -4415,12 +4495,34 @@ pub mod msgpack {
                 }
             }
             SyntaxTerm::Bu(fields) => {
-                let mut sorted: Vec<&(String, SyntaxTerm)> = fields.iter().collect();
-                sorted.sort_by(|a, b| a.0.cmp(&b.0));
-                encode_len(out, sorted.len(), 0x80, 0x0f, None, 0xde, 0xdf);
-                for (k, v) in sorted {
-                    encode_str(out, k);
-                    encode_into(v, out);
+                encode_len(out, fields.len(), 0x80, 0x0f, None, 0xde, 0xdf);
+                // Keys go out in sorted order. A small map (nearly all of them) is ordered with a
+                // stable insertion sort over indices on the stack; a larger one with a sorted Vec.
+                const SMALL: usize = 16;
+                if fields.len() <= SMALL {
+                    let n = fields.len();
+                    let mut order = [0usize; SMALL];
+                    for (i, slot) in order.iter_mut().enumerate().take(n) {
+                        *slot = i;
+                    }
+                    for i in 1..n {
+                        let mut j = i;
+                        while j > 0 && key_gt(&fields[order[j - 1]].0, &fields[order[j]].0) {
+                            order.swap(j - 1, j);
+                            j -= 1;
+                        }
+                    }
+                    for &i in &order[..n] {
+                        encode_str(out, &fields[i].0);
+                        encode_into(&fields[i].1, out);
+                    }
+                } else {
+                    let mut sorted: Vec<&(String, SyntaxTerm)> = fields.iter().collect();
+                    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                    for (k, v) in sorted {
+                        encode_str(out, k);
+                        encode_into(v, out);
+                    }
                 }
             }
         }
@@ -5153,23 +5255,44 @@ pub mod proto {
     /// omitted — proto2 optional-field semantics.
     #[must_use]
     pub fn encode(term: &SyntaxTerm, schema: &ProtoSchema, registry: &ProtoRegistry) -> Vec<u8> {
-        let SyntaxTerm::Bu(entries) = term else {
-            return Vec::new();
-        };
         let mut out = Vec::new();
+        encode_message(&mut out, term, schema, registry);
+        out
+    }
+
+    /// Appends the wire bytes of one message (`term` per `schema`) to `out`; a term that is not a
+    /// `Bu` appends nothing.
+    fn encode_message(
+        out: &mut Vec<u8>,
+        term: &SyntaxTerm,
+        schema: &ProtoSchema,
+        registry: &ProtoRegistry,
+    ) {
+        let SyntaxTerm::Bu(entries) = term else {
+            return;
+        };
         // proto field order on the wire is conventionally ascending by number (gogo-proto's
         // `MarshalToSizedBuffer` writes descending internally but the buffer is filled backwards, so
         // the DECODED wire order is ascending) — walk the SCHEMA, not the term's own field order, so
         // wire output matches production regardless of what order the term's map iterates in.
-        let mut ordered: Vec<&ProtoField> = schema.fields.iter().collect();
-        ordered.sort_by_key(|f| f.number);
-        for field in ordered {
+        // Schemas are almost always declared in number order already; only a schema that is not
+        // pays for a sorted copy of its field list.
+        let in_order = schema.fields.windows(2).all(|w| w[0].number <= w[1].number);
+        let sorted: Vec<&ProtoField>;
+        let fields: &mut dyn Iterator<Item = &ProtoField> = if in_order {
+            &mut schema.fields.iter()
+        } else {
+            let mut v: Vec<&ProtoField> = schema.fields.iter().collect();
+            v.sort_by_key(|f| f.number);
+            sorted = v;
+            &mut sorted.iter().copied()
+        };
+        for field in fields {
             let Some((_, value)) = entries.iter().find(|(k, _)| k == &field.name) else {
                 continue;
             };
-            encode_field(&mut out, field, value, registry);
+            encode_field(out, field, value, registry);
         }
-        out
     }
 
     fn encode_field(
@@ -5242,10 +5365,21 @@ pub mod proto {
                 let Some(nested_schema) = registry.get(type_name) else {
                     return;
                 };
-                let nested_bytes = encode(value, nested_schema, registry);
+                // Encode the nested message straight into `out` after a one-byte length slot,
+                // instead of into a temporary `Vec` that is then copied. Under 128 bytes (the common
+                // case) the slot is the whole length; a longer message shifts to make room.
                 write_uvarint(out, tag);
-                write_uvarint(out, nested_bytes.len() as u64);
-                out.extend_from_slice(&nested_bytes);
+                let slot = out.len();
+                out.push(0);
+                encode_message(out, value, nested_schema, registry);
+                let len = out.len() - slot - 1;
+                if len < 0x80 {
+                    out[slot] = len as u8;
+                } else {
+                    let mut varint = Vec::with_capacity(5);
+                    write_uvarint(&mut varint, len as u64);
+                    out.splice(slot..=slot, varint);
+                }
             }
             ProtoKind::Map(_, _) => {} // handled in `encode_field` before reaching here — a map needs zero-or-more entries, not one
         }
@@ -5276,7 +5410,10 @@ pub mod proto {
             return Err(ProtoError::new("message nested too deeply"));
         }
         let mut pos = 0usize;
-        let mut fields: Vec<(String, SyntaxTerm)> = Vec::new();
+        // A decoded message has at most one entry per schema field (repeated fields and maps fold
+        // into one), so the schema's field count is the right size for the list. Capped so a huge
+        // schema does not reserve for fields the bytes never contain.
+        let mut fields: Vec<(String, SyntaxTerm)> = Vec::with_capacity(schema.fields.len().min(32));
         while pos < bytes.len() {
             let wire_err = |_| ProtoError::new("truncated or oversized varint");
             let tag = read_uvarint(bytes, &mut pos).map_err(wire_err)?;
@@ -5862,11 +5999,12 @@ pub mod syntax {
 
     pub use rdf::{parse_rdfxml, parse_turtle, render_rdfxml, render_turtle};
     pub use yaml::parse_yaml;
+    use yaml::parse_yaml_with;
 
     use super::{compress, decompress};
     use surfaces::{
         parse_baml, parse_csv, parse_poml, parse_toon, render_baml_term, render_csv, render_json,
-        render_poml, render_toon, JsonParser,
+        render_poml, render_toon, Borrowed, JsonParser, Owned,
     };
     use yaml::render_yaml;
 
@@ -5890,6 +6028,73 @@ pub mod syntax {
         Bool(bool),
         Num(String),
         Str(String),
+    }
+
+    /// An [`Atom`] whose text may borrow from the input it was parsed from.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum AtomRef<'a> {
+        Bool(bool),
+        Num(std::borrow::Cow<'a, str>),
+        Str(std::borrow::Cow<'a, str>),
+    }
+
+    /// A [`SyntaxTerm`] whose keys and scalars may borrow from the input text instead of owning a
+    /// `String` each. Parsing into it (see [`parse_surface_ref`]) skips the allocation and copy for
+    /// every key and scalar the input already spells out exactly (a JSON string with no escapes, a
+    /// number, a plain YAML scalar), which is most of the cost of building a [`SyntaxTerm`].
+    /// [`into_owned`](Self::into_owned) turns it into the owned form when it must outlive the input.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum SyntaxTermRef<'a> {
+        Nb,
+        B(AtomRef<'a>),
+        Bu(Vec<(std::borrow::Cow<'a, str>, SyntaxTermRef<'a>)>),
+        Fourth(Vec<SyntaxTermRef<'a>>),
+        Unknown,
+    }
+
+    impl SyntaxTermRef<'_> {
+        /// The same term with every borrowed string copied, so it no longer depends on the input.
+        #[must_use]
+        pub fn into_owned(self) -> SyntaxTerm {
+            match self {
+                SyntaxTermRef::Nb => SyntaxTerm::Nb,
+                SyntaxTermRef::Unknown => SyntaxTerm::Unknown,
+                SyntaxTermRef::B(AtomRef::Bool(b)) => SyntaxTerm::B(Atom::Bool(b)),
+                SyntaxTermRef::B(AtomRef::Num(s)) => SyntaxTerm::B(Atom::Num(s.into_owned())),
+                SyntaxTermRef::B(AtomRef::Str(s)) => SyntaxTerm::B(Atom::Str(s.into_owned())),
+                SyntaxTermRef::Bu(fields) => SyntaxTerm::Bu(
+                    fields
+                        .into_iter()
+                        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                        .collect(),
+                ),
+                SyntaxTermRef::Fourth(items) => {
+                    SyntaxTerm::Fourth(items.into_iter().map(SyntaxTermRef::into_owned).collect())
+                }
+            }
+        }
+
+        /// An owned term as a `SyntaxTermRef` (nothing in it borrows).
+        #[must_use]
+        pub fn from_owned(term: SyntaxTerm) -> Self {
+            use std::borrow::Cow::Owned;
+            match term {
+                SyntaxTerm::Nb => SyntaxTermRef::Nb,
+                SyntaxTerm::Unknown => SyntaxTermRef::Unknown,
+                SyntaxTerm::B(Atom::Bool(b)) => SyntaxTermRef::B(AtomRef::Bool(b)),
+                SyntaxTerm::B(Atom::Num(s)) => SyntaxTermRef::B(AtomRef::Num(Owned(s))),
+                SyntaxTerm::B(Atom::Str(s)) => SyntaxTermRef::B(AtomRef::Str(Owned(s))),
+                SyntaxTerm::Bu(fields) => SyntaxTermRef::Bu(
+                    fields
+                        .into_iter()
+                        .map(|(k, v)| (Owned(k), SyntaxTermRef::from_owned(v)))
+                        .collect(),
+                ),
+                SyntaxTerm::Fourth(items) => SyntaxTermRef::Fourth(
+                    items.into_iter().map(SyntaxTermRef::from_owned).collect(),
+                ),
+            }
+        }
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6269,7 +6474,7 @@ pub mod syntax {
 
     pub fn parse_surface(surface: Surface, input: &str) -> Result<SyntaxTerm, SyntaxError> {
         match surface {
-            Surface::Json => JsonParser::new(input, false).parse(),
+            Surface::Json => JsonParser::<Owned>::new(input, false).parse(),
             Surface::Baml => parse_baml(input),
             Surface::Csv => parse_csv(input),
             Surface::Toon => parse_toon(input),
@@ -6277,6 +6482,20 @@ pub mod syntax {
             Surface::Yaml => parse_yaml(input),
             Surface::Turtle => parse_turtle(input),
             Surface::RdfXml => parse_rdfxml(input),
+        }
+    }
+
+    /// [`parse_surface`] into a [`SyntaxTermRef`], which borrows from `input` where it can. JSON and
+    /// YAML parse straight into the borrowing form; the other surfaces are parsed as usual and
+    /// converted, so they work here but save nothing.
+    pub fn parse_surface_ref(
+        surface: Surface,
+        input: &str,
+    ) -> Result<SyntaxTermRef<'_>, SyntaxError> {
+        match surface {
+            Surface::Json => JsonParser::<Borrowed>::new(input, false).parse(),
+            Surface::Yaml => parse_yaml_with::<Borrowed>(input),
+            other => parse_surface(other, input).map(SyntaxTermRef::from_owned),
         }
     }
 
