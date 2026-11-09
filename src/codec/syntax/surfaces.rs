@@ -2,7 +2,7 @@
 //! `Segment`/`BuildNode` path tree the CSV/TOON parsers rebuild through, and the escape/attr
 //! helpers those surfaces share. Entry points are re-exported by [`super`].
 
-use super::{field, Atom, SyntaxError, SyntaxTerm};
+use super::{Atom, AtomRef, SyntaxError, SyntaxTerm, SyntaxTermRef};
 
 pub(super) fn render_json(term: &SyntaxTerm) -> String {
     let mut out = String::new();
@@ -73,6 +73,13 @@ enum BamlWork<'a> {
     Field(&'a str, usize),
 }
 
+/// Two spaces per level of nesting.
+fn push_indent(out: &mut String, depth: usize) {
+    for _ in 0..depth {
+        out.push_str("  ");
+    }
+}
+
 pub(super) fn render_baml_term(term: &SyntaxTerm, depth: usize) -> String {
     let mut out = String::new();
     let mut stack = vec![BamlWork::Term(term, depth)];
@@ -81,12 +88,12 @@ pub(super) fn render_baml_term(term: &SyntaxTerm, depth: usize) -> String {
             BamlWork::Lit(s) => out.push_str(s),
             BamlWork::CloseObject(depth) => {
                 out.push('\n');
-                out.push_str(&"  ".repeat(depth));
+                push_indent(&mut out, depth);
                 out.push('}');
             }
             BamlWork::Field(k, depth) => {
                 out.push('\n');
-                out.push_str(&"  ".repeat(depth));
+                push_indent(&mut out, depth);
                 out.push_str(k);
                 out.push_str(" = ");
             }
@@ -96,7 +103,7 @@ pub(super) fn render_baml_term(term: &SyntaxTerm, depth: usize) -> String {
                 SyntaxTerm::B(Atom::Num(v)) => out.push_str(v),
                 SyntaxTerm::B(Atom::Str(v)) => {
                     out.push('"');
-                    out.push_str(&escape_json(v));
+                    push_escaped_json(&mut out, v);
                     out.push('"');
                 }
                 SyntaxTerm::Bu(fields) => {
@@ -124,96 +131,135 @@ pub(super) fn render_baml_term(term: &SyntaxTerm, depth: usize) -> String {
 }
 
 pub(super) fn render_toon(term: &SyntaxTerm) -> String {
-    let mut lines = Vec::new();
-    flatten_toon("$", term, &mut lines);
-    lines.join("\n") + "\n"
+    let mut out = String::new();
+    walk_paths(term, false, |path, node| match node {
+        // A container has no line of its own; its leaves carry the path.
+        SyntaxTerm::Bu(_) | SyntaxTerm::Fourth(_) => {}
+        scalar => {
+            out.push_str(path);
+            out.push_str(" = ");
+            push_scalar_lit(&mut out, scalar);
+            out.push('\n');
+        }
+    });
+    if out.is_empty() {
+        out.push('\n');
+    }
+    out
 }
 
-fn flatten_toon(path: &str, term: &SyntaxTerm, out: &mut Vec<String>) {
-    let mut stack = vec![(path.to_string(), term)];
-    while let Some((path, term)) = stack.pop() {
-        match term {
+/// One step from a node's parent to the node, for [`walk_paths`].
+enum PathSeg<'a> {
+    Root,
+    Key(&'a str),
+    Index(usize),
+}
+
+/// Visit every node of `root` in document order with its path (`$`, `a.b`, `a[0].c`, ...). One path
+/// buffer is extended and truncated as the walk goes, so no path `String` is built per node. The
+/// walk uses an explicit stack, not recursion, because a term can be arbitrarily deep.
+///
+/// Two quirks of the path syntax are kept exactly: a child of a node whose path is the text `$`
+/// drops the `$` (`a`, not `$.a`), and `bare_root_index` makes a list at that path give `[0]`
+/// rather than `$[0]` (CSV does; TOON does not).
+fn walk_paths<'a>(
+    root: &'a SyntaxTerm,
+    bare_root_index: bool,
+    mut visit: impl FnMut(&str, &'a SyntaxTerm),
+) {
+    use std::fmt::Write as _;
+    // The current path is `buf[start..]`; `start` moves past a dropped `$` and back again.
+    let mut buf = String::from("$");
+    let mut stack = vec![(root, 1usize, 0usize, PathSeg::Root)];
+    while let Some((node, parent_end, parent_start, seg)) = stack.pop() {
+        buf.truncate(parent_end);
+        let mut start = parent_start;
+        match seg {
+            PathSeg::Root => {}
+            PathSeg::Key(k) => {
+                if &buf[start..] == "$" {
+                    start = buf.len();
+                } else {
+                    buf.push('.');
+                }
+                buf.push_str(k);
+            }
+            PathSeg::Index(i) => {
+                if bare_root_index && &buf[start..] == "$" {
+                    start = buf.len();
+                }
+                let _ = write!(buf, "[{i}]");
+            }
+        }
+        visit(&buf[start..], node);
+        let end = buf.len();
+        match node {
             SyntaxTerm::Bu(fields) => {
                 for (k, v) in fields.iter().rev() {
-                    let next = if path == "$" {
-                        k.clone()
-                    } else {
-                        format!("{path}.{k}")
-                    };
-                    stack.push((next, v));
+                    stack.push((v, end, start, PathSeg::Key(k)));
                 }
             }
             SyntaxTerm::Fourth(items) => {
-                for (idx, v) in items.iter().enumerate().rev() {
-                    stack.push((format!("{path}[{idx}]"), v));
+                for (i, v) in items.iter().enumerate().rev() {
+                    stack.push((v, end, start, PathSeg::Index(i)));
                 }
             }
-            _ => out.push(format!("{path} = {}", scalar_lit(term))),
+            _ => {}
         }
+    }
+}
+
+/// A scalar as TOON writes it after `path = `.
+fn push_scalar_lit(out: &mut String, term: &SyntaxTerm) {
+    match term {
+        SyntaxTerm::Nb | SyntaxTerm::Unknown => out.push_str("nb"),
+        SyntaxTerm::B(Atom::Bool(v)) => out.push_str(if *v { "true" } else { "false" }),
+        SyntaxTerm::B(Atom::Num(v)) => out.push_str(v),
+        SyntaxTerm::B(Atom::Str(v)) => {
+            out.push('"');
+            push_escaped_json(out, v);
+            out.push('"');
+        }
+        SyntaxTerm::Bu(_) | SyntaxTerm::Fourth(_) => write_json(term, out),
     }
 }
 
 pub(super) fn render_csv(term: &SyntaxTerm) -> String {
-    let mut rows = Vec::new();
-    rows.push(csv_row(["path", "kind", "value"]));
-    flatten_csv("$", term, &mut rows);
-    rows.join("\n") + "\n"
+    let mut out = String::from("path,kind,value\n");
+    walk_paths(term, true, |path, node| {
+        let (kind, value): (&str, &str) = match node {
+            SyntaxTerm::Nb => ("nb", ""),
+            SyntaxTerm::Unknown => ("unknown", ""),
+            SyntaxTerm::B(Atom::Bool(v)) => ("bool", if *v { "true" } else { "false" }),
+            SyntaxTerm::B(Atom::Num(v)) => ("num", v.as_str()),
+            SyntaxTerm::B(Atom::Str(v)) => ("str", v.as_str()),
+            SyntaxTerm::Bu(_) => ("bu", ""),
+            SyntaxTerm::Fourth(_) => ("fourth", ""),
+        };
+        push_csv_field(&mut out, path);
+        out.push(',');
+        out.push_str(kind);
+        out.push(',');
+        push_csv_field(&mut out, value);
+        out.push('\n');
+    });
+    out
 }
 
-fn flatten_csv(path: &str, term: &SyntaxTerm, out: &mut Vec<String>) {
-    let mut stack = vec![(path.to_string(), term)];
-    while let Some((path, term)) = stack.pop() {
-        let path = path.as_str();
-        match term {
-            SyntaxTerm::Nb => out.push(csv_row([path, "nb", ""])),
-            SyntaxTerm::Unknown => out.push(csv_row([path, "unknown", ""])),
-            SyntaxTerm::B(Atom::Bool(v)) => {
-                out.push(csv_row([path, "bool", if *v { "true" } else { "false" }]));
-            }
-            SyntaxTerm::B(Atom::Num(v)) => out.push(csv_row([path, "num", v.as_str()])),
-            SyntaxTerm::B(Atom::Str(v)) => out.push(csv_row([path, "str", v.as_str()])),
-            SyntaxTerm::Bu(fields) => {
-                out.push(csv_row([path, "bu", ""]));
-                for (k, v) in fields.iter().rev() {
-                    let next = if path == "$" {
-                        k.clone()
-                    } else {
-                        format!("{path}.{k}")
-                    };
-                    stack.push((next, v));
-                }
-            }
-            SyntaxTerm::Fourth(items) => {
-                out.push(csv_row([path, "fourth", ""]));
-                for (idx, v) in items.iter().enumerate().rev() {
-                    let next = if path == "$" {
-                        format!("[{idx}]")
-                    } else {
-                        format!("{path}[{idx}]")
-                    };
-                    stack.push((next, v));
-                }
-            }
-        }
-    }
-}
-
-fn csv_row<I, S>(cols: I) -> String
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    cols.into_iter()
-        .map(|s| csv_escape(s.as_ref()))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-fn csv_escape(s: &str) -> String {
+/// One CSV column: quoted, with embedded quotes doubled, only if it contains a comma, quote or
+/// line break.
+fn push_csv_field(out: &mut String, s: &str) {
     if s.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", s.replace('"', "\"\""))
+        out.push('"');
+        for c in s.chars() {
+            if c == '"' {
+                out.push('"');
+            }
+            out.push(c);
+        }
+        out.push('"');
     } else {
-        s.to_string()
+        out.push_str(s);
     }
 }
 
@@ -229,8 +275,10 @@ pub(super) fn parse_csv(input: &str) -> Result<SyntaxTerm, SyntaxError> {
     }
     let mut root = BuildNode::Empty;
     let mut fillers = filler_budget(input);
+    let mut cols: Vec<std::borrow::Cow<'_, str>> = Vec::with_capacity(3);
     for row in rows {
-        let cols = parse_csv_row(row)?;
+        cols.clear();
+        csv_columns(row, &mut cols)?;
         if cols.len() != 3 {
             return Err(SyntaxError::new("csv row must have exactly 3 columns"));
         }
@@ -254,6 +302,20 @@ pub(super) fn parse_csv(input: &str) -> Result<SyntaxTerm, SyntaxError> {
         insert_csv_node(&mut root, path, term, &mut fillers)?;
     }
     Ok(root.finish())
+}
+
+/// The columns of one row, borrowed from it when it has no quote character (no unescaping is
+/// possible then, so each column is just a slice between commas) and owned otherwise.
+fn csv_columns<'r>(
+    row: &'r str,
+    out: &mut Vec<std::borrow::Cow<'r, str>>,
+) -> Result<(), SyntaxError> {
+    if row.contains('"') {
+        out.extend(parse_csv_row(row)?.into_iter().map(std::borrow::Cow::Owned));
+    } else {
+        out.extend(row.split(',').map(std::borrow::Cow::Borrowed));
+    }
+    Ok(())
 }
 
 fn parse_csv_row(row: &str) -> Result<Vec<String>, SyntaxError> {
@@ -303,16 +365,6 @@ fn insert_csv_node(
     root.insert(&segs, term, fillers)
 }
 
-fn scalar_lit(term: &SyntaxTerm) -> String {
-    match term {
-        SyntaxTerm::Nb | SyntaxTerm::Unknown => "nb".into(),
-        SyntaxTerm::B(Atom::Bool(v)) => v.to_string(),
-        SyntaxTerm::B(Atom::Num(v)) => v.clone(),
-        SyntaxTerm::B(Atom::Str(v)) => format!("\"{}\"", escape_json(v)),
-        SyntaxTerm::Bu(_) | SyntaxTerm::Fourth(_) => render_json(term),
-    }
-}
-
 pub(super) fn render_poml(term: &SyntaxTerm) -> String {
     format!("<poml>{}</poml>\n", render_poml_node(term))
 }
@@ -333,7 +385,7 @@ fn render_poml_node(term: &SyntaxTerm) -> String {
             PomlWork::Lit(s) => out.push_str(s),
             PomlWork::FieldOpen(k) => {
                 out.push_str("<field name=\"");
-                out.push_str(&escape_xml(k));
+                push_escaped_xml(&mut out, k);
                 out.push_str("\">");
             }
             PomlWork::Term(term) => match term {
@@ -342,10 +394,14 @@ fn render_poml_node(term: &SyntaxTerm) -> String {
                     let _ = write!(out, "<b kind=\"bool\">{v}</b>");
                 }
                 SyntaxTerm::B(Atom::Num(v)) => {
-                    let _ = write!(out, "<b kind=\"num\">{}</b>", escape_xml(v));
+                    out.push_str("<b kind=\"num\">");
+                    push_escaped_xml(&mut out, v);
+                    out.push_str("</b>");
                 }
                 SyntaxTerm::B(Atom::Str(v)) => {
-                    let _ = write!(out, "<b kind=\"str\">{}</b>", escape_xml(v));
+                    out.push_str("<b kind=\"str\">");
+                    push_escaped_xml(&mut out, v);
+                    out.push_str("</b>");
                 }
                 SyntaxTerm::Bu(fields) => {
                     out.push_str("<bu>");
@@ -374,12 +430,13 @@ fn render_poml_node(term: &SyntaxTerm) -> String {
 pub(super) fn parse_baml(input: &str) -> Result<SyntaxTerm, SyntaxError> {
     let trimmed = input.trim();
     let body = trimmed.strip_prefix("baml").unwrap_or(trimmed).trim();
-    JsonParser::new(body, true).parse()
+    JsonParser::<Owned>::new(body, true).parse()
 }
 
 pub(super) fn parse_toon(input: &str) -> Result<SyntaxTerm, SyntaxError> {
     let mut root = BuildNode::Obj(Vec::new());
     let mut fillers = filler_budget(input);
+    let mut segs: Vec<Segment<'_>> = Vec::new();
     for line in input.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -388,8 +445,8 @@ pub(super) fn parse_toon(input: &str) -> Result<SyntaxTerm, SyntaxError> {
         let (path, value) = line
             .split_once('=')
             .ok_or_else(|| SyntaxError::new(format!("bad TOON line: {line}")))?;
-        let segs = parse_path(path.trim())?;
-        let term = JsonParser::new(value.trim(), true).parse()?;
+        parse_path_into(path.trim(), &mut segs)?;
+        let term = JsonParser::<Owned>::new(value.trim(), true).parse()?;
         root.insert(&segs, term, &mut fillers)?;
     }
     Ok(root.finish())
@@ -401,10 +458,22 @@ pub(super) fn parse_poml(input: &str) -> Result<SyntaxTerm, SyntaxError> {
         .strip_prefix("<poml>")
         .and_then(|s| s.strip_suffix("</poml>"))
         .ok_or_else(|| SyntaxError::new("POML must be wrapped in <poml>"))?;
-    parse_poml_node(body.trim(), 0)
+    parse_poml_node(body.trim(), 0, &mut PomlScratch::default())
 }
 
-fn parse_poml_node(input: &str, depth: usize) -> Result<SyntaxTerm, SyntaxError> {
+/// Reusable stacks for the fields and items being built, so each object or list is allocated once
+/// at its final size instead of grown by pushing.
+#[derive(Default)]
+struct PomlScratch {
+    fields: Vec<(String, SyntaxTerm)>,
+    items: Vec<SyntaxTerm>,
+}
+
+fn parse_poml_node(
+    input: &str,
+    depth: usize,
+    scratch: &mut PomlScratch,
+) -> Result<SyntaxTerm, SyntaxError> {
     let input = input.trim();
     if input == "<nb/>" {
         return Ok(SyntaxTerm::Nb);
@@ -416,7 +485,7 @@ fn parse_poml_node(input: &str, depth: usize) -> Result<SyntaxTerm, SyntaxError>
         if depth >= MAX_NESTING_DEPTH {
             return Err(depth_error());
         }
-        let mut fields = Vec::new();
+        let base = scratch.fields.len();
         let mut rest = inner.trim();
         while !rest.is_empty() {
             let tag_end = rest
@@ -429,13 +498,14 @@ fn parse_poml_node(input: &str, depth: usize) -> Result<SyntaxTerm, SyntaxError>
                 .ok_or_else(|| SyntaxError::new("unclosed field"))?
                 + tag_end
                 + 1;
-            fields.push((
-                unescape_xml(&name),
-                parse_poml_node(&rest[tag_end + 1..end], depth + 1)?,
-            ));
+            let field = (
+                unescape_xml(name),
+                parse_poml_node(&rest[tag_end + 1..end], depth + 1, scratch)?,
+            );
+            scratch.fields.push(field);
             rest = rest[end + close.len()..].trim();
         }
-        return Ok(SyntaxTerm::Bu(fields));
+        return Ok(SyntaxTerm::Bu(scratch.fields.drain(base..).collect()));
     }
     if let Some(inner) = input
         .strip_prefix("<list>")
@@ -444,7 +514,7 @@ fn parse_poml_node(input: &str, depth: usize) -> Result<SyntaxTerm, SyntaxError>
         if depth >= MAX_NESTING_DEPTH {
             return Err(depth_error());
         }
-        let mut items = Vec::new();
+        let base = scratch.items.len();
         let mut rest = inner.trim();
         while !rest.is_empty() {
             let tag = "<item>";
@@ -454,10 +524,11 @@ fn parse_poml_node(input: &str, depth: usize) -> Result<SyntaxTerm, SyntaxError>
                 .ok_or_else(|| SyntaxError::new("bad list item"))?;
             let end = find_balanced_close(body, tag, close)
                 .ok_or_else(|| SyntaxError::new("unclosed item"))?;
-            items.push(parse_poml_node(&body[..end], depth + 1)?);
+            let item = parse_poml_node(&body[..end], depth + 1, scratch)?;
+            scratch.items.push(item);
             rest = body[end + close.len()..].trim();
         }
-        return Ok(SyntaxTerm::Fourth(items));
+        return Ok(SyntaxTerm::Fourth(scratch.items.drain(base..).collect()));
     }
     if input.starts_with("<b ") {
         let tag_end = input
@@ -469,7 +540,7 @@ fn parse_poml_node(input: &str, depth: usize) -> Result<SyntaxTerm, SyntaxError>
             .strip_suffix("</b>")
             .ok_or_else(|| SyntaxError::new("unclosed scalar"))?;
         let value = unescape_xml(value);
-        return Ok(SyntaxTerm::B(match kind.as_str() {
+        return Ok(SyntaxTerm::B(match kind {
             "bool" => Atom::Bool(value == "true"),
             "num" => Atom::Num(value),
             _ => Atom::Str(value),
@@ -479,8 +550,9 @@ fn parse_poml_node(input: &str, depth: usize) -> Result<SyntaxTerm, SyntaxError>
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Segment {
-    Key(String),
+enum Segment<'a> {
+    /// Borrowed from the path text: the key is copied only if inserting it creates a new field.
+    Key(&'a str),
     Index(usize),
 }
 
@@ -498,7 +570,7 @@ impl BuildNode {
     /// cannot ask for a list of a billion slots.
     fn insert(
         &mut self,
-        segs: &[Segment],
+        segs: &[Segment<'_>],
         value: SyntaxTerm,
         fillers: &mut usize,
     ) -> Result<(), SyntaxError> {
@@ -518,11 +590,11 @@ impl BuildNode {
                 let BuildNode::Obj(fields) = self else {
                     return Err(SyntaxError::new("path crosses non-object"));
                 };
-                let pos = fields.iter().position(|(k, _)| k == key);
+                let pos = fields.iter().position(|(k, _)| k.as_str() == *key);
                 let idx = if let Some(i) = pos {
                     i
                 } else {
-                    fields.push((key.clone(), BuildNode::Empty));
+                    fields.push(((*key).to_owned(), BuildNode::Empty));
                     fields.len() - 1
                 };
                 fields[idx].1.insert(&segs[1..], value, fillers)
@@ -565,48 +637,74 @@ fn filler_budget(input: &str) -> usize {
     (input.lines().count() + 1).saturating_mul(MAX_NESTING_DEPTH)
 }
 
-fn parse_path(path: &str) -> Result<Vec<Segment>, SyntaxError> {
-    if path == "$" {
-        return Ok(Vec::new());
-    }
+fn parse_path(path: &str) -> Result<Vec<Segment<'_>>, SyntaxError> {
     let mut segs = Vec::new();
-    for part in path.split('.') {
+    parse_path_into(path, &mut segs)?;
+    Ok(segs)
+}
+
+/// First index of `b` in `s`. Paths are a few bytes long, where a plain loop beats the general
+/// character searcher's setup cost.
+#[inline]
+fn find_byte(s: &[u8], b: u8) -> Option<usize> {
+    s.iter().position(|&x| x == b)
+}
+
+/// [`parse_path`] into a caller-owned buffer (cleared first), so a parser that reads one path per
+/// line can reuse a single allocation. The buffer keeps the segments borrowed from `path`.
+fn parse_path_into<'p>(path: &'p str, segs: &mut Vec<Segment<'p>>) -> Result<(), SyntaxError> {
+    segs.clear();
+    if path == "$" {
+        return Ok(());
+    }
+    let bytes = path.as_bytes();
+    let mut start = 0;
+    loop {
+        // One `.`-separated part (empty parts are skipped, as `split('.')` yielded them).
+        let end = find_byte(&bytes[start..], b'.').map_or(bytes.len(), |i| start + i);
+        let part = &path[start..end];
         if segs.len() > MAX_NESTING_DEPTH {
             return Err(depth_error());
         }
         let mut rem = part;
-        if let Some(key_end) = rem.find('[') {
+        let mut keyed_only = false;
+        if let Some(key_end) = find_byte(rem.as_bytes(), b'[') {
             if key_end > 0 {
-                segs.push(Segment::Key(rem[..key_end].to_string()));
+                segs.push(Segment::Key(&rem[..key_end]));
             }
             rem = &rem[key_end..];
         } else if !rem.is_empty() {
-            segs.push(Segment::Key(rem.to_string()));
-            continue;
+            segs.push(Segment::Key(rem));
+            keyed_only = true;
         }
-        while let Some(body) = rem.strip_prefix('[') {
-            let end = body
-                .find(']')
-                .ok_or_else(|| SyntaxError::new("bad index path"))?;
-            segs.push(Segment::Index(
-                body[..end]
-                    .parse()
-                    .map_err(|_| SyntaxError::new("bad index"))?,
-            ));
-            rem = &body[end + 1..];
-            // each segment is a level of the tree built (then finished and dropped) from this path
-            if segs.len() > MAX_NESTING_DEPTH {
-                return Err(depth_error());
+        if !keyed_only {
+            while let Some(body) = rem.strip_prefix('[') {
+                let close = find_byte(body.as_bytes(), b']')
+                    .ok_or_else(|| SyntaxError::new("bad index path"))?;
+                segs.push(Segment::Index(
+                    body[..close]
+                        .parse()
+                        .map_err(|_| SyntaxError::new("bad index"))?,
+                ));
+                rem = &body[close + 1..];
+                // each segment is a level of the tree built (then finished and dropped) from this path
+                if segs.len() > MAX_NESTING_DEPTH {
+                    return Err(depth_error());
+                }
+            }
+            if !rem.is_empty() {
+                return Err(SyntaxError::new("bad path tail"));
             }
         }
-        if !rem.is_empty() {
-            return Err(SyntaxError::new("bad path tail"));
+        if end == bytes.len() {
+            break;
         }
+        start = end + 1;
     }
     if segs.len() > MAX_NESTING_DEPTH {
         return Err(depth_error());
     }
-    Ok(segs)
+    Ok(())
 }
 
 /// How many arrays/objects may be open at once while parsing (`serde_json`'s default). The parsers
@@ -621,27 +719,131 @@ pub(super) fn depth_error() -> SyntaxError {
     ))
 }
 
+/// How a parser builds its result. The JSON and YAML parsers are written once, generic over this,
+/// and instantiated twice: [`Owned`] builds the [`SyntaxTerm`] that `parse_surface` returns, and
+/// [`Borrowed`] builds a [`SyntaxTermRef`] whose text borrows from the input wherever the input
+/// already holds the exact bytes (a string with no escapes, a number, a plain YAML scalar).
+pub(super) trait Build<'a> {
+    /// A key or scalar's text: `String`, or `Cow<'a, str>`.
+    type Text: AsRef<str>;
+    /// The term being built.
+    type Term;
+    /// Text that is a slice of the input.
+    fn borrowed(s: &'a str) -> Self::Text;
+    /// Text that had to be built (unescaped, joined, ...).
+    fn owned(s: String) -> Self::Text;
+    fn nb() -> Self::Term;
+    fn boolean(b: bool) -> Self::Term;
+    fn num(t: Self::Text) -> Self::Term;
+    fn string(t: Self::Text) -> Self::Term;
+    fn object(fields: Vec<(Self::Text, Self::Term)>) -> Self::Term;
+    fn list(items: Vec<Self::Term>) -> Self::Term;
+    /// A subtree some other (owned-only) parser produced, in this builder's term type.
+    fn adopt(term: SyntaxTerm) -> Self::Term;
+}
+
+/// Builds the owned [`SyntaxTerm`].
+pub(super) struct Owned;
+
+impl Build<'_> for Owned {
+    type Text = String;
+    type Term = SyntaxTerm;
+    fn borrowed(s: &str) -> String {
+        s.to_owned()
+    }
+    fn owned(s: String) -> String {
+        s
+    }
+    fn nb() -> SyntaxTerm {
+        SyntaxTerm::Nb
+    }
+    fn boolean(b: bool) -> SyntaxTerm {
+        SyntaxTerm::B(Atom::Bool(b))
+    }
+    fn num(t: String) -> SyntaxTerm {
+        SyntaxTerm::B(Atom::Num(t))
+    }
+    fn string(t: String) -> SyntaxTerm {
+        SyntaxTerm::B(Atom::Str(t))
+    }
+    fn object(fields: Vec<(String, SyntaxTerm)>) -> SyntaxTerm {
+        SyntaxTerm::Bu(fields)
+    }
+    fn list(items: Vec<SyntaxTerm>) -> SyntaxTerm {
+        SyntaxTerm::Fourth(items)
+    }
+    fn adopt(term: SyntaxTerm) -> SyntaxTerm {
+        term
+    }
+}
+
+/// Builds the borrowing [`SyntaxTermRef`].
+pub(super) struct Borrowed;
+
+impl<'a> Build<'a> for Borrowed {
+    type Text = std::borrow::Cow<'a, str>;
+    type Term = SyntaxTermRef<'a>;
+    fn borrowed(s: &'a str) -> Self::Text {
+        std::borrow::Cow::Borrowed(s)
+    }
+    fn owned(s: String) -> Self::Text {
+        std::borrow::Cow::Owned(s)
+    }
+    fn nb() -> Self::Term {
+        SyntaxTermRef::Nb
+    }
+    fn boolean(b: bool) -> Self::Term {
+        SyntaxTermRef::B(AtomRef::Bool(b))
+    }
+    fn num(t: Self::Text) -> Self::Term {
+        SyntaxTermRef::B(AtomRef::Num(t))
+    }
+    fn string(t: Self::Text) -> Self::Term {
+        SyntaxTermRef::B(AtomRef::Str(t))
+    }
+    fn object(fields: Vec<(Self::Text, Self::Term)>) -> Self::Term {
+        SyntaxTermRef::Bu(fields)
+    }
+    fn list(items: Vec<Self::Term>) -> Self::Term {
+        SyntaxTermRef::Fourth(items)
+    }
+    fn adopt(term: SyntaxTerm) -> Self::Term {
+        SyntaxTermRef::from_owned(term)
+    }
+}
+
 /// `loose == false` is the strict RFC 8259 grammar (what [`Surface::Json`](super::Surface::Json)
 /// uses): no control characters in strings, only the escapes the RFC defines, no leading zeros,
 /// no trailing commas, and a repeated object key is an error (the RFC leaves duplicates to the
 /// receiver, and parsers disagree on which one wins; refusing them keeps every reader of the same
 /// bytes on the same document). `loose == true` is the lenient dialect BAML and TOON values use.
-pub(super) struct JsonParser<'a> {
+pub(super) struct JsonParser<'a, B: Build<'a>> {
+    /// The input as text: any slice that starts and ends on an ASCII delimiter is valid UTF-8, so
+    /// strings and numbers are copied out without being validated again.
+    text: &'a str,
     s: &'a [u8],
     pos: usize,
     loose: bool,
     depth: usize,
     max_depth: usize,
+    /// Scratch stacks for the object fields and array items being built. Children are pushed here
+    /// and moved into a `Vec` of exactly the right size when the container closes, so building a
+    /// container is one allocation instead of a push-and-grow sequence of them.
+    fields: Vec<(B::Text, B::Term)>,
+    items: Vec<B::Term>,
 }
 
-impl<'a> JsonParser<'a> {
+impl<'a, B: Build<'a>> JsonParser<'a, B> {
     pub(super) fn new(input: &'a str, loose: bool) -> Self {
         Self {
+            text: input,
             s: input.as_bytes(),
             pos: 0,
             loose,
             depth: 0,
             max_depth: MAX_NESTING_DEPTH,
+            fields: Vec::new(),
+            items: Vec::new(),
         }
     }
 
@@ -660,7 +862,7 @@ impl<'a> JsonParser<'a> {
         Ok(())
     }
 
-    pub(super) fn parse(mut self) -> Result<SyntaxTerm, SyntaxError> {
+    pub(super) fn parse(mut self) -> Result<B::Term, SyntaxError> {
         let v = self.value()?;
         self.ws();
         if self.pos != self.s.len() {
@@ -669,7 +871,7 @@ impl<'a> JsonParser<'a> {
         Ok(v)
     }
 
-    fn value(&mut self) -> Result<SyntaxTerm, SyntaxError> {
+    fn value(&mut self) -> Result<B::Term, SyntaxError> {
         self.ws();
         match self.peek() {
             Some(b'{') => {
@@ -684,28 +886,32 @@ impl<'a> JsonParser<'a> {
                 self.depth -= 1;
                 v
             }
-            Some(b'"') => self.string().map(|s| SyntaxTerm::B(Atom::Str(s))),
-            Some(b'-' | b'0'..=b'9') => Ok(SyntaxTerm::B(Atom::Num(self.number()?))),
+            Some(b'"') => self.string().map(B::string),
+            Some(b'-' | b'0'..=b'9') => Ok(B::num(self.number()?)),
             Some(_) if self.loose => {
                 let word = self.word();
                 Ok(match word.as_str() {
-                    "nb" | "null" => SyntaxTerm::Nb,
-                    "true" => SyntaxTerm::B(Atom::Bool(true)),
-                    "false" => SyntaxTerm::B(Atom::Bool(false)),
-                    _ => SyntaxTerm::B(Atom::Str(word)),
+                    "nb" | "null" => B::nb(),
+                    "true" => B::boolean(true),
+                    "false" => B::boolean(false),
+                    _ => B::string(B::owned(word)),
                 })
             }
-            _ if self.take_lit("null") => Ok(SyntaxTerm::Nb),
-            _ if self.take_lit("true") => Ok(SyntaxTerm::B(Atom::Bool(true))),
-            _ if self.take_lit("false") => Ok(SyntaxTerm::B(Atom::Bool(false))),
+            _ if self.take_lit("null") => Ok(B::nb()),
+            _ if self.take_lit("true") => Ok(B::boolean(true)),
+            _ if self.take_lit("false") => Ok(B::boolean(false)),
             _ => Err(SyntaxError::new("expected value")),
         }
     }
 
-    fn object(&mut self) -> Result<SyntaxTerm, SyntaxError> {
+    fn object(&mut self) -> Result<B::Term, SyntaxError> {
         self.expect(b'{')?;
-        let mut fields = Vec::new();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let base = self.fields.len();
+        // Duplicate detection: a linear scan of the keys so far is fastest for the small objects
+        // that dominate real documents; an object that grows past `LINEAR_KEY_LIMIT` keys switches
+        // to a hash set so a hostile wide object stays linear overall.
+        const LINEAR_KEY_LIMIT: usize = 16;
+        let mut seen: Option<std::collections::HashSet<String>> = None;
         let mut after_comma = false;
         loop {
             self.ws();
@@ -718,7 +924,7 @@ impl<'a> JsonParser<'a> {
             let key = if self.peek() == Some(b'"') {
                 self.string()?
             } else if self.loose {
-                self.word()
+                B::owned(self.word())
             } else {
                 return Err(SyntaxError::new("expected quoted object key"));
             };
@@ -726,11 +932,29 @@ impl<'a> JsonParser<'a> {
             if !(self.take(b':') || (self.loose && self.take(b'='))) {
                 return Err(SyntaxError::new("expected object separator"));
             }
-            if !self.loose && !seen.insert(key.clone()) {
-                return Err(SyntaxError::new(format!("duplicate object key {key:?}")));
+            if !self.loose {
+                let duplicate = if let Some(set) = seen.as_mut() {
+                    !set.insert(key.as_ref().to_owned())
+                } else {
+                    let mine = &self.fields[base..];
+                    let dup = mine.iter().any(|(k, _)| k.as_ref() == key.as_ref());
+                    if !dup && mine.len() + 1 >= LINEAR_KEY_LIMIT {
+                        let mut set: std::collections::HashSet<String> =
+                            mine.iter().map(|(k, _)| k.as_ref().to_owned()).collect();
+                        set.insert(key.as_ref().to_owned());
+                        seen = Some(set);
+                    }
+                    dup
+                };
+                if duplicate {
+                    return Err(SyntaxError::new(format!(
+                        "duplicate object key {:?}",
+                        key.as_ref()
+                    )));
+                }
             }
             let val = self.value()?;
-            fields.push((key, val));
+            self.fields.push((key, val));
             self.ws();
             if self.take(b'}') {
                 break;
@@ -743,12 +967,12 @@ impl<'a> JsonParser<'a> {
                 }
             }
         }
-        Ok(SyntaxTerm::Bu(fields))
+        Ok(B::object(self.fields.drain(base..).collect()))
     }
 
-    fn array(&mut self) -> Result<SyntaxTerm, SyntaxError> {
+    fn array(&mut self) -> Result<B::Term, SyntaxError> {
         self.expect(b'[')?;
-        let mut items = Vec::new();
+        let base = self.items.len();
         let mut after_comma = false;
         loop {
             self.ws();
@@ -758,7 +982,8 @@ impl<'a> JsonParser<'a> {
                 }
                 break;
             }
-            items.push(self.value()?);
+            let item = self.value()?;
+            self.items.push(item);
             self.ws();
             if self.take(b']') {
                 break;
@@ -766,7 +991,7 @@ impl<'a> JsonParser<'a> {
             self.expect(b',')?;
             after_comma = true;
         }
-        Ok(SyntaxTerm::Fourth(items))
+        Ok(B::list(self.items.drain(base..).collect()))
     }
 
     /// A JSON string. Bytes are collected raw (not widened one-at-a-time to `char`, which mangled
@@ -782,13 +1007,32 @@ impl<'a> JsonParser<'a> {
     /// a loader wants. A parser that widened bytes only forced the loader to undo the widening, and
     /// that repair is not idempotent: run it over correct scalars and `Ã©` (the spelling of `é`'s two
     /// UTF-8 bytes) collapses back to one char. One decode, here, is the whole contract.
-    fn string(&mut self) -> Result<String, SyntaxError> {
+    fn string(&mut self) -> Result<B::Text, SyntaxError> {
         self.expect(b'"')?;
-        let mut out: Vec<u8> = Vec::new();
+        // Fast path: scan to the closing quote. With no escape and no rejected control byte, the
+        // string is one slice of the input, copied once and already known to be valid UTF-8.
+        let start = self.pos;
+        let mut i = start;
+        while let Some(&b) = self.s.get(i) {
+            if b == b'"' {
+                self.pos = i + 1;
+                return Ok(B::borrowed(&self.text[start..i]));
+            }
+            if b == b'\\' || (b < 0x20 && !self.loose) {
+                break;
+            }
+            i += 1;
+        }
+        // Slow path (an escape, a control byte, or no closing quote): carry on from where the scan
+        // stopped, with everything scanned so far already in the buffer.
+        let mut out: Vec<u8> = Vec::with_capacity(i - start + 16);
+        out.extend_from_slice(&self.s[start..i]);
+        self.pos = i;
         while let Some(b) = self.next() {
             match b {
                 b'"' => {
                     return String::from_utf8(out)
+                        .map(B::owned)
                         .map_err(|_| SyntaxError::new("bad utf8 in string"))
                 }
                 b'\\' => {
@@ -853,7 +1097,7 @@ impl<'a> JsonParser<'a> {
         Ok(v)
     }
 
-    fn number(&mut self) -> Result<String, SyntaxError> {
+    fn number(&mut self) -> Result<B::Text, SyntaxError> {
         let start = self.pos;
         if self.peek() == Some(b'-') {
             self.pos += 1;
@@ -891,8 +1135,7 @@ impl<'a> JsonParser<'a> {
                 return Err(SyntaxError::new("bad number"));
             }
         }
-        String::from_utf8(self.s[start..self.pos].to_vec())
-            .map_err(|_| SyntaxError::new("bad number"))
+        Ok(B::borrowed(&self.text[start..self.pos]))
     }
 
     fn word(&mut self) -> String {
@@ -950,11 +1193,39 @@ impl<'a> JsonParser<'a> {
     }
 }
 
-fn attr(tag: &str, name: &str) -> Option<String> {
-    let needle = format!("{name}=\"");
-    let start = tag.find(&needle)? + needle.len();
-    let end = tag[start..].find('"')?;
-    Some(tag[start..start + end].to_string())
+/// The value of `name="..."` inside a tag: the first place `name="` occurs, up to the next quote.
+fn attr<'t>(tag: &'t str, name: &str) -> Option<&'t str> {
+    let hay = tag.as_bytes();
+    let name = name.as_bytes();
+    let need = name.len() + 2;
+    let mut i = 0;
+    while i + need <= hay.len() {
+        if hay[i..].starts_with(name)
+            && hay[i + name.len()] == b'='
+            && hay[i + name.len() + 1] == b'"'
+        {
+            let start = i + need;
+            let end = tag[start..].find('"')?;
+            return Some(&tag[start..start + end]);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// First index at or after `from` where `pat` occurs, for a `pat` that starts with `<`. Finds the
+/// `<` with the fast single-character search and checks the rest in place, instead of building a
+/// substring searcher for every call.
+fn find_lt(s: &str, pat: &str, from: usize) -> Option<usize> {
+    let mut at = from;
+    while let Some(i) = s[at..].find('<') {
+        let p = at + i;
+        if s[p..].starts_with(pat) {
+            return Some(p);
+        }
+        at = p + 1;
+    }
+    None
 }
 
 fn find_balanced_close(s: &str, open: &str, close: &str) -> Option<usize> {
@@ -964,17 +1235,17 @@ fn find_balanced_close(s: &str, open: &str, close: &str) -> Option<usize> {
     // it, so the whole scan reads `s` once. (Searching both from `cursor` on every step re-read the
     // far-away match each time: quadratic on `<item>` x N followed by `</item>` x N.) A search that
     // found nothing stays "nothing": `cursor` only moves forward.
-    let mut next_open = s.find(open);
-    let mut next_close = s.find(close);
+    let mut next_open = find_lt(s, open, 0);
+    let mut next_close = find_lt(s, close, 0);
     loop {
         if next_open.is_some_and(|o| o < cursor) {
-            next_open = s[cursor..].find(open).map(|i| cursor + i);
+            next_open = find_lt(s, open, cursor);
         }
         if next_close.is_some_and(|c| c < cursor) {
-            next_close = s[cursor..].find(close).map(|i| cursor + i);
+            next_close = find_lt(s, close, cursor);
         }
         match (next_open, next_close) {
-            (_, Some(c)) if next_open.map_or(true, |o| c < o) => {
+            (_, Some(c)) if next_open.is_none_or(|o| c < o) => {
                 if depth == 0 {
                     return Some(c);
                 }
@@ -991,34 +1262,63 @@ fn find_balanced_close(s: &str, open: &str, close: &str) -> Option<usize> {
 }
 
 fn push_escaped_json(out: &mut String, s: &str) {
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0c}' => out.push_str("\\f"),
-            c => out.push(c),
-        }
+    // Most strings need no escaping at all: one scan, one copy.
+    if !s
+        .bytes()
+        .any(|b| matches!(b, b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 0x08 | 0x0c))
+    {
+        out.push_str(s);
+        return;
     }
+    // Copy each run of characters that need no escape in one go; only the escaped ones are written
+    // individually. All the escaped characters are ASCII, so run boundaries fall on char boundaries.
+    let mut run = 0;
+    for (i, c) in s.char_indices() {
+        let esc = match c {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
+            '\u{08}' => "\\b",
+            '\u{0c}' => "\\f",
+            _ => continue,
+        };
+        out.push_str(&s[run..i]);
+        out.push_str(esc);
+        run = i + 1;
+    }
+    out.push_str(&s[run..]);
 }
 
-fn escape_json(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    push_escaped_json(&mut out, s);
-    out
-}
-
-fn escape_xml(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('"', "&quot;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+/// `s` with `&`, `"`, `<` and `>` replaced by their entities, appended to `out` (one pass; the same
+/// result as replacing them one after another, since `&` is replaced first).
+fn push_escaped_xml(out: &mut String, s: &str) {
+    if !s.bytes().any(|b| matches!(b, b'&' | b'"' | b'<' | b'>')) {
+        out.push_str(s);
+        return;
+    }
+    let mut run = 0;
+    for (i, c) in s.char_indices() {
+        let esc = match c {
+            '&' => "&amp;",
+            '"' => "&quot;",
+            '<' => "&lt;",
+            '>' => "&gt;",
+            _ => continue,
+        };
+        out.push_str(&s[run..i]);
+        out.push_str(esc);
+        run = i + 1;
+    }
+    out.push_str(&s[run..]);
 }
 
 fn unescape_xml(s: &str) -> String {
+    // No `&` means no entity: one copy instead of four replace passes (the common case).
+    if !s.contains('&') {
+        return s.to_owned();
+    }
     s.replace("&quot;", "\"")
         .replace("&lt;", "<")
         .replace("&gt;", ">")

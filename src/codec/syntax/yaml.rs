@@ -2,7 +2,7 @@
 //! sub-parser, the renderer, and their scalar quote/unquote/chomp helpers. The honest scope is
 //! stated in the header below.
 
-use super::surfaces::{depth_error, MAX_NESTING_DEPTH};
+use super::surfaces::{depth_error, Build, Owned, MAX_NESTING_DEPTH};
 use super::{Atom, SyntaxError, SyntaxTerm};
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -23,15 +23,23 @@ use super::{Atom, SyntaxError, SyntaxTerm};
 // ════════════════════════════════════════════════════════════════════════════
 
 pub fn parse_yaml(input: &str) -> Result<SyntaxTerm, SyntaxError> {
-    let lines: Vec<&str> = input.lines().collect();
-    let mut p = YamlParser {
+    parse_yaml_with::<Owned>(input)
+}
+
+/// The block parser behind [`parse_yaml`], generic over what it builds: an owned [`SyntaxTerm`], or
+/// a [`SyntaxTermRef`](super::SyntaxTermRef) that borrows plain scalars and unquoted keys from `input`.
+pub(super) fn parse_yaml_with<'a, B: Build<'a>>(input: &'a str) -> Result<B::Term, SyntaxError> {
+    let lines: Vec<&'a str> = input.lines().collect();
+    let mut p = YamlParser::<B> {
         lines,
         pos: 0,
         depth: 0,
+        fields: Vec::new(),
+        items: Vec::new(),
     };
     match p.peek_indent() {
         Some(indent) => p.parse_block(indent),
-        None => Ok(SyntaxTerm::Nb),
+        None => Ok(B::nb()),
     }
 }
 
@@ -40,6 +48,23 @@ fn line_indent(line: &str) -> usize {
 }
 
 fn is_yaml_noise(line: &str) -> bool {
+    // Fast path for the overwhelmingly common case: the first byte after any spaces/tabs is an
+    // ordinary ASCII character that cannot start a blank, a comment or a `---`/`...` marker. The
+    // Unicode-aware `trim` below handles everything else.
+    let b = line.as_bytes();
+    let mut i = 0;
+    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+        i += 1;
+    }
+    if let Some(&c) = b.get(i) {
+        if c.is_ascii_graphic() && c != b'#' {
+            // `-` and `.` only matter as the start of a `---` / `...` marker.
+            let marker = (c == b'-' || c == b'.') && b.get(i + 1) == Some(&c);
+            if !marker {
+                return false;
+            }
+        }
+    }
     let t = line.trim();
     t.is_empty() || t.starts_with('#') || t == "---" || t == "..."
 }
@@ -93,34 +118,49 @@ fn strip_unquoted_comment(s: &str) -> &str {
 }
 
 fn looks_numeric(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars().enumerate().all(|(i, c)| {
+    // Bytes, not chars: any non-ASCII byte fails the character test below, so the answer is the
+    // same, and the index of an accepted byte is its index as a character.
+    let b = s.as_bytes();
+    !b.is_empty()
+        && b.iter().enumerate().all(|(i, &c)| {
             c.is_ascii_digit()
-                || c == '.'
-                || (i == 0 && (c == '-' || c == '+'))
-                || c == 'e'
-                || c == 'E'
+                || c == b'.'
+                || (i == 0 && (c == b'-' || c == b'+'))
+                || c == b'e'
+                || c == b'E'
         })
-        && s.chars().any(|c| c.is_ascii_digit())
+        && b.iter().any(u8::is_ascii_digit)
 }
 
-fn scalar_from_plain(s: &str) -> SyntaxTerm {
+fn scalar_from_plain<'a, B: Build<'a>>(s: &'a str) -> B::Term {
     match s {
-        "" | "~" | "null" | "Null" | "NULL" => SyntaxTerm::Nb,
-        "true" | "True" | "TRUE" => SyntaxTerm::B(Atom::Bool(true)),
-        "false" | "False" | "FALSE" => SyntaxTerm::B(Atom::Bool(false)),
-        _ if looks_numeric(s) => SyntaxTerm::B(Atom::Num(s.to_string())),
-        _ => SyntaxTerm::B(Atom::Str(s.to_string())),
+        "" | "~" | "null" | "Null" | "NULL" => B::nb(),
+        "true" | "True" | "TRUE" => B::boolean(true),
+        "false" | "False" | "FALSE" => B::boolean(false),
+        _ if looks_numeric(s) => B::num(B::borrowed(s)),
+        _ => B::string(B::borrowed(s)),
     }
 }
 
-fn unquote_scalar(s: &str) -> String {
+/// A key or quoted scalar's text: the input slice itself when unquoting changes nothing (no quotes,
+/// or quotes around text with no escape), built otherwise.
+fn unquote_text<'a, B: Build<'a>>(s: &'a str) -> B::Text {
     if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
-        unescape_double(&s[1..s.len() - 1])
+        let inner = &s[1..s.len() - 1];
+        if inner.contains('\\') {
+            B::owned(unescape_double(inner))
+        } else {
+            B::borrowed(inner)
+        }
     } else if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') {
-        s[1..s.len() - 1].replace("''", "'")
+        let inner = &s[1..s.len() - 1];
+        if inner.contains("''") {
+            B::owned(inner.replace("''", "'"))
+        } else {
+            B::borrowed(inner)
+        }
     } else {
-        s.to_string()
+        B::borrowed(s)
     }
 }
 
@@ -152,14 +192,18 @@ enum Chomp {
     Keep,
 }
 
-struct YamlParser<'a> {
+struct YamlParser<'a, B: Build<'a>> {
     lines: Vec<&'a str>,
     pos: usize,
     /// Open block collections; bounded by [`MAX_NESTING_DEPTH`] (the parser recurses per level).
     depth: usize,
+    /// Scratch stacks for the mapping fields and sequence items being built, so each collection
+    /// is allocated once at its final size instead of grown by pushing.
+    fields: Vec<(B::Text, B::Term)>,
+    items: Vec<B::Term>,
 }
 
-impl YamlParser<'_> {
+impl<'a, B: Build<'a>> YamlParser<'a, B> {
     fn skip_noise(&mut self) {
         while self.pos < self.lines.len() && is_yaml_noise(self.lines[self.pos]) {
             self.pos += 1;
@@ -195,7 +239,7 @@ impl YamlParser<'_> {
 
     /// Parse whatever sits at exactly `indent`: a sequence, a mapping, or (rare at block level)
     /// a lone scalar/flow value.
-    fn parse_block(&mut self, indent: usize) -> Result<SyntaxTerm, SyntaxError> {
+    fn parse_block(&mut self, indent: usize) -> Result<B::Term, SyntaxError> {
         if self.depth >= MAX_NESTING_DEPTH {
             return Err(depth_error());
         }
@@ -205,12 +249,12 @@ impl YamlParser<'_> {
         term
     }
 
-    fn parse_block_at(&mut self, indent: usize) -> Result<SyntaxTerm, SyntaxError> {
+    fn parse_block_at(&mut self, indent: usize) -> Result<B::Term, SyntaxError> {
         let Some(cur) = self.peek_indent() else {
-            return Ok(SyntaxTerm::Nb);
+            return Ok(B::nb());
         };
         if cur != indent {
-            return Ok(SyntaxTerm::Nb);
+            return Ok(B::nb());
         }
         let line = self.lines[self.pos];
         let content = &line[indent..];
@@ -224,8 +268,8 @@ impl YamlParser<'_> {
         }
     }
 
-    fn parse_sequence(&mut self, indent: usize) -> Result<SyntaxTerm, SyntaxError> {
-        let mut items = Vec::new();
+    fn parse_sequence(&mut self, indent: usize) -> Result<B::Term, SyntaxError> {
+        let base = self.items.len();
         while let Some(cur) = self.peek_indent() {
             if cur != indent {
                 break;
@@ -241,22 +285,24 @@ impl YamlParser<'_> {
                     .peek_indent()
                     .filter(|&d| d > indent)
                     .unwrap_or(indent + 2);
-                items.push(self.parse_block(next)?);
+                let item = self.parse_block(next)?;
+                self.items.push(item);
                 continue;
             }
             let rest = content[1..].trim_start();
             let dash_col = indent + (content.len() - rest.len());
-            if Self::looks_like_mapping_line(rest) {
-                items.push(self.parse_mapping_from_first_line(rest, dash_col)?);
+            let item = if Self::looks_like_mapping_line(rest) {
+                self.parse_mapping_from_first_line(rest, dash_col)?
             } else {
-                items.push(self.parse_inline_value(rest, dash_col)?);
-            }
+                self.parse_inline_value(rest, dash_col)?
+            };
+            self.items.push(item);
         }
-        Ok(SyntaxTerm::Fourth(items))
+        Ok(B::list(self.items.drain(base..).collect()))
     }
 
-    fn parse_mapping(&mut self, indent: usize) -> Result<SyntaxTerm, SyntaxError> {
-        let mut fields = Vec::new();
+    fn parse_mapping(&mut self, indent: usize) -> Result<B::Term, SyntaxError> {
+        let base = self.fields.len();
         while let Some(cur) = self.peek_indent() {
             if cur != indent {
                 break;
@@ -266,9 +312,10 @@ impl YamlParser<'_> {
                 break;
             }
             self.pos += 1;
-            fields.push(self.parse_key_value(content, indent)?);
+            let field = self.parse_key_value(content, indent)?;
+            self.fields.push(field);
         }
-        Ok(SyntaxTerm::Bu(fields))
+        Ok(B::object(self.fields.drain(base..).collect()))
     }
 
     /// A mapping whose FIRST key:value pair already sat on a `- ` sequence-item line (the
@@ -276,10 +323,12 @@ impl YamlParser<'_> {
     /// appear on later lines at `indent` (the column right after the dash).
     fn parse_mapping_from_first_line(
         &mut self,
-        first: &str,
+        first: &'a str,
         indent: usize,
-    ) -> Result<SyntaxTerm, SyntaxError> {
-        let mut fields = vec![self.parse_key_value(first, indent)?];
+    ) -> Result<B::Term, SyntaxError> {
+        let base = self.fields.len();
+        let first_field = self.parse_key_value(first, indent)?;
+        self.fields.push(first_field);
         while let Some(cur) = self.peek_indent() {
             if cur != indent {
                 break;
@@ -292,9 +341,10 @@ impl YamlParser<'_> {
                 break;
             }
             self.pos += 1;
-            fields.push(self.parse_key_value(content, indent)?);
+            let field = self.parse_key_value(content, indent)?;
+            self.fields.push(field);
         }
-        Ok(SyntaxTerm::Bu(fields))
+        Ok(B::object(self.fields.drain(base..).collect()))
     }
 
     /// `content` is one `key: value` (or bare `key:`) line's text, already past its indent;
@@ -302,12 +352,12 @@ impl YamlParser<'_> {
     /// the next line.
     fn parse_key_value(
         &mut self,
-        content: &str,
+        content: &'a str,
         key_indent: usize,
-    ) -> Result<(String, SyntaxTerm), SyntaxError> {
+    ) -> Result<(B::Text, B::Term), SyntaxError> {
         let colon =
             find_key_colon(content).ok_or_else(|| SyntaxError::new("expected 'key: value'"))?;
-        let key = unquote_scalar(content[..colon].trim());
+        let key = unquote_text::<B>(content[..colon].trim());
         let rest = content[colon + 1..].trim_start();
         if rest.is_empty() {
             let value = match self.peek_indent() {
@@ -315,7 +365,7 @@ impl YamlParser<'_> {
                 Some(next) if next == key_indent && self.is_sequence_line_at(next) => {
                     self.parse_block(next)?
                 }
-                _ => SyntaxTerm::Nb,
+                _ => B::nb(),
             };
             Ok((key, value))
         } else {
@@ -327,12 +377,12 @@ impl YamlParser<'_> {
     /// collection, a quoted scalar, or a plain scalar (with its trailing `# comment` stripped).
     fn parse_inline_value(
         &mut self,
-        s: &str,
+        s: &'a str,
         key_indent: usize,
-    ) -> Result<SyntaxTerm, SyntaxError> {
+    ) -> Result<B::Term, SyntaxError> {
         let s = s.trim();
         if s.is_empty() {
-            return Ok(SyntaxTerm::Nb);
+            return Ok(B::nb());
         }
         if let Some(rest) = s.strip_prefix('|').or_else(|| s.strip_prefix('>')) {
             let folded = s.starts_with('>');
@@ -343,20 +393,17 @@ impl YamlParser<'_> {
             } else {
                 Chomp::Clip
             };
-            return Ok(SyntaxTerm::B(Atom::Str(
+            return Ok(B::string(B::owned(
                 self.parse_block_scalar(key_indent, folded, chomp),
             )));
         }
         if s.starts_with('[') || s.starts_with('{') {
-            return parse_yaml_flow(s);
+            return Ok(B::adopt(parse_yaml_flow(s)?));
         }
-        if s.starts_with('"') {
-            return Ok(SyntaxTerm::B(Atom::Str(unquote_scalar(s))));
+        if s.starts_with('"') || s.starts_with('\'') {
+            return Ok(B::string(unquote_text::<B>(s)));
         }
-        if s.starts_with('\'') {
-            return Ok(SyntaxTerm::B(Atom::Str(unquote_scalar(s))));
-        }
-        Ok(scalar_from_plain(strip_unquoted_comment(s).trim()))
+        Ok(scalar_from_plain::<B>(strip_unquoted_comment(s).trim()))
     }
 
     /// Consume every subsequent line indented MORE than `key_indent` as this block scalar's
@@ -379,7 +426,9 @@ impl YamlParser<'_> {
                 break;
             }
             let bi = *block_indent.get_or_insert(ind);
-            raw.push(if line.len() >= bi { &line[bi..] } else { "" });
+            // `get`, not an index: a line indented less than the block's margin can have a
+            // multi-byte character where `bi` falls, and slicing inside it panics.
+            raw.push(line.get(bi..).unwrap_or(""));
             self.pos += 1;
         }
         while raw.last() == Some(&"") {
@@ -454,7 +503,7 @@ impl FlowParser<'_> {
             }
             Some(b'"') => Ok(SyntaxTerm::B(Atom::Str(self.quoted(b'"')?))),
             Some(b'\'') => Ok(SyntaxTerm::B(Atom::Str(self.quoted(b'\'')?))),
-            _ => Ok(scalar_from_plain(self.plain_until(b",]}").trim())),
+            _ => Ok(scalar_from_plain::<Owned>(self.plain_until(b",]}").trim())),
         }
     }
     fn seq(&mut self) -> Result<SyntaxTerm, SyntaxError> {
@@ -558,70 +607,84 @@ impl FlowParser<'_> {
 /// Render a `SyntaxTerm` back to block-style YAML — mainly for round-trip testing; the parser
 /// above is this module's real purpose (ingesting real rule files), not YAML generation.
 pub(super) fn render_yaml(term: &SyntaxTerm, indent: usize) -> String {
-    use std::fmt::Write as _;
-    let pad = " ".repeat(indent);
+    let mut out = String::new();
+    write_yaml(term, indent, &mut out);
+    out
+}
+
+fn push_spaces(out: &mut String, n: usize) {
+    for _ in 0..n {
+        out.push(' ');
+    }
+}
+
+/// Appends the YAML for `term` at `indent` to `out`. (An empty mapping or sequence after `key: `
+/// writes nothing, as it always has, so the next line continues on the same line.)
+fn write_yaml(term: &SyntaxTerm, indent: usize, out: &mut String) {
     match term {
-        SyntaxTerm::Nb | SyntaxTerm::Unknown => "null\n".to_string(),
-        SyntaxTerm::B(Atom::Bool(b)) => format!("{b}\n"),
-        SyntaxTerm::B(Atom::Num(n)) => format!("{n}\n"),
-        SyntaxTerm::B(Atom::Str(s)) => format!("{}\n", render_yaml_scalar(s)),
+        SyntaxTerm::Nb | SyntaxTerm::Unknown => out.push_str("null\n"),
+        SyntaxTerm::B(Atom::Bool(b)) => out.push_str(if *b { "true\n" } else { "false\n" }),
+        SyntaxTerm::B(Atom::Num(n)) => {
+            out.push_str(n);
+            out.push('\n');
+        }
+        SyntaxTerm::B(Atom::Str(s)) => {
+            push_yaml_scalar(out, s);
+            out.push('\n');
+        }
         SyntaxTerm::Bu(fields) => {
-            let mut out = String::new();
             for (k, v) in fields {
+                push_spaces(out, indent);
+                out.push_str(k);
                 match v {
                     SyntaxTerm::Bu(f) if !f.is_empty() => {
-                        writeln!(out, "{pad}{k}:").unwrap();
-                        out.push_str(&render_yaml(v, indent + 2));
+                        out.push_str(":\n");
+                        write_yaml(v, indent + 2, out);
                     }
                     SyntaxTerm::Fourth(items) if !items.is_empty() => {
-                        writeln!(out, "{pad}{k}:").unwrap();
-                        out.push_str(&render_yaml(v, indent));
+                        out.push_str(":\n");
+                        write_yaml(v, indent, out);
                     }
                     _ => {
-                        write!(out, "{pad}{k}: ").unwrap();
-                        out.push_str(&render_yaml(v, indent + 2));
+                        out.push_str(": ");
+                        write_yaml(v, indent + 2, out);
                     }
                 }
             }
-            out
         }
         SyntaxTerm::Fourth(items) => {
-            let mut out = String::new();
             for item in items {
                 match item {
                     SyntaxTerm::Bu(fields) if !fields.is_empty() => {
-                        let mut first = true;
-                        for (k, v) in fields {
-                            let marker = if first {
-                                format!("{pad}- ")
-                            } else {
-                                format!("{pad}  ")
-                            };
-                            first = false;
+                        for (i, (k, v)) in fields.iter().enumerate() {
+                            push_spaces(out, indent);
+                            out.push_str(if i == 0 { "- " } else { "  " });
+                            out.push_str(k);
                             match v {
                                 SyntaxTerm::Bu(f) if !f.is_empty() => {
-                                    writeln!(out, "{marker}{k}:").unwrap();
-                                    out.push_str(&render_yaml(v, indent + 4));
+                                    out.push_str(":\n");
+                                    write_yaml(v, indent + 4, out);
                                 }
                                 _ => {
-                                    write!(out, "{marker}{k}: ").unwrap();
-                                    out.push_str(&render_yaml(v, indent + 4));
+                                    out.push_str(": ");
+                                    write_yaml(v, indent + 4, out);
                                 }
                             }
                         }
                     }
                     _ => {
-                        write!(out, "{pad}- ").unwrap();
-                        out.push_str(&render_yaml(item, indent + 2));
+                        push_spaces(out, indent);
+                        out.push_str("- ");
+                        write_yaml(item, indent + 2, out);
                     }
                 }
             }
-            out
         }
     }
 }
 
-fn render_yaml_scalar(s: &str) -> String {
+/// A string scalar: bare when that reads back as the same string, single-quoted otherwise.
+fn push_yaml_scalar(out: &mut String, s: &str) {
     if s.is_empty()
         || s.contains(':')
         || s.contains('#')
@@ -630,8 +693,15 @@ fn render_yaml_scalar(s: &str) -> String {
         || s == "null"
         || looks_numeric(s)
     {
-        format!("'{}'", s.replace('\'', "''"))
+        out.push('\'');
+        for c in s.chars() {
+            if c == '\'' {
+                out.push('\'');
+            }
+            out.push(c);
+        }
+        out.push('\'');
     } else {
-        s.to_string()
+        out.push_str(s);
     }
 }

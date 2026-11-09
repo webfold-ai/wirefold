@@ -91,7 +91,7 @@ impl<'a> TurtleParser<'a> {
             Err(SyntaxError::new(format!(
                 "expected `{}`, found `{}`",
                 c as char,
-                self.peek().map(|b| b as char).unwrap_or('?')
+                self.peek().map_or('?', |b| b as char)
             )))
         }
     }
@@ -237,7 +237,7 @@ impl<'a> TurtleParser<'a> {
             Some(b'"') => {
                 // string literal: `"..."` optionally followed by `^^<type>` or `@lang`
                 let s = self.read_string()?;
-                let mut full = format!("\"{}\"", s);
+                let mut full = format!("\"{s}\"");
                 self.skip_one_ws();
                 if self.take(b'^') {
                     self.skip_one_ws();
@@ -286,12 +286,12 @@ impl<'a> TurtleParser<'a> {
                 let id = std::str::from_utf8(&self.s[id_start..self.pos])
                     .map_err(|_| SyntaxError::new("non-UTF8 in blank node label"))?
                     .to_string();
-                Ok((format!("_:{}", id), false))
+                Ok((format!("_:{id}"), false))
             }
             Some(b'a') => {
                 // check it's not part of a longer token
                 let next = self.s.get(self.pos + 1).copied();
-                if next.map_or(true, |c| {
+                if next.is_none_or(|c| {
                     !c.is_ascii_alphanumeric() && c != b'_' && c != b'-' && c != b'.'
                 }) {
                     self.pos += 1;
@@ -359,7 +359,7 @@ impl<'a> TurtleParser<'a> {
                 Some(b'<') => self.read_iri()?,
                 Some(b'a') => {
                     let next = self.s.get(self.pos + 1).copied();
-                    if next.map_or(true, |c| {
+                    if next.is_none_or(|c| {
                         !c.is_ascii_alphanumeric() && c != b'_' && c != b'-' && c != b'.'
                     }) {
                         self.pos += 1;
@@ -473,21 +473,19 @@ impl<'a> TurtleParser<'a> {
         let mut subjects: Vec<(String, Vec<(String, Vec<String>)>)> = Vec::new();
         for (subj, triples) in flat {
             // find or insert subject
-            let subj_idx = match subjects.iter().position(|(s, _)| s == &subj) {
-                Some(i) => i,
-                None => {
-                    subjects.push((subj.clone(), Vec::new()));
-                    subjects.len() - 1
-                }
+            let subj_idx = if let Some(i) = subjects.iter().position(|(s, _)| s == &subj) {
+                i
+            } else {
+                subjects.push((subj.clone(), Vec::new()));
+                subjects.len() - 1
             };
             let preds = &mut subjects[subj_idx].1;
             for (pred, obj) in triples {
-                let pred_idx = match preds.iter().position(|(p, _)| p == &pred) {
-                    Some(i) => i,
-                    None => {
-                        preds.push((pred.clone(), Vec::new()));
-                        preds.len() - 1
-                    }
+                let pred_idx = if let Some(i) = preds.iter().position(|(p, _)| p == &pred) {
+                    i
+                } else {
+                    preds.push((pred.clone(), Vec::new()));
+                    preds.len() - 1
                 };
                 preds[pred_idx].1.push(obj);
             }
@@ -664,8 +662,7 @@ impl<'a> RdfXmlParser<'a> {
                             })
                             .collect();
                         return Err(SyntaxError::new(format!(
-                            "expected `=` after attribute `{}` at context `{}`",
-                            attr_name, ctx
+                            "expected `=` after attribute `{attr_name}` at context `{ctx}`"
                         )));
                     }
                     let val = self.read_attr_value()?;
@@ -683,7 +680,7 @@ impl<'a> RdfXmlParser<'a> {
     fn _skip_to_close(&mut self, tag: &str) -> Result<(), SyntaxError> {
         loop {
             if self.peek().is_none() {
-                return Err(SyntaxError::new(format!("no `</{}>` found", tag)));
+                return Err(SyntaxError::new(format!("no `</{tag}>` found")));
             }
             if self.take(b'<') {
                 if self.take(b'/') {
@@ -694,8 +691,7 @@ impl<'a> RdfXmlParser<'a> {
                         return Ok(());
                     }
                     return Err(SyntaxError::new(format!(
-                        "expected `</{}>`, found `</{}>`",
-                        tag, got
+                        "expected `</{tag}>`, found `</{got}>`"
                     )));
                 }
                 // skip nested opening tag — recurse one level
@@ -775,7 +771,7 @@ impl<'a> RdfXmlParser<'a> {
                 if k == "rdf:about" {
                     subj = v.clone();
                 } else if k == "rdf:nodeID" {
-                    subj = format!("_:{}", v);
+                    subj = format!("_:{v}");
                 }
             }
             subj
@@ -842,8 +838,7 @@ impl<'a> RdfXmlParser<'a> {
                         return Ok(());
                     }
                     return Err(SyntaxError::new(format!(
-                        "expected `</{}>`, got `</{}>`",
-                        tag, got
+                        "expected `</{tag}>`, got `</{got}>`"
                     )));
                 }
                 self.pos = save;
@@ -860,7 +855,7 @@ impl<'a> RdfXmlParser<'a> {
                         is_resource = true;
                     }
                     "rdf:nodeID" => {
-                        obj = format!("_:{}", v);
+                        obj = format!("_:{v}");
                         is_resource = true;
                     }
                     "rdf:parseType" if v == "Resource" => {
@@ -873,38 +868,35 @@ impl<'a> RdfXmlParser<'a> {
                 // body is another description — same subject, predicate inherited
                 self.read_description(&subject, true, out)?;
                 triples.push((pred.clone(), format!("__nested__{}", triples.len())));
+            } else if pred_self_closing {
+                // The `<pred .../>` form — `read_open_tag` already consumed the `/>`,
+                // so pos is past the close. Just push the (predicate, object) pair.
+                if !obj.is_empty() || is_resource {
+                    triples.push((pred.clone(), obj));
+                }
             } else {
-                if pred_self_closing {
-                    // The `<pred .../>` form — `read_open_tag` already consumed the `/>`,
-                    // so pos is past the close. Just push the (predicate, object) pair.
-                    if !obj.is_empty() || is_resource {
-                        triples.push((pred.clone(), obj));
+                // body: text → literal (read until `</pred>`)
+                let text_start = self.pos;
+                while let Some(b) = self.s.get(self.pos).copied() {
+                    if b == b'<' {
+                        break;
                     }
-                } else {
-                    // body: text → literal (read until `</pred>`)
-                    let text_start = self.pos;
-                    while let Some(b) = self.s.get(self.pos).copied() {
-                        if b == b'<' {
-                            break;
-                        }
-                        self.pos += 1;
-                    }
-                    obj = String::from_utf8_lossy(&self.s[text_start..self.pos])
-                        .trim()
-                        .to_string();
-                    self.expect_str("</")?;
-                    let got = self.read_name()?;
-                    self.ws();
-                    self.expect_str(">")?;
-                    if got != pred {
-                        return Err(SyntaxError::new(format!(
-                            "expected `</{}>`, got `</{}>`",
-                            pred, got
-                        )));
-                    }
-                    if !obj.is_empty() || is_resource {
-                        triples.push((pred.clone(), obj));
-                    }
+                    self.pos += 1;
+                }
+                obj = String::from_utf8_lossy(&self.s[text_start..self.pos])
+                    .trim()
+                    .to_string();
+                self.expect_str("</")?;
+                let got = self.read_name()?;
+                self.ws();
+                self.expect_str(">")?;
+                if got != pred {
+                    return Err(SyntaxError::new(format!(
+                        "expected `</{pred}>`, got `</{got}>`"
+                    )));
+                }
+                if !obj.is_empty() || is_resource {
+                    triples.push((pred.clone(), obj));
                 }
             }
         }
@@ -960,8 +952,7 @@ pub fn parse_rdfxml(input: &str) -> Result<SyntaxTerm, SyntaxError> {
                     p.expect_str(">")?;
                     if got != outer_tag {
                         return Err(SyntaxError::new(format!(
-                            "expected `</{}>`, got `</{}>`",
-                            outer_tag, got
+                            "expected `</{outer_tag}>`, got `</{got}>`"
                         )));
                     }
                     break;
@@ -975,21 +966,19 @@ pub fn parse_rdfxml(input: &str) -> Result<SyntaxTerm, SyntaxError> {
     // merge by subject → by predicate, same as Turtle
     let mut subjects: Vec<(String, Vec<(String, Vec<String>)>)> = Vec::new();
     for (subj, triples) in flat {
-        let subj_idx = match subjects.iter().position(|(s, _)| s == &subj) {
-            Some(i) => i,
-            None => {
-                subjects.push((subj.clone(), Vec::new()));
-                subjects.len() - 1
-            }
+        let subj_idx = if let Some(i) = subjects.iter().position(|(s, _)| s == &subj) {
+            i
+        } else {
+            subjects.push((subj.clone(), Vec::new()));
+            subjects.len() - 1
         };
         let preds = &mut subjects[subj_idx].1;
         for (pred, obj) in triples {
-            let pred_idx = match preds.iter().position(|(p, _)| p == &pred) {
-                Some(i) => i,
-                None => {
-                    preds.push((pred.clone(), Vec::new()));
-                    preds.len() - 1
-                }
+            let pred_idx = if let Some(i) = preds.iter().position(|(p, _)| p == &pred) {
+                i
+            } else {
+                preds.push((pred.clone(), Vec::new()));
+                preds.len() - 1
             };
             preds[pred_idx].1.push(obj);
         }

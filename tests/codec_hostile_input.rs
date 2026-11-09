@@ -7,10 +7,10 @@
 //! the process, exactly as a real out-of-memory does, so an unguarded length prefix fails loudly).
 #![cfg(feature = "codec")]
 
-use wirefold::codec;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::{Cell, RefCell};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use wirefold::codec;
 
 /// The largest single allocation any decoder may request for the tiny inputs used here (the
 /// documented cap on constant-size-input expansion is far below this).
