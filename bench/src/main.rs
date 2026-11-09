@@ -129,15 +129,23 @@ fn serialize_row(dataset: &str, n: usize, row: &str, op: &str) {
             };
             ("wirefold Collapse + compress()", z.len(), t)
         }
-        ("collapse-zstd", _) => {
-            let z = zstd::encode_all(&wf[..], 19).unwrap();
+        (r, _) if r.starts_with("collapse-zstd") => {
+            // "collapse-zstd" is level 19; "collapse-zstd1", "collapse-zstd3", "collapse-zstd6" the others
+            let level: i32 = r["collapse-zstd".len()..].parse().unwrap_or(19);
+            let z = zstd::encode_all(&wf[..], level).unwrap();
             assert!(zstd::decode_all(&z[..]).unwrap() == wf);
             let t = if op == "encode" {
-                ms(3, || zstd::encode_all(&wf[..], 19).unwrap())
+                ms(if level >= 10 { 3 } else { runs }, || {
+                    zstd::encode_all(&wf[..], level).unwrap()
+                })
             } else {
                 ms(runs, || zstd::decode_all(&z[..]).unwrap())
             };
-            ("wirefold Collapse + zstd -19", z.len(), t)
+            (
+                Box::leak(format!("wirefold Collapse + zstd -{level}").into_boxed_str()) as &str,
+                z.len(),
+                t,
+            )
         }
         ("bincode", _) => {
             let b = bincode::serialize(data).unwrap();
@@ -309,6 +317,9 @@ fn serialize_tables(n: usize, runs: usize) {
         for row in [
             "collapse",
             "collapse-cm",
+            "collapse-zstd1",
+            "collapse-zstd3",
+            "collapse-zstd6",
             "collapse-zstd",
             "bincode",
             "postcard",

@@ -96,12 +96,14 @@ row stride that codes smallest on a sample; the trials run as one static batch o
 `compress_shaped` measures three faces on the input (order-1 tANS, lz, and the lz-plus-tANS hybrid) and takes
 the fastest within a size tolerance of the smallest; they run as one static batch too.
 
-Measured on the telemetry records: encode 129 ms and decode 2.25 ms for 713 KB, against 249 ms and 0.81 ms for
-zstd -19 on the same bytes. What it gives up is density: it cannot track data that changes along the stream the
-way an adaptive context-mixing model does, and the order-1 table has a header. An adaptive context-mixing
-coder was used here before. It was 28% smaller on the telemetry data (174,810 against 243,202 bytes) and level
-on random data; it took 3.5 s to encode and 1.5 s to decode the same bytes after being made 5 to 7 times faster
-by caching and chunking, and was removed because that is 27 and 650 times slower than the static coder.
+Measured on the telemetry records: encode 127 ms and decode 2.0 ms for 713 KB, against 2.0 ms and 1.2 ms for
+zstd -1 on the same bytes (237,083 against 243,202 bytes). So this coder does not compete with zstd at the
+levels people use; it beats only level 19 on encode time (249 ms), at 17% more bytes. What it is for is a
+compression path with no C dependency and nothing to build, not a better compressor, and the serialization
+format does not depend on it: `Collapse` output is plain bytes that can be handed to zstd. An adaptive
+context-mixing coder was used here before. It was 28% smaller than this one on the telemetry data (174,810
+bytes, below zstd -19) and level on random data; it took 3.5 s to encode and 1.5 s to decode the same bytes
+after being made 5 to 7 times faster by caching and chunking, and was removed for that cost.
 
 ## Numbers: why not ryu and itoa
 
@@ -124,8 +126,8 @@ convert only at a boundary that needs text.
 ## What wirefold gives up
 
 - **Ecosystem.** Nothing outside wirefold understands its formats, and it does not implement serde's traits.
-- **Density.** The static model cannot adapt along the stream, so `compress()` is larger than zstd -19 on
-  the structured telemetry data (17% larger) and about 2.8 times slower to decode.
+- **Compression.** `compress()` is slower than zstd -1 (about 60 times to encode, 1.7 times to decode) and
+  slightly larger on the structured telemetry data. Use zstd on `Collapse` bytes when compression matters.
 - **rkyv's validated column read** is faster in the measured case.
 - **MessagePack** encode and decode are slower than `rmp-serde`.
 - **Owned parsing** is sequential, as above.
