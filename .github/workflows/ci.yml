@@ -42,6 +42,45 @@ jobs:
       - name: Check
         run: cargo +1.89.0 check --locked --all-features
 
+  docs:
+    name: Rustdoc (no warnings)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Build the docs, failing on any warning
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --workspace --all-features --no-deps
+
+  semver:
+    name: Semver check against the last release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Find the baseline
+        id: base
+        run: |
+          TAG=$(git tag --list 'v*' --sort=-v:refname | head -n 1)
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          if [ -z "${TAG}" ]; then echo "::notice::no release tag yet; nothing to compare against"; fi
+      - name: Install cargo-semver-checks
+        if: steps.base.outputs.tag != ''
+        run: cargo install cargo-semver-checks --locked
+      - name: Check the public API against the baseline
+        if: steps.base.outputs.tag != ''
+        env:
+          BASELINE: ${{ steps.base.outputs.tag }}
+        run: cargo semver-checks check-release --package wirefold --all-features --baseline-rev "${BASELINE}"
+
   sanitizers:
     name: Sanitizers (${{ matrix.sanitizer }})
     runs-on: ubuntu-latest

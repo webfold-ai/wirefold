@@ -6,6 +6,11 @@ All notable changes to this crate are documented in this file. The format follow
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-10
+
+First release. The entries below record how the crate reached this point. Items marked breaking describe changes made
+before there was a released version, so they are not breaks for any existing user.
+
 ### Added
 
 - `docs/DESIGN.md` (the apeiron basis against serde, bincode, ryu and itoa) and fresh serialization and
@@ -101,3 +106,6 @@ All notable changes to this crate are documented in this file. The format follow
 - Minimum supported Rust version is 1.89 (the derive crate already required it).
 - `clippy -D warnings` is clean for the whole crate; a short list of inherited style lints is allowed by
   name in `src/lib.rs`.
+
+[Unreleased]: https://github.com/webfold-ai/wirefold/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/webfold-ai/wirefold/releases/tag/v0.1.0

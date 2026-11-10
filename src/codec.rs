@@ -1789,7 +1789,7 @@ pub mod lz {
         compress_seq_inner(&gen_apply(g, data), g)
     }
 
-    /// Seq compress, MAX effort: the cost-optimal parse ([`compress_seq_optimal`]) — the density crown
+    /// Seq compress, MAX effort: the cost-optimal parse (`compress_seq_optimal`) — the density crown
     /// of the seq family. Same format, same fast decode; the encode is slow (zstd-19 class) by
     /// construction. The compress-once-load-many profile (.seed serialisation): pay the parse once,
     /// win density AND decode speed on every load.
@@ -5276,8 +5276,8 @@ pub mod syntax {
     //!
     //! This file holds the term itself, the `AsTerm` conversions, the public entry points and the
     //! binary term codec. The per-surface machinery lives beside it and is re-exported from here, so
-    //! every `codec::syntax::…` path is unchanged: [`surfaces`] (JSON/BAML/CSV/TOON/POML),
-    //! [`yaml`], [`rdf`] (Turtle + RDF/XML).
+    //! every `codec::syntax::…` path is unchanged: `surfaces` (JSON/BAML/CSV/TOON/POML),
+    //! `yaml`, `rdf` (Turtle + RDF/XML).
 
     mod rdf;
     mod surfaces;
@@ -8710,7 +8710,7 @@ pub fn try_decompress_framed(bytes: &[u8]) -> Result<Vec<u8>, DecodeError> {
 pub enum Bias {
     /// Smallest output, whatever the cost — always the context-mixer crown.
     Dense,
-    /// Take the faster face only when it stays within [`BALANCE_TOL`] of the densest — the knee.
+    /// Take the faster face only when it stays within `BALANCE_TOL` of the densest — the knee.
     #[default]
     Balanced,
     /// Fastest face that still compresses — the pure suffix-web tokens.

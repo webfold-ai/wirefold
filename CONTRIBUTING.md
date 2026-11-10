@@ -53,6 +53,10 @@ branch.
 Open a pull request against `main`. Describe the change, the commands you ran and their results, and any
 security or compatibility impact.
 
+Commit subjects follow [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `perf:`, `docs:`,
+`ci:`, `chore:`; `!` or a `BREAKING CHANGE:` footer for a break): the next version is computed from them. See
+[docs/RELEASING.md](docs/RELEASING.md) for the versioning rules and how a release is cut.
+
 ## Security reports
 
 Do not report vulnerabilities in public issues or pull requests. Follow [SECURITY.md](SECURITY.md).
