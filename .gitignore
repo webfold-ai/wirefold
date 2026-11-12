@@ -25,3 +25,5 @@ rustc-ice-*.txt
 
 # bindings build output
 /wirefold_bindings/dist/
+__pycache__/
+*.pyc
