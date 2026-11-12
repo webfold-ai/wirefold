@@ -225,7 +225,7 @@ fn py_name(s: &str) -> String {
 fn convenience(out: &mut String, name: &str) {
     let _ = write!(
         out,
-        "\n    @staticmethod\n    def from_obj(o: Any) -> \"{name}\":\n        return decode_{name}(o)\n\n    def to_obj(self) -> Any:\n        return encode_{name}(self)\n\n    @staticmethod\n    def from_json(s: str) -> \"{name}\":\n        return decode_{name}(json.loads(s))\n\n    def to_json(self) -> str:\n        return json.dumps(encode_{name}(self))\n"
+        "\n    @staticmethod\n    def from_obj(o: Any) -> \"{name}\":\n        return decode_{name}(o)\n\n    def to_obj(self) -> Any:\n        return encode_{name}(self)\n\n    @staticmethod\n    def from_json(s: str) -> \"{name}\":\n        return decode_{name}(json.loads(s))\n\n    def to_json(self) -> str:\n        return json.dumps(encode_{name}(self))\n\n    @staticmethod\n    def from_dict(data: Any) -> \"{name}\":\n        return decode_{name}(data)\n\n    def to_dict(self) -> Any:\n        return encode_{name}(self)\n"
     );
 }
 

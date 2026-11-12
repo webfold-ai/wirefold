@@ -481,7 +481,7 @@ fn python_round_trips_the_wire_form() {
     std::fs::write(dir.join("out_in.json"), &ob).unwrap();
     std::fs::write(
         dir.join("main.py"),
-        "import json, sys\nimport bindings as b\nsrc = open('in.json').read()\nv = b.Doc.from_json(src)\nassert isinstance(v.shapes[2], b.ShapeSeg), v.shapes[2]\nassert v.level == b.Level.mid, v.level\nopen('out.json', 'w').write(v.to_json())\no = b.Outbound.from_json(open('out_in.json').read())\nassert isinstance(o.one, b.WrappedWrap), o.one\nopen('out_out.json', 'w').write(o.to_json())\n",
+        "import json, sys\nimport bindings as b\nsrc = open('in.json').read()\nv = b.Doc.from_json(src)\nassert isinstance(v.shapes[2], b.ShapeSeg), v.shapes[2]\nassert v.level == b.Level.mid, v.level\nassert b.Doc.from_dict(json.loads(src)) == v\nassert json.loads(v.to_json()) == v.to_dict()\nopen('out.json', 'w').write(v.to_json())\no = b.Outbound.from_json(open('out_in.json').read())\nassert isinstance(o.one, b.WrappedWrap), o.one\nopen('out_out.json', 'w').write(o.to_json())\n",
     )
     .unwrap();
     run(Command::new("python3")
