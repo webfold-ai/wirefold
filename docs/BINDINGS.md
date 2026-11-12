@@ -1,13 +1,15 @@
 # Bindings: using wirefold from other types and other languages
 
-There are two separate problems, and they have separate answers.
+There are three separate problems, and they have separate answers.
 
 1. **Rust types you already have** (derived with serde or facet) should reach wirefold's surfaces and
    MessagePack without rewriting them. That is the [serde bridge](#serde-bridge) and
    [`wirefold_facet`](#facet-wirefold_facet).
-2. **Other languages** should read and write the same data. Today that is
-   [generated types for the JSON wire form](#other-languages). Calling wirefold's own binary codecs from
-   another language is [not done yet](#not-done-yet).
+2. **Other languages** should read and write the same data. That is
+   [generated types for the JSON wire form](#other-languages).
+3. **Other languages should call wirefold itself**: translate between surfaces, convert JSON to and
+   from MessagePack. That is [`wirefold_bindings`](#calling-wirefold-from-python-and-typescript), for
+   Python and for TypeScript through WebAssembly.
 
 ## Serde bridge
 
@@ -101,14 +103,30 @@ Wire choices a reader of the generated code will notice: a 128-bit integer is a 
 array of numbers (`[]int` in Go, because `[]byte` marshals as base64); `Option<T>` fields are `null` when `None`
 and may be absent; an inline tuple is `[]any` in Go.
 
+## Calling wirefold from Python and TypeScript
+
+`wirefold_bindings` is one small, explicit API (`translate`, `json_to_msgpack`, `msgpack_to_json`,
+`formats`, `version`) written once in plain Rust, with two thin front ends: a PyO3 Python module and a
+wasm-bindgen WebAssembly module with TypeScript declarations. It takes and returns strings and bytes,
+never wirefold's internal types. See [`wirefold_bindings/README.md`](../wirefold_bindings/README.md).
+
+Both are tested against the built artifact, not just the Rust: `scripts/test-python.sh` builds the
+extension and runs `unittest` against it, and `scripts/build-wasm.sh` plus `tests/wasm/test.mjs` load
+the compiled `.wasm` in Node. Both feed hostile MessagePack and require an error, not a crash. CI runs
+them (`language-bindings` job).
+
+PyO3 and wasm-bindgen are MIT/Apache-2.0, so they fit this repository's `deny.toml`. UniFFI would add
+Kotlin and Swift but is MPL-2.0, which `deny.toml` does not allow; that is a licensing decision for the
+owner, not one to make in a dependency bump.
+
+The WebAssembly build needed a fix in apeiron (`MAX_K` overflowed a 32-bit `usize`); wirefold pins the
+commit that carries it (webfold-ai/apeiron#6).
+
 ## Not done yet
 
-- **Calling wirefold's binary codecs from other languages** (`Collapse` columns, the integer column codec,
-  MessagePack through the `Term`). The planned shape is one small `wirefold-ffi` crate with an explicit,
-  narrow API (encode/decode bytes), then UniFFI for Python, Kotlin and Swift, or Diplomat if C, C++, Dart or C#
-  are wanted. The boundary should be a deliberate API, not wirefold's internal types. This is a different
-  deliverable from the emitters above: bindings give access to the existing codec; emitters give independent
-  implementations of the data model.
+- **Go, Java/Kotlin, Swift and C bindings for the codecs.** A C ABI (`cbindgen`) would serve Go and C;
+  UniFFI would serve Kotlin and Swift (see the licence note above). The columnar `Collapse` codec is not
+  bound at all: it is generated per record type, so there is no single signature to expose.
 - **Independent binary codecs per language** (no Rust library loaded). `serde-reflection` + `serde-generate` is
   the closest existing architecture: a language-neutral registry plus per-language backends and runtime
   libraries, tested against the Rust side for interoperability. `Schema` is the registry half of that; the

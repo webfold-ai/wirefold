@@ -50,6 +50,30 @@ jobs:
       - name: Test the serde bridge
         run: cargo test --locked --features serde --test serde_bridge
 
+  language-bindings:
+    name: Python and WebAssembly bindings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component clippy --target wasm32-unknown-unknown
+      - name: Clippy
+        run: cargo clippy --locked -p wirefold_bindings --features python --all-targets -- -D warnings
+      - name: Rust tests
+        run: cargo test --locked -p wirefold_bindings
+      - name: Python extension and its tests
+        run: wirefold_bindings/scripts/test-python.sh
+      - name: Install the wasm-bindgen CLI at the locked version
+        run: |
+          v="$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p')"
+          cargo install --locked wasm-bindgen-cli --version "$v"
+      - name: WebAssembly module and its tests
+        run: |
+          wirefold_bindings/scripts/build-wasm.sh
+          node wirefold_bindings/tests/wasm/test.mjs
+
   msrv:
     name: MSRV 1.89
     runs-on: ubuntu-latest

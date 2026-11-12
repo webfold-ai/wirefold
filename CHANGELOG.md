@@ -14,7 +14,11 @@ All notable changes to this crate are documented in this file. The format follow
   language-neutral description of the JSON wire form; emitters for Python, TypeScript, Go and JSON Schema. A
   separate crate because facet's `smallvec` 2 beta breaks coherence with the `error` feature's blanket `From`.
   Cross-language round trips are tested in CI.
-- `docs/BINDINGS.md`: what exists, what does not, and the plan for FFI bindings and independent codecs.
+- `wirefold_bindings` workspace crate: Python (PyO3) and TypeScript/WebAssembly (wasm-bindgen) bindings for
+  `translate`, `json_to_msgpack` and `msgpack_to_json`, tested against the built artifacts in CI.
+- apeiron pin moved to a commit that builds for `wasm32` (webfold-ai/apeiron#6).
+- `wirefold_facet` declares `rust-version = "1.90"`, which facet requires (it said 1.89).
+- `docs/BINDINGS.md`: what exists, what does not, and the plan for further languages and independent codecs.
 
 ## [0.1.0] - 2026-11-10
 

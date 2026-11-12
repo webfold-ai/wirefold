@@ -24,7 +24,8 @@ wirefold = { git = "https://github.com/webfold-ai/wirefold", features = ["derive
 - [Usage guide](docs/USAGE.md): `Collapse`, `Term`, text surfaces, compression, MessagePack. Every snippet
   is in `examples/usage.rs`, which CI runs (`cargo run --example usage --all-features`).
 - [Bindings](docs/BINDINGS.md): using wirefold from serde and facet types (`serde` feature, the `wirefold_facet`
-  crate) and from Python, TypeScript, Go and JSON Schema consumers, with what is not done yet.
+  crate), calling it from Python and TypeScript (`wirefold_bindings`), and generated Python, TypeScript, Go and
+  JSON Schema types, with what is not done yet.
 - [Design](docs/DESIGN.md): why it is built on apeiron rather than serde, bincode, ryu and itoa, how parsing
   becomes a fold, and what it gives up.
 - [Report](docs/REPORT.md): a standalone comparison with lz4, Snappy, deflate, Brotli and zstd on three datasets, with the
