@@ -30,6 +30,26 @@ jobs:
       - name: Build with no default features
         run: cargo check --locked --no-default-features
 
+  bindings:
+    name: Bindings (wirefold_facet, cross-language)
+    runs-on: ubuntu-latest
+    env:
+      WIREFOLD_REQUIRE_TOOLCHAINS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component clippy
+      - name: Install TypeScript
+        run: npm install --global typescript
+      - name: Clippy
+        run: cargo clippy --locked -p wirefold_facet --all-targets -- -D warnings
+      - name: Test (Python, Go and TypeScript must be present)
+        run: cargo test --locked -p wirefold_facet
+      - name: Test the serde bridge
+        run: cargo test --locked --features serde --test serde_bridge
+
   msrv:
     name: MSRV 1.89
     runs-on: ubuntu-latest

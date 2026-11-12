@@ -6,6 +6,16 @@ All notable changes to this crate are documented in this file. The format follow
 
 ## [Unreleased]
 
+### Added
+
+- `serde` feature: `serde_bridge` converts any `Serialize`/`Deserialize` type to and from the universal `Term`,
+  every text surface and MessagePack, with serde_json's data model.
+- `wirefold_facet` workspace crate: any `Facet` type to and from the `Term`; `Schema::of::<T>()` extracts a
+  language-neutral description of the JSON wire form; emitters for Python, TypeScript, Go and JSON Schema. A
+  separate crate because facet's `smallvec` 2 beta breaks coherence with the `error` feature's blanket `From`.
+  Cross-language round trips are tested in CI.
+- `docs/BINDINGS.md`: what exists, what does not, and the plan for FFI bindings and independent codecs.
+
 ## [0.1.0] - 2026-11-10
 
 First release. The entries below record how the crate reached this point. Items marked breaking describe changes made

@@ -11,6 +11,7 @@
 //! | `derive` | `#[derive(Collapse)]` and `#[derive(Term)]` for zero-copy record serialization |
 //! | `error` | `Error`, `Result` and `Context`, plus `#[derive(Error)]` |
 //! | `validate` | `Validate` trait plus `#[derive(Validate)]` |
+//! | `serde` | [`serde_bridge`]: any serde type to and from the universal Term, every surface and MessagePack |
 
 #![warn(missing_docs)]
 #![warn(clippy::pedantic)]
@@ -52,6 +53,9 @@
 #[cfg(feature = "codec")]
 #[allow(missing_docs)]
 pub mod codec;
+
+#[cfg(feature = "serde")]
+pub mod serde_bridge;
 
 #[cfg(feature = "derive")]
 pub use wirefold_derive::Collapse;

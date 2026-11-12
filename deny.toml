@@ -8,7 +8,8 @@ ignore = []
 
 [licenses]
 version = 2
-allow = ["Apache-2.0", "MIT"]
+# Unicode-3.0 (unicode-ident) and Zlib (foldhash) arrive with facet, in the wirefold_facet crate.
+allow = ["Apache-2.0", "MIT", "Unicode-3.0", "Zlib"]
 confidence-threshold = 0.8
 
 [bans]
