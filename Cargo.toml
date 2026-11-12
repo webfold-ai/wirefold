@@ -20,6 +20,7 @@ categories = ["encoding", "compression"]
 readme = "README.md"
 repository = "https://github.com/webfold-ai/wirefold"
 rust-version = "1.89"
+exclude = [".github/", "deny.toml"]
 
 [dependencies]
 apeiron = { version = "0.1.0", git = "https://github.com/webfold-ai/apeiron", rev = "d0eda3226193542949306f767d7280404921546f" }

@@ -18,7 +18,7 @@
 //! model it parses and generates through is `src/proc_masq.rs` in this crate: a table-backed
 //! stand-in for `proc_macro`/`syn`/`quote`. The part that needs the real, compiler-native
 //! `proc_macro` crate (only a `proc-macro = true` crate gets sysroot access to it) lives in
-//! [`pm_bridge`] below.
+//! `pm_bridge` below.
 
 // `quote_tokens!` recurses once per remaining token (see its module doc); the biggest single
 // template here (`derive_struct`'s final `impl`/`struct`/`impl CollapseElem` block) has more
