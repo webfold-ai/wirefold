@@ -2,7 +2,7 @@
 
 A zero-copy wire format, a universal `Term`, an integer column codec, a static table-driven entropy coder and
 structured-text surfaces (JSON, YAML, TOON, POML, RDF and others), built on
-[apeiron](https://github.com/webfold-ai/apeiron). The only dependency is apeiron; the derive crate has none.
+[apeiron](https://github.com/webfold-ai/apeiron). The only dependency is apeiron; the derive crate has none. (The optional `serde` feature adds serde, and the separate `wirefold_facet` crate adds facet.)
 
 ```toml
 [dependencies]
@@ -17,11 +17,15 @@ wirefold = { git = "https://github.com/webfold-ai/wirefold", features = ["derive
 | `derive` | `#[derive(Collapse)]` and `#[derive(Term)]` |
 | `error` | `Error`, `Result`, `Context` and `#[derive(Error)]` |
 | `validate` | `Validate` and `#[derive(Validate)]` |
+| `serde` | `serde_bridge`: any `Serialize`/`Deserialize` type to and from the Term, every text surface and MessagePack |
 
 ## Documentation
 
 - [Usage guide](docs/USAGE.md): `Collapse`, `Term`, text surfaces, compression, MessagePack. Every snippet
   is in `examples/usage.rs`, which CI runs (`cargo run --example usage --all-features`).
+- [Bindings](docs/BINDINGS.md): using wirefold from serde and facet types (`serde` feature, the `wirefold_facet`
+  crate), calling it from Python and TypeScript (`wirefold_bindings`), and generated Python, TypeScript, Go and
+  JSON Schema types, with what is not done yet.
 - [Design](docs/DESIGN.md): why it is built on apeiron rather than serde, bincode, ryu and itoa, how parsing
   becomes a fold, and what it gives up.
 - [Report](docs/REPORT.md): a standalone comparison with lz4, Snappy, deflate, Brotli and zstd on three datasets, with the

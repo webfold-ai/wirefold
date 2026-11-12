@@ -1,0 +1,24 @@
+[package]
+name = "wirefold_bindings"
+version = "0.1.0"
+edition = "2021"
+description = "Python and WebAssembly (TypeScript) bindings for wirefold: translate between text surfaces and convert JSON to and from MessagePack, through one small API."
+license = "Apache-2.0"
+repository = "https://github.com/webfold-ai/wirefold"
+rust-version = "1.89"
+publish = false
+
+[lib]
+name = "wirefold_bindings"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wirefold = { version = "0.1.0", path = "..", default-features = false, features = ["syntax"] }
+pyo3 = { version = "0.30", optional = true, features = ["abi3-py39"] }
+wasm-bindgen = { version = "0.2", optional = true }
+
+[features]
+# Build the `wirefold` Python extension module (with maturin, or `cargo build --features python`).
+python = ["dep:pyo3"]
+# Build the WebAssembly module (`cargo build --target wasm32-unknown-unknown --features wasm`, then wasm-bindgen).
+wasm = ["dep:wasm-bindgen"]

@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "wirefold"
+description = "Translate between JSON, YAML, TOON, POML, CSV, BAML, Turtle and RDF/XML, and convert JSON to and from MessagePack, with wirefold's parsers."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.9"
+dynamic = ["version"]
+
+[tool.maturin]
+features = ["python"]
+module-name = "wirefold"

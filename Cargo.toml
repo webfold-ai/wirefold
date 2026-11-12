@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["wirefold_derive"]
+members = ["wirefold_derive", "wirefold_facet", "wirefold_bindings"]
 
 [workspace.package]
 edition = "2021"
@@ -23,8 +23,12 @@ rust-version = "1.89"
 exclude = [".github/", "deny.toml"]
 
 [dependencies]
-apeiron = { version = "0.1.0", git = "https://github.com/webfold-ai/apeiron", rev = "d0eda3226193542949306f767d7280404921546f" }
+apeiron = { version = "0.1.0", git = "https://github.com/webfold-ai/apeiron", rev = "1c3d4a1da565cde409f6f3cb343086aa6853eb9c" }
 wirefold_derive = { version = "0.1.0", path = "wirefold_derive", optional = true }
+serde = { version = "1", default-features = false, features = ["std"], optional = true }
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(procmasq_no_export)'] }
@@ -43,6 +47,9 @@ derive = ["codec", "dep:wirefold_derive"]
 error = ["dep:wirefold_derive"]
 # validator-style Validate trait plus #[derive(Validate)]
 validate = ["dep:wirefold_derive"]
+# Bridge for serde types: any Serialize/Deserialize type to and from the universal Term, and so to
+# every surface (JSON, YAML, TOON, POML, RDF) and MessagePack
+serde = ["syntax", "dep:serde"]
 
 [[test]]
 name = "collapse_derive"
@@ -75,3 +82,7 @@ required-features = ["syntax"]
 [[test]]
 name = "parse_behaviour"
 required-features = ["syntax"]
+
+[[test]]
+name = "serde_bridge"
+required-features = ["serde"]
