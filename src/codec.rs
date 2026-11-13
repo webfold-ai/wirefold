@@ -38,6 +38,9 @@ pub use wirefold_derive::Collapse;
 // ════════════════════════════════════════════════════════════════════════════
 
 #[cfg(feature = "compress")]
+mod legacy_cm;
+
+#[cfg(feature = "compress")]
 pub mod cm {
     //! The static context-model byte codec: the counts of a stream, accumulated exactly into a table,
     //! read out as a tANS code.
@@ -59,10 +62,10 @@ pub mod cm {
 
     use super::{read_uvarint, DecodeError};
 
-    /// The version byte that begins every stream this module writes. A reader accepts exactly this
-    /// value and returns [`DecodeError::UnsupportedVersion`] for any other, so a change of format
-    /// bumps it and old streams are refused rather than misread. Streams written before the byte
-    /// existed are not supported.
+    /// The version byte that begins every stream this module writes. [`try_decompress`] reads streams with
+    /// this value, and otherwise falls back to the formats written before the byte existed (see
+    /// [`try_decompress_legacy`]); anything that is neither returns [`DecodeError::UnsupportedVersion`]. A
+    /// change of format bumps it.
     pub const VERSION: u8 = 1;
 
     /// The context order of the model: how much of the preceding bytes the table is keyed by.
@@ -328,10 +331,90 @@ pub mod cm {
         try_decompress(bs).unwrap_or_default()
     }
 
-    /// Checked [`decompress`]: `Err` for truncated or inconsistent input, and
-    /// [`DecodeError::UnsupportedVersion`] for a stream of another version. The declared length is
+    /// Checked [`decompress`]: `Err` for truncated or inconsistent input. The declared length is
     /// bounded by [`super::DEFAULT_MAX_OUTPUT`] and must equal what the stream decodes to.
+    ///
+    /// Reads version-1 streams, and falls back to [`try_decompress_legacy`] for a stream written before the
+    /// version byte existed (the adaptive coder of wirefold up to `ba9a712` and of hashtrinity, or the
+    /// unversioned static coder that followed it), so data written by those stays readable. A stream
+    /// that is neither returns the version-1 error ([`DecodeError::UnsupportedVersion`] when its first
+    /// byte is not [`VERSION`]).
+    ///
+    /// Detection is by decoding, not by a marker the old format did not have: an old stream whose first
+    /// byte happens to be `1` (its uncompressed length is exactly one byte) is tried as version 1 first.
+    /// A version-1 decode must also reproduce the declared length, which a misread old stream
+    /// essentially never does; use [`try_decompress_legacy`] directly when you know the stream is old.
     pub fn try_decompress(bs: &[u8]) -> Result<Vec<u8>, DecodeError> {
+        match try_decompress_v1(bs) {
+            Ok(v) => Ok(v),
+            Err(e) => try_decompress_legacy(bs).map_err(|_| e),
+        }
+    }
+
+    /// Decode a stream written before the version byte existed: first the unversioned static coder
+    /// (`[byteLen][order][stride][tANS]`, orders 0 and 1), then the original adaptive coder
+    /// (`[byteLen][order][stride][rANS]`, orders 0..=6). Never a write path.
+    pub fn try_decompress_legacy(bs: &[u8]) -> Result<Vec<u8>, DecodeError> {
+        // A declared length of 0 is an empty stream, and the old encoders wrote one exact byte string for
+        // it. Accept exactly that: the decoders below return as soon as they see the zero length, so
+        // without this check anything that starts with a 0 byte would read as "empty".
+        if bs.first() == Some(&0) {
+            return if is_legacy_empty(bs) {
+                Ok(Vec::new())
+            } else {
+                Err(DecodeError::Malformed)
+            };
+        }
+        if let Ok(v) = try_decompress_static_unversioned(bs) {
+            return Ok(v);
+        }
+        super::legacy_cm::try_decompress(bs)
+    }
+
+    /// Whether `bs` is exactly what an old encoder wrote for empty input: the adaptive coder's
+    /// `[0][order 0..=6][0][0, 0, 0, 128, 0]`, or the unversioned static coder's `[0][order][0][tANS of nothing]`
+    /// (today's version-1 stream for empty input without its leading version byte).
+    fn is_legacy_empty(bs: &[u8]) -> bool {
+        const ADAPTIVE_TAIL: [u8; 5] = [0, 0, 0, 128, 0];
+        if bs.len() == 7 && bs[1] <= 6 && bs[2] == 0 && bs[3..] == ADAPTIVE_TAIL[1..] {
+            return true;
+        }
+        [Order::Zero, Order::One]
+            .into_iter()
+            .any(|o| compress(o, &[])[1..] == *bs)
+    }
+
+    /// The static coder as it was before it had a version byte: `[byteLen][order][stride][tANS stream]`.
+    fn try_decompress_static_unversioned(bs: &[u8]) -> Result<Vec<u8>, DecodeError> {
+        let mut p = 0usize;
+        let n = get_varint(bs, &mut p)?;
+        let order = get_varint(bs, &mut p)?;
+        let stride = get_varint(bs, &mut p)?;
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let n = usize::try_from(n).map_err(|_| DecodeError::TooLarge)?;
+        if n > super::DEFAULT_MAX_OUTPUT {
+            return Err(DecodeError::TooLarge);
+        }
+        let order = Order::from_wire(order).ok_or(DecodeError::Malformed)?;
+        let stride = usize::try_from(stride).map_err(|_| DecodeError::Malformed)?;
+        let stream = match order {
+            Order::Zero => super::tans::try_decompress4(&bs[p..])?,
+            Order::One => super::tans::try_decompress4_o1(&bs[p..])?,
+        };
+        if stream.len() != n {
+            return Err(DecodeError::Malformed);
+        }
+        Ok(if stride > 0 {
+            med_inverse(&stream, stride)
+        } else {
+            stream
+        })
+    }
+
+    /// Decode a version-1 stream; [`DecodeError::UnsupportedVersion`] for any other first byte.
+    fn try_decompress_v1(bs: &[u8]) -> Result<Vec<u8>, DecodeError> {
         let version = *bs.first().ok_or(DecodeError::Truncated)?;
         if version != VERSION {
             return Err(DecodeError::UnsupportedVersion(version));
@@ -7473,7 +7556,8 @@ pub mod web {
         /// A `String` column holds bytes that are not valid UTF-8 (derive-generated views).
         BadUtf8,
         /// A section table does not begin with the `WC` magic: not a table this crate wrote, or one written
-        /// before tables carried a version.
+        /// before tables carried a version. The derive-generated `collapse_decode` reads the latter through
+        /// `collapse_decode_legacy`; the zero-copy views (`collapse_open`) do not.
         BadMagic,
         /// A section table carries a version this build does not read; the payload is that version.
         UnsupportedVersion(u8),
@@ -7916,9 +8000,10 @@ pub mod web {
     }
 
     /// The version of the section-table layout written by this build. A reader accepts exactly this value
-    /// and returns [`WireErr::UnsupportedVersion`] for any other, so a layout change bumps it and old
-    /// buffers are refused rather than misread. The first versioned layout is 1; tables written before
-    /// versioning began carry no magic and are refused with [`WireErr::BadMagic`].
+    /// and returns [`WireErr::UnsupportedVersion`] for any other, so a layout change bumps it. The first
+    /// versioned layout is 1. Tables written before versioning began carry no magic: the zero-copy views
+    /// refuse them with [`WireErr::BadMagic`], and the owned `collapse_decode` reads them through the
+    /// derive-generated `collapse_decode_legacy`.
     pub const TABLE_VERSION: u8 = 1;
 
     /// The first word of every section table: the section count in the low 32 bits and, in the high 32
@@ -7943,21 +8028,43 @@ pub mod web {
     }
 
     impl<'a> Sections<'a> {
+        /// Open a section table written by this build: its first word carries the `WC` magic and
+        /// [`TABLE_VERSION`]. A table without the magic is [`WireErr::BadMagic`]; one written before
+        /// tables carried a version can be read with [`Sections::open_legacy`].
         pub fn open(buf: &'a [u8]) -> Result<Self, WireErr> {
+            Self::open_inner(buf, false)
+        }
+
+        /// Open a section table written before tables carried a version: its first word is the bare
+        /// section count (the high 32 bits are zero), with no magic. A current table (magic in the high
+        /// bits) is [`WireErr::BadMagic`] here, so the two readers never accept each other's tables. The
+        /// derive-generated `collapse_decode` falls back to this layout; see `collapse_decode_legacy`.
+        pub fn open_legacy(buf: &'a [u8]) -> Result<Self, WireErr> {
+            Self::open_inner(buf, true)
+        }
+
+        fn open_inner(buf: &'a [u8], legacy: bool) -> Result<Self, WireErr> {
             if buf.len() < 8 || !(buf.as_ptr() as usize).is_multiple_of(8) {
                 return Err(WireErr::Misaligned);
             }
             // SAFETY: 8-aligned, ≥8 bytes; read the table word (section count and magic).
             let word = unsafe { *buf.as_ptr().cast::<u64>() };
-            let tag = (word >> 32).to_le_bytes();
-            let tag = [tag[0], tag[1], tag[2], tag[3]];
-            if tag[0] != b'W' || tag[1] != b'C' || tag[3] != 0 {
-                return Err(WireErr::BadMagic);
-            }
-            if tag[2] != TABLE_VERSION {
-                return Err(WireErr::UnsupportedVersion(tag[2]));
-            }
-            let n = (word & 0xFFFF_FFFF) as usize;
+            let n = if legacy {
+                if word >> 32 != 0 {
+                    return Err(WireErr::BadMagic);
+                }
+                word as usize
+            } else {
+                let tag = (word >> 32).to_le_bytes();
+                let tag = [tag[0], tag[1], tag[2], tag[3]];
+                if tag[0] != b'W' || tag[1] != b'C' || tag[3] != 0 {
+                    return Err(WireErr::BadMagic);
+                }
+                if tag[2] != TABLE_VERSION {
+                    return Err(WireErr::UnsupportedVersion(tag[2]));
+                }
+                (word & 0xFFFF_FFFF) as usize
+            };
             let header = n
                 .checked_mul(2)
                 .and_then(|c| c.checked_add(1))
@@ -8170,6 +8277,14 @@ pub mod web {
         fn collapse_emit(items: &[Self], dst: &mut [u8]);
         /// Open a packed sub-buffer to its zero-copy view.
         fn collapse_open(bytes: &[u8]) -> Result<Self::View<'_>, WireErr>;
+        /// Decode, to owned records, a buffer written by an older version of this crate (before section
+        /// tables carried a version, and, for records, before each scalar field was its own column). The
+        /// derive implements it for records and enums, `Pod` types read the same layout as always, and
+        /// the default refuses ([`WireErr::BadMagic`]). The derive-generated `collapse_decode` calls it
+        /// when a buffer has no table magic; it is never a write path.
+        fn collapse_decode_legacy(_bytes: &[u8]) -> Result<Vec<Self>, WireErr> {
+            Err(WireErr::BadMagic)
+        }
         /// ONE 8-aligned allocation (sized by `collapse_size`), filled by `collapse_emit`. The composition
         /// of `size`+`emit` across the derive means the whole nested tree is this single allocation.
         #[must_use]
@@ -8211,6 +8326,10 @@ pub mod web {
         }
         fn collapse_open(bytes: &[u8]) -> Result<&[T], WireErr> {
             Ok(Wire::<T>::open(bytes)?.as_slice())
+        }
+        /// A `Pod` column has no table, so its layout never changed.
+        fn collapse_decode_legacy(bytes: &[u8]) -> Result<Vec<T>, WireErr> {
+            Ok(Wire::<T>::open(bytes)?.as_slice().to_vec())
         }
     }
 
@@ -8685,8 +8804,91 @@ pub fn decompress_framed(bytes: &[u8]) -> Vec<u8> {
 /// Checked [`decompress_framed`]: `Err` for truncated or inconsistent input. The declared length and
 /// every chunk length are validated against the input before anything is allocated.
 pub fn try_decompress_framed(bytes: &[u8]) -> Result<Vec<u8>, DecodeError> {
-    cm::try_decompress(bytes)
+    match cm::try_decompress(bytes) {
+        Ok(v) => Ok(v),
+        Err(e) => try_decompress_framed_legacy(bytes).map_err(|_| e),
+    }
 }
+
+/// Checked inverse of the framed stream the original `compress_at` wrote (and hashtrinity's before it):
+/// `[nchunks][chunk length…][chunk…]`, each chunk an old cm stream (see [`cm::try_decompress_legacy`]),
+/// decoded across the pool. [`try_decompress_framed`] falls back to this for anything that is not a
+/// version-1 stream; call it directly when the stream is known to be old. The chunk count and every
+/// chunk length are validated against the input before anything is allocated.
+#[cfg(feature = "compress")]
+pub fn try_decompress_framed_legacy(bytes: &[u8]) -> Result<Vec<u8>, DecodeError> {
+    use crate::par::{Pool, SendPtr};
+    let mut pos = 0usize;
+    let nch = read_len(bytes, &mut pos)?;
+    if nch == 0 {
+        return Ok(Vec::new());
+    }
+    // each chunk length is at least one varint byte, so a count beyond the remaining input is a lie
+    if nch > bytes.len() - pos {
+        return Err(DecodeError::Truncated);
+    }
+    let mut lens: Vec<usize> = try_vec(nch)?;
+    for _ in 0..nch {
+        lens.push(read_len(bytes, &mut pos)?);
+    }
+    let mut offs: Vec<(usize, usize)> = try_vec(nch)?;
+    let mut o = pos;
+    for &l in &lens {
+        let end = o
+            .checked_add(l)
+            .filter(|&e| e <= bytes.len())
+            .ok_or(DecodeError::Truncated)?;
+        offs.push((o, end));
+        o = end;
+    }
+    // the old writer framed exactly `[count][lengths][chunks]`: nothing follows the last chunk
+    if o != bytes.len() {
+        return Err(DecodeError::Malformed);
+    }
+    let mut parts: Vec<Result<Vec<u8>, DecodeError>> = (0..nch).map(|_| Ok(Vec::new())).collect();
+    if nch <= 1 {
+        parts[0] = cm::try_decompress_legacy(&bytes[offs[0].0..offs[0].1]);
+    } else {
+        let pool = Pool::global();
+        // wave-cap by the largest chunk so decode memory stays bounded (the tables are per chunk)
+        let maxc = lens.iter().copied().max().unwrap_or(1).max(1);
+        let wave = (LEGACY_MEM_BUDGET / (256 * maxc)).clamp(1, nch);
+        let pptr = SendPtr(parts.as_mut_ptr());
+        let mut base = 0;
+        while base < nch {
+            let this = wave.min(nch - base);
+            pool.dispatch(this, |t| {
+                let (a, b) = offs[base + t];
+                // SAFETY: task t writes only parts[base+t]; distinct t are disjoint.
+                unsafe { *pptr.add(base + t) = cm::try_decompress_legacy(&bytes[a..b]) };
+            });
+            base += this;
+        }
+    }
+    let mut total = 0usize;
+    for part in &parts {
+        let part = part.as_ref().map_err(|&e| e)?;
+        total = total
+            .checked_add(part.len())
+            .filter(|&t| t <= DEFAULT_MAX_OUTPUT)
+            .ok_or(DecodeError::TooLarge)?;
+    }
+    let mut out = try_vec(total)?;
+    for part in parts {
+        out.extend_from_slice(&part?);
+    }
+    Ok(out)
+}
+
+/// Peak-memory ceiling the old framed decoder used to bound how many chunks run at once.
+#[cfg(feature = "compress")]
+const LEGACY_MEM_BUDGET: usize = 3usize << 30;
+
+/// The context order the old API named as its default (`5`, capped to order 1 by the coder that wrote
+/// the stream). Kept so `compress_at(DEFAULT_ORDER, ..)` keeps compiling: it is now [`cm::Order::One`],
+/// which is what the cap made of the old value.
+#[cfg(feature = "compress")]
+pub const DEFAULT_ORDER: cm::Order = cm::Order::One;
 
 // ════════════════════════════════════════════════════════════════════════════
 // THE FACE-SELECTOR — route the whole stream to the right face by MEASURED shape.

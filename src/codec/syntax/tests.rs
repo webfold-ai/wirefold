@@ -456,14 +456,20 @@ mod tests {
                 "U+{c:04X} must not appear raw in the rendered JSON: {out:?}"
             );
             match parse_surface(Surface::Json, &out) {
-                Ok(SyntaxTerm::B(Atom::Str(back))) => assert_eq!(back, text, "U+{c:04X} round-trips"),
-                other => panic!("U+{c:04X}: {out:?} did not parse back to the same string: {other:?}"),
+                Ok(SyntaxTerm::B(Atom::Str(back))) => {
+                    assert_eq!(back, text, "U+{c:04X} round-trips");
+                }
+                other => {
+                    panic!("U+{c:04X}: {out:?} did not parse back to the same string: {other:?}")
+                }
             }
         }
         let nan = SyntaxTerm::B(Atom::Str("\0nonfinite:NaN".to_string()));
-        assert_eq!(render_surface(&nan, Surface::Json), "\"\\u0000nonfinite:NaN\"");
+        assert_eq!(
+            render_surface(&nan, Surface::Json),
+            "\"\\u0000nonfinite:NaN\""
+        );
     }
-
 
     /// `\b`, `\f` and `\uXXXX` are real JSON escapes. Dropping the backslash and keeping the letter
     /// silently aliases the key `"\b"` onto the key `"b"` — which is exactly how a HuggingFace

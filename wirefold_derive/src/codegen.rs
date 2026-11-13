@@ -432,6 +432,59 @@ pub(crate) fn derive_struct(name: &Ident, fields: &[Field]) -> proc_masq::TokenS
     }
     let aliases_j = concat_tokens(aliases);
 
+    // LEGACY layout (tables written before they carried a version): section 0 is ONE row-major block of
+    // every scalar field (`Wire<[u8; COLLAPSE_SCALAR_BYTES]>`, fields packed back to back with no
+    // padding), then one section per variable-length field, and a table word that is the bare section
+    // count. This owned decoder reads exactly that, recursing into nested tables with the same layout; it
+    // is only ever reached from `collapse_decode` when a buffer has no table magic.
+    let legacy_nsections = nonscalars.len() + 1;
+    let mut leg_cols: Vec<proc_masq::TokenStream> = Vec::new();
+    let mut leg_fields: Vec<proc_masq::TokenStream> = Vec::new();
+    for (j, (fname, ty, is_bool)) in scalars.iter().enumerate() {
+        let off = off_expr(&all_sty[..j]);
+        leg_fields.push(if *is_bool {
+            quote_tokens! { #fname: __b[#off] != 0 }
+        } else {
+            quote_tokens! { #fname: ::wirefold::codec::web::pod_read::<#ty>(&__b[#off..#off + ::core::mem::size_of::<#ty>()]) }
+        });
+    }
+    for (k, ns) in nonscalars.iter().enumerate() {
+        let cid = &col_ids[k];
+        let sec = k + 1;
+        match ns {
+            NonScalar::Str(fname) => {
+                leg_cols.push(quote_tokens! {
+                    let #cid = ::wirefold::codec::web::Ragged::open(s.section(#sec))?;
+                    if #cid.len() != __n {
+                        return ::core::result::Result::Err(::wirefold::codec::web::WireErr::BadLength);
+                    }
+                    for __i in 0..__n {
+                        if ::core::str::from_utf8(#cid.get(__i)).is_err() {
+                            return ::core::result::Result::Err(::wirefold::codec::web::WireErr::BadUtf8);
+                        }
+                    }
+                });
+                leg_fields.push(quote_tokens! {
+                    #fname: ::std::string::String::from_utf8(#cid.get(__i).to_vec())
+                        .map_err(|_| ::wirefold::codec::web::WireErr::BadUtf8)?
+                });
+            }
+            NonScalar::Vec(fname, inner) => {
+                leg_cols.push(quote_tokens! {
+                    let #cid = ::wirefold::codec::web::Sections::open_legacy(s.section(#sec))?;
+                    if #cid.len() != __n {
+                        return ::core::result::Result::Err(::wirefold::codec::web::WireErr::BadLength);
+                    }
+                });
+                leg_fields.push(quote_tokens! {
+                    #fname: <#inner as ::wirefold::codec::web::CollapseElem>::collapse_decode_legacy(#cid.section(__i))?
+                });
+            }
+        }
+    }
+    let leg_cols_j = concat_tokens(leg_cols);
+    let leg_fields_j = join_comma(leg_fields);
+
     quote_tokens! {
         impl #name {
             pub const COLLAPSE_SCALAR_BYTES: usize = #scalar_bytes;
@@ -442,9 +495,40 @@ pub(crate) fn derive_struct(name: &Ident, fields: &[Field]) -> proc_masq::TokenS
             /// Open + reconstruct OWNED records — the serde `deserialize`-to-`Vec<T>` equivalent
             /// (allocates the Strings/Vecs). For zero-copy reads use the `View` instead. Returns an
             /// error — never panics — for a malformed buffer (bad structure, non-UTF-8 `String`).
+            ///
+            /// A buffer without the table magic is read as the layout of tables written before they
+            /// carried a version (see [`Self::collapse_decode_legacy`]), so data written by an older
+            /// version of this crate stays readable; it is rewritten in the current layout the next time
+            /// it is packed.
             pub fn collapse_decode(bytes: &[u8]) -> ::core::result::Result<::std::vec::Vec<#name>, ::wirefold::codec::web::WireErr> {
                 // Canonical names, never the aliases: a field may have claimed those.
-                ::core::result::Result::Ok(#view::collapse_open(bytes)?.collapse_to_vec())
+                match #view::collapse_open(bytes) {
+                    ::core::result::Result::Ok(v) => ::core::result::Result::Ok(v.collapse_to_vec()),
+                    ::core::result::Result::Err(::wirefold::codec::web::WireErr::BadMagic) => {
+                        <#name>::collapse_decode_legacy(bytes)
+                    }
+                    ::core::result::Result::Err(e) => ::core::result::Result::Err(e),
+                }
+            }
+            /// Decode owned records from a table written before tables carried a version: a bare section
+            /// count as the table word, then one row-major block of every scalar field and one section per
+            /// `String`/`Vec` field. [`WireErr::BadMagic`] when `bytes` is not such a table. Never a write
+            /// path; `collapse_encode` always writes the current layout.
+            pub fn collapse_decode_legacy(bytes: &[u8]) -> ::core::result::Result<::std::vec::Vec<#name>, ::wirefold::codec::web::WireErr> {
+                let s = ::wirefold::codec::web::Sections::open_legacy(bytes)?;
+                if s.len() != #legacy_nsections {
+                    return ::core::result::Result::Err(::wirefold::codec::web::WireErr::BadLength);
+                }
+                let __scalars = ::wirefold::codec::web::Wire::<[u8; #name::COLLAPSE_SCALAR_BYTES]>::open(s.section(0))?;
+                let __n = __scalars.len();
+                #leg_cols_j
+                // a record count taken from the buffer must not size an allocation on its own
+                let mut __out = ::std::vec::Vec::with_capacity(__n.min(bytes.len()));
+                for __i in 0..__n {
+                    let __b = &__scalars.as_slice()[__i];
+                    __out.push(#name { #leg_fields_j });
+                }
+                ::core::result::Result::Ok(__out)
             }
         }
         #f_asserts_j
@@ -515,6 +599,9 @@ pub(crate) fn derive_struct(name: &Ident, fields: &[Field]) -> proc_masq::TokenS
             }
             fn collapse_open(bytes: &[u8]) -> ::core::result::Result<#view<'_>, ::wirefold::codec::web::WireErr> {
                 #view::collapse_open(bytes)
+            }
+            fn collapse_decode_legacy(bytes: &[u8]) -> ::core::result::Result<::std::vec::Vec<#name>, ::wirefold::codec::web::WireErr> {
+                <#name>::collapse_decode_legacy(bytes)
             }
         }
     }
@@ -620,8 +707,23 @@ pub(crate) fn derive_enum(name: &Ident, variants: &[Variant]) -> proc_masq::Toke
             /// Open + reconstruct OWNED records — the serde `deserialize`-to-`Vec<T>` equivalent.
             /// Returns an error — never panics — for a malformed buffer (bad structure, a tag no
             /// variant owns, a payload of the wrong size).
+            ///
+            /// A buffer without the table magic is read as the layout of tables written before they
+            /// carried a version (an enum's tag and payload sections are unchanged; only the table word
+            /// differs), so data written by an older version of this crate stays readable.
             pub fn collapse_decode(bytes: &[u8]) -> ::core::result::Result<::std::vec::Vec<#name>, ::wirefold::codec::web::WireErr> {
-                ::core::result::Result::Ok(#view::open(bytes)?.to_vec())
+                match #view::open(bytes) {
+                    ::core::result::Result::Ok(v) => ::core::result::Result::Ok(v.to_vec()),
+                    ::core::result::Result::Err(::wirefold::codec::web::WireErr::BadMagic) => {
+                        <#name>::collapse_decode_legacy(bytes)
+                    }
+                    ::core::result::Result::Err(e) => ::core::result::Result::Err(e),
+                }
+            }
+            /// Decode owned records from a table written before tables carried a version.
+            /// [`WireErr::BadMagic`] when `bytes` is not such a table. Never a write path.
+            pub fn collapse_decode_legacy(bytes: &[u8]) -> ::core::result::Result<::std::vec::Vec<#name>, ::wirefold::codec::web::WireErr> {
+                ::core::result::Result::Ok(#view::open_with(bytes, true)?.to_vec())
             }
         }
         /// Zero-copy view of a `Collapse` enum: tag + payload columns; `get(i)` reconstructs the variant.
@@ -633,7 +735,15 @@ pub(crate) fn derive_enum(name: &Ident, variants: &[Variant]) -> proc_masq::Toke
             /// Validates the whole column once: both sections, one payload per tag, every tag owned by a
             /// variant, every payload exactly its variant's size. `get` cannot panic on a column that opened.
             pub fn open(bytes: &'a [u8]) -> ::core::result::Result<Self, ::wirefold::codec::web::WireErr> {
-                let s = ::wirefold::codec::web::Sections::open(bytes)?;
+                Self::open_with(bytes, false)
+            }
+            /// [`Self::open`], or with `legacy` the table word of tables written before they carried a version.
+            fn open_with(bytes: &'a [u8], legacy: bool) -> ::core::result::Result<Self, ::wirefold::codec::web::WireErr> {
+                let s = if legacy {
+                    ::wirefold::codec::web::Sections::open_legacy(bytes)?
+                } else {
+                    ::wirefold::codec::web::Sections::open(bytes)?
+                };
                 if s.len() != 2 {
                     return ::core::result::Result::Err(::wirefold::codec::web::WireErr::BadLength);
                 }
@@ -712,6 +822,9 @@ pub(crate) fn derive_enum(name: &Ident, variants: &[Variant]) -> proc_masq::Toke
             }
             fn collapse_open(bytes: &[u8]) -> ::core::result::Result<#view<'_>, ::wirefold::codec::web::WireErr> {
                 #view::open(bytes)
+            }
+            fn collapse_decode_legacy(bytes: &[u8]) -> ::core::result::Result<::std::vec::Vec<#name>, ::wirefold::codec::web::WireErr> {
+                <#name>::collapse_decode_legacy(bytes)
             }
         }
     }

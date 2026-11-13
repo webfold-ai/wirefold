@@ -6,6 +6,27 @@ All notable changes to this crate are documented in this file. The format follow
 
 ## [Unreleased]
 
+### Fixed
+
+- Data written by earlier versions is readable again. The changes of 2026-11-09 (the static cm coder, the cm version
+  byte, the `Collapse` table header and the per-column layout) changed three on-disk formats without a way to read the
+  old ones, so a consumer that moved to this crate lost access to what it had stored (sangdb pins `ba9a712`, the
+  version before them). `codec::cm::try_decompress` now falls back to the formats written before the version byte
+  (the unversioned static coder, and the adaptive context-mixing coder of `ba9a712` and hashtrinity, with the old
+  decoder's rANS end-state check added so damaged or foreign input is refused); `codec::try_decompress_framed` reads
+  the old `compress_at` framing (`try_decompress_framed_legacy`); `compress`/`decompress` read old shaped streams,
+  including the hybrid face; and `collapse_decode` (derive-generated, structs and enums) reads tables without the `WC`
+  magic through `collapse_decode_legacy`, including nested tables and the old row-major scalar block. The old formats
+  are recognised without a marker they never had: the legacy reader is tried after a version-1 read fails, tables are
+  told apart by their first word, and the one residual ambiguity (an old stream of exactly one uncompressed byte) is
+  documented in `docs/USAGE.md`. Nothing legacy is ever written. Tests read real output of `ba9a712` and of the
+  unversioned static coder (`tests/fixtures/legacy_cm`, `tests/fixtures/legacy_collapse`), with truncation, bit-flip
+  and foreign-input checks (`tests/legacy_streams.rs`, `tests/legacy_collapse.rs`).
+- `codec::DEFAULT_ORDER` is back (as `cm::Order::One`, what the old value of 5 was capped to), so `compress_at(DEFAULT_ORDER, ..)`
+  compiles again.
+- The JSON renderer escapes every control character U+0000..U+001F (it wrote all but `\b \f \n \r \t` raw, which is invalid
+  JSON and which the parser here rejects). Found through sangdb's NaN sentinel string (webfold-ai/wirefold#11).
+
 ### Added
 
 - `serde` feature: `serde_bridge` converts any `Serialize`/`Deserialize` type to and from the universal `Term`,

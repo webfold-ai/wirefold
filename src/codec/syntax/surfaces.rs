@@ -1481,10 +1481,7 @@ fn find_balanced_close(s: &str, open: &str, close: &str) -> Option<usize> {
 
 fn push_escaped_json(out: &mut String, s: &str) {
     // Most strings need no escaping at all: one scan, one copy.
-    if !s
-        .bytes()
-        .any(|b| matches!(b, b'"' | b'\\') || b < 0x20)
-    {
+    if !s.bytes().any(|b| matches!(b, b'"' | b'\\') || b < 0x20) {
         out.push_str(s);
         return;
     }
