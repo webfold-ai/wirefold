@@ -5,7 +5,7 @@
 Report suspected vulnerabilities privately, through either:
 
 - GitHub private vulnerability reporting: <https://github.com/webfold-ai/wirefold/security/advisories/new>
-- Email: **security@twn.systems**
+- Email: **security@webfold.ai**
 
 Do not open a public issue or pull request for an unpatched vulnerability. Include the affected version or
 commit, the impact, and steps to reproduce (a minimal input that triggers it is ideal). The maintainers
