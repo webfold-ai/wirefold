@@ -52,7 +52,14 @@ Every table starts with a header word: the section count in the low 32 bits, the
 version (`codec::web::TABLE_VERSION`, now 1) and a zero. A reader accepts exactly its own version and returns
 `WireErr::UnsupportedVersion(v)` for another, and `WireErr::BadMagic` for bytes that are not a table or that were
 written before tables carried a version (including every buffer from before the per-field column layout). Nested
-record tables carry their own header. A flat array of plain values (`Wire<T>`, what a `Vec<u64>` packs to) is not a
+record tables carry their own header.
+
+`collapse_decode` (owned records) still reads those older tables: when a buffer has no `WC` magic it decodes the
+layout wirefold wrote up to `ba9a712` (and hashtrinity before it), a bare section count followed by one row-major
+block of every scalar field, through the derive-generated `collapse_decode_legacy`. The two layouts are told
+apart by the table word alone, and neither reader accepts the other's tables. The zero-copy views
+(`collapse_open`) read current tables only, and `collapse_encode` always writes the current layout, so old data is
+rewritten in the new layout the next time it is packed. A flat array of plain values (`Wire<T>`, what a `Vec<u64>` packs to) is not a
 table and has no header.
 
 ## Structs to and from text: `#[derive(Term)]`
@@ -134,10 +141,17 @@ let records = EventView::collapse_open(&bytes)?.collapse_to_vec();
 ```
 
 The raw coder is `codec::compress_at(codec::cm::Order::One, &bytes)` (or `Order::Zero`). Its stream starts with
-a version byte (`codec::cm::VERSION`); a reader accepts exactly that version and returns
-`DecodeError::UnsupportedVersion` for any other, so streams from a different version, including those written
-before the byte existed, are refused rather than misread. For bytes you did
-not produce yourself, use `codec::try_decompress_framed`, which returns an error on malformed input.
+a version byte (`codec::cm::VERSION`). `codec::cm::try_decompress` reads it, and otherwise falls back to the
+formats written before the byte existed: the unversioned static coder, and the adaptive context-mixing coder
+wirefold had up to `ba9a712` and hashtrinity before it (`[byteLen][order][stride][rANS]`, orders 0 to 6). The old
+`compress_at` framing (`[nchunks][lengths][chunks]`) is read by `codec::try_decompress_framed`, which falls back
+to `codec::try_decompress_framed_legacy`. Those formats had no marker, so they are recognised by decoding, and
+the old adaptive decoder checks the rANS end state (a valid stream returns to the initial state with every byte
+consumed), so damaged, truncated or foreign input is refused. The one residual ambiguity: an old stream whose
+uncompressed length is exactly one byte begins with the same byte as a version-1 stream, and is tried as
+version 1 first. Anything that is none of these returns `DecodeError::UnsupportedVersion`. `codec::DEFAULT_ORDER`
+is kept (it is `cm::Order::One`, what the old default capped to) so `compress_at(DEFAULT_ORDER, ..)` compiles. For
+bytes you did not produce yourself, use `codec::try_decompress_framed`, which returns an error on malformed input.
 
 ## MessagePack
 

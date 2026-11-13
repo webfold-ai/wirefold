@@ -851,8 +851,10 @@ fn cm_stream_version_order_and_header_are_checked() {
             DecodeError::UnsupportedVersion(v)
         );
     }
-    // a stream written before the version byte existed (it began with the length) is not read
-    assert!(cm::try_decompress(&enc[1..]).is_err());
+    // a stream written before the version byte existed (it began with the length) IS read: without its
+    // version byte this stream is exactly the unversioned static coder's format (see
+    // tests/legacy_streams.rs for streams written by the real older versions)
+    assert_eq!(cm::try_decompress(&enc[1..]).unwrap(), data);
     // truncated headers: nothing, the version only, then each header varint cut short
     assert_eq!(cm::try_decompress(&[]).unwrap_err(), DecodeError::Truncated);
     assert_eq!(
