@@ -441,6 +441,30 @@ mod tests {
         }));
     }
 
+    /// Every control character U+0000..U+001F must be written as an escape (RFC 8259 §7): a raw one is invalid
+    /// JSON, and the parser here refuses it, so a string carrying one (e.g. the `"\0nonfinite:NaN"` sentinel
+    /// sangdb stores for a NaN number) used to render fine and then fail to parse back.
+    #[test]
+    fn json_render_escapes_every_control_character_and_round_trips() {
+        for c in 0u32..0x20 {
+            let ch = char::from_u32(c).unwrap();
+            let text = format!("a{ch}b\0c");
+            let term = SyntaxTerm::B(Atom::Str(text.clone()));
+            let out = render_surface(&term, Surface::Json);
+            assert!(
+                out.bytes().all(|b| b >= 0x20),
+                "U+{c:04X} must not appear raw in the rendered JSON: {out:?}"
+            );
+            match parse_surface(Surface::Json, &out) {
+                Ok(SyntaxTerm::B(Atom::Str(back))) => assert_eq!(back, text, "U+{c:04X} round-trips"),
+                other => panic!("U+{c:04X}: {out:?} did not parse back to the same string: {other:?}"),
+            }
+        }
+        let nan = SyntaxTerm::B(Atom::Str("\0nonfinite:NaN".to_string()));
+        assert_eq!(render_surface(&nan, Surface::Json), "\"\\u0000nonfinite:NaN\"");
+    }
+
+
     /// `\b`, `\f` and `\uXXXX` are real JSON escapes. Dropping the backslash and keeping the letter
     /// silently aliases the key `"\b"` onto the key `"b"` — which is exactly how a HuggingFace
     /// `tokenizer.json` loses the letter *b* to the control character. `\uXXXX` lands as

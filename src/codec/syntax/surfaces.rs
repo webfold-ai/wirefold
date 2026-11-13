@@ -1483,7 +1483,7 @@ fn push_escaped_json(out: &mut String, s: &str) {
     // Most strings need no escaping at all: one scan, one copy.
     if !s
         .bytes()
-        .any(|b| matches!(b, b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 0x08 | 0x0c))
+        .any(|b| matches!(b, b'"' | b'\\') || b < 0x20)
     {
         out.push_str(s);
         return;
@@ -1500,6 +1500,16 @@ fn push_escaped_json(out: &mut String, s: &str) {
             '\t' => "\\t",
             '\u{08}' => "\\b",
             '\u{0c}' => "\\f",
+            // RFC 8259 §7: every other control character (U+0000..U+001F) must be written as \u00XX; a raw one is
+            // invalid JSON, and this crate's own parser refuses it ("control character in string").
+            c if (c as u32) < 0x20 => {
+                out.push_str(&s[run..i]);
+                out.push_str("\\u00");
+                out.push(char::from_digit((c as u32) >> 4, 16).unwrap_or('0'));
+                out.push(char::from_digit((c as u32) & 0xf, 16).unwrap_or('0'));
+                run = i + 1;
+                continue;
+            }
             _ => continue,
         };
         out.push_str(&s[run..i]);
