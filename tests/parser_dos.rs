@@ -110,8 +110,8 @@ fn rdfxml_nested_parse_type_resource_errors() {
 
 /// A chain `n` levels deep, built iteratively. Terms built in memory (not by a parser) can be
 /// deeper than any parser allows, so the renderers must not recurse per level. Dropping one recurses per
-/// level in the derived `Drop` of `SyntaxTerm` (which is not what is under test), so it is dropped on a
-/// thread with a stack large enough for that, rather than leaked: a leak would hide real ones from a
+/// level in the derived `Drop` of `SyntaxTerm` (which is not what is under test), so it is dropped by
+/// `drop_iteratively`, rather than leaked: a leak would hide real ones from a
 /// sanitizer's leak check.
 fn deep_chain(n: usize, objects: bool) -> wirefold::codec::syntax::SyntaxTerm {
     use wirefold::codec::syntax::{Atom, SyntaxTerm};
@@ -129,13 +129,28 @@ fn deep_chain(n: usize, objects: bool) -> wirefold::codec::syntax::SyntaxTerm {
 fn render_deep(surface: Surface, n: usize, objects: bool) -> String {
     let t = deep_chain(n, objects);
     let out = wirefold::codec::syntax::render_surface(&t, surface);
-    std::thread::Builder::new()
-        .stack_size(1 << 30)
-        .spawn(move || drop(t))
-        .expect("spawn the dropping thread")
-        .join()
-        .expect("a deep term drops without overflowing the stack");
+    drop_iteratively(t);
     out
+}
+
+/// Frees a deep chain without recursing per level. The derived `Drop` of `SyntaxTerm` recurses once per
+/// level, which overflowed even a 1 GiB stack under ThreadSanitizer (larger frames) at a million levels.
+/// Every level of these chains owns exactly one child: detach it and let the emptied parent drop.
+fn drop_iteratively(mut t: wirefold::codec::syntax::SyntaxTerm) {
+    use wirefold::codec::syntax::SyntaxTerm;
+    loop {
+        t = match t {
+            SyntaxTerm::Bu(mut v) => match v.pop() {
+                Some((_, child)) => child,
+                None => return,
+            },
+            SyntaxTerm::Fourth(mut v) => match v.pop() {
+                Some(child) => child,
+                None => return,
+            },
+            _ => return,
+        };
+    }
 }
 
 #[test]
