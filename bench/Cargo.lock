@@ -26,7 +26,7 @@ dependencies = [
 [[package]]
 name = "apeiron"
 version = "0.1.0"
-source = "git+https://github.com/webfold-ai/apeiron?rev=d0eda3226193542949306f767d7280404921546f#d0eda3226193542949306f767d7280404921546f"
+source = "git+https://github.com/webfold-ai/apeiron?rev=85b404b8dc89903c5c588a2cd1d10bfa5b9e64bc#85b404b8dc89903c5c588a2cd1d10bfa5b9e64bc"
 dependencies = [
  "libc",
 ]
