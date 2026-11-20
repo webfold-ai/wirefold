@@ -6597,8 +6597,9 @@ pub mod tans {
         let raw = take_slice(bytes, p, 2 * (max_sym + 1))?;
         let mut norm = [0u16; 256];
         let mut sum = 0u32;
-        for (n, c) in norm.iter_mut().zip(raw.chunks_exact(2)) {
-            *n = u16::from_le_bytes([c[0], c[1]]);
+        let (pairs, _) = raw.as_chunks::<2>();
+        for (n, c) in norm.iter_mut().zip(pairs) {
+            *n = u16::from_le_bytes(*c);
             sum += u32::from(*n);
         }
         if sum != 1u32 << table_log {

@@ -329,7 +329,9 @@ fn nested_tables_carry_the_version() {
     // every occurrence of a table header inside the buffer carries the same tag: the outer table and one
     // per record's `items` table, found by their 8-aligned `[n][W C v 0]` words
     let tags = b
-        .chunks_exact(8)
+        .as_chunks::<8>()
+        .0
+        .iter()
         .filter(|w| w[4..8] == [b'W', b'C', TABLE_VERSION, 0])
         .count();
     assert!(tags > src.len(), "found {tags} tagged tables");

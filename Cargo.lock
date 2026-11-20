@@ -11,7 +11,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 [[package]]
 name = "apeiron"
 version = "0.1.0"
-source = "git+https://github.com/webfold-ai/apeiron?rev=1c3d4a1da565cde409f6f3cb343086aa6853eb9c#1c3d4a1da565cde409f6f3cb343086aa6853eb9c"
+source = "git+https://github.com/webfold-ai/apeiron?rev=85b404b8dc89903c5c588a2cd1d10bfa5b9e64bc#85b404b8dc89903c5c588a2cd1d10bfa5b9e64bc"
 dependencies = [
  "libc",
 ]

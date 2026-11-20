@@ -23,7 +23,7 @@ rust-version = "1.89"
 exclude = [".github/", "deny.toml"]
 
 [dependencies]
-apeiron = { version = "0.1.0", git = "https://github.com/webfold-ai/apeiron", rev = "1c3d4a1da565cde409f6f3cb343086aa6853eb9c" }
+apeiron = { version = "0.1.0", git = "https://github.com/webfold-ai/apeiron", rev = "85b404b8dc89903c5c588a2cd1d10bfa5b9e64bc" }
 wirefold_derive = { version = "0.1.0", path = "wirefold_derive", optional = true }
 serde = { version = "1", default-features = false, features = ["std"], optional = true }
 

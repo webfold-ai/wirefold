@@ -1308,15 +1308,14 @@ fn parse_generic_param(item: &TokenStream, at: &Cursor) -> Result<GenericParam, 
     while matches!(c.peek(), Some(TokenTree::Punct(p)) if p.ch == '#') {
         attrs.push(Attribute::from_tokens(&mut c)?);
     }
-    let kind;
-    if c.punct('\'') {
-        kind = GenericKind::Lifetime;
+    let kind = if c.punct('\'') {
+        GenericKind::Lifetime
     } else if matches!(c.peek(), Some(TokenTree::Ident(i)) if i.sym == "const") {
         c.next();
-        kind = GenericKind::Const;
+        GenericKind::Const
     } else {
-        kind = GenericKind::Type;
-    }
+        GenericKind::Type
+    };
     let name = c
         .ident()
         .ok_or_else(|| ParseError::new("expected a generic parameter name", at))?;
