@@ -360,8 +360,8 @@ for any format that holds recall, which is where an index stops being optional; 
 
 Named, since I was asked to:
 
-- **I never ran sangdb's own code.** I read `sangdb::vector`, `mrl` and `quant` (the TurboQuant column, the two-stage
-  read, the dispatch) and benchmarked my own kernels on the same ideas. Whether sangdb's kernels are faster or
+- **I never ran iotadb's own code.** I read `iotadb::vector`, `mrl` and `quant` (the TurboQuant column, the two-stage
+  read, the dispatch) and benchmarked my own kernels on the same ideas. Whether iotadb's kernels are faster or
   slower than these is unknown.
 - **The scan reaches about half the raw read bandwidth and I do not know why.**
 - **int8 is not using VNNI.** The machine has AVX-512 VNNI; the int8 kernel is AVX2 `maddubs`. There is headroom I have not taken.
@@ -369,11 +369,11 @@ Named, since I was asked to:
   int8, for a quarter of the bytes. In DRAM the byte saving is real, but their recall is the problem on the isotropic corpus.
 - **Everything is synthetic.** No real model, no real corpus, one machine, four threads. The core time per row is
   assumed to scale linearly to many machines; that follows from the static partition but was not measured past 4 cores.
-- **No index.** `lsh` and `graph_vec` exist in sangdb and are not measured; the cost model is an exact scan only.
+- **No index.** `lsh` and `graph_vec` exist in iotadb and are not measured; the cost model is an exact scan only.
 - **Re-rank IO is not priced** (100 random 4 KiB reads per query from SSD).
 - **Nothing is calibrated.** tcofold's rule is no refit before 8 paid or metered outcomes (`calibration::MIN_SAMPLE`); there are none.
 - **Insert, update, delete and the persistence format are not measured.** Neither are filtered queries.
-- **No embedding column type exists in wirefold's library,** and none of this lives in sangdb: it is a benchmark and a costing module.
+- **No embedding column type exists in wirefold's library,** and none of this lives in iotadb: it is a benchmark and a costing module.
 - **spbench was not run.** The `BENCH_QUALITY` and `BENCH_TOK_S` markers follow its harness document; I did not build spbench to check they parse.
 - **The tcofold tests ran on a copy with its own workspace,** not through ai-gateway's workspace, which needs private git dependencies.
 

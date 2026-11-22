@@ -5,7 +5,7 @@
 //!
 //! * `adaptive_*`, `framed_*`, `shaped_*`: wirefold `ba9a712`, whose cm coder is the adaptive context-mixing
 //!   coder hashtrinity had before it (`[byteLen][order][stride][rANS]`, orders 0..=6; `compress_at` frames
-//!   chunks as `[nchunks][lengths][chunks]`; `compress` adds a face tag). This is the format sangdb data was
+//!   chunks as `[nchunks][lengths][chunks]`; `compress` adds a face tag). This is the format iotadb data was
 //!   written in.
 //! * `static_*`: the unversioned static coder that followed it (`[byteLen][order][stride][tANS]`).
 //!
