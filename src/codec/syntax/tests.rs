@@ -443,7 +443,7 @@ mod tests {
 
     /// Every control character U+0000..U+001F must be written as an escape (RFC 8259 §7): a raw one is invalid
     /// JSON, and the parser here refuses it, so a string carrying one (e.g. the `"\0nonfinite:NaN"` sentinel
-    /// sangdb stores for a NaN number) used to render fine and then fail to parse back.
+    /// iotadb stores for a NaN number) used to render fine and then fail to parse back.
     #[test]
     fn json_render_escapes_every_control_character_and_round_trips() {
         for c in 0u32..0x20 {

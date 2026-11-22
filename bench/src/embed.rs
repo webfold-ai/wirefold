@@ -5,7 +5,7 @@
 //!   - encode and decode throughput (static partition of the rows over `par::Pool`, no shared state);
 //!   - exact top-k scan latency (each task scans a contiguous row range into its own top-k; the lists merge
 //!     associatively), single-core ns per row, and recall@10 against the exact f32 answer;
-//!   - the two-stage read sangdb's `mrl` face does: scan a small column, re-rank the shortlist at f32.
+//!   - the two-stage read iotadb's `mrl` face does: scan a small column, re-rank the shortlist at f32.
 //!
 //! The corpus is SYNTHETIC (clustered, with a decaying per-dimension variance spectrum so prefixes carry most
 //! of the energy the way a Matryoshka-trained model's do; `iso` is the isotropic worst case with no structure).
@@ -21,7 +21,7 @@ use wirefold::par::Pool;
 
 const D: usize = 1024;
 const K: usize = 10;
-/// Shortlist multiplier of the two-stage read (sangdb's `mrl_search` default is `k * 8`; 10 is used here).
+/// Shortlist multiplier of the two-stage read (iotadb's `mrl_search` default is `k * 8`; 10 is used here).
 const RERANK: usize = 10;
 
 struct Rng(u64);
@@ -109,7 +109,7 @@ fn normalize(v: &mut [f32]) {
     }
 }
 
-// ---------- the rotation (sangdb's TurboQuant step: signs + normalised Walsh-Hadamard, twice) ----------
+// ---------- the rotation (iotadb's TurboQuant step: signs + normalised Walsh-Hadamard, twice) ----------
 
 fn fwht(a: &mut [f32]) {
     let m = a.len();
@@ -216,7 +216,7 @@ enum Kind {
     /// int8 / int4 after the rotation (the coordinates are equalised before the per-vector scale is taken).
     I8R,
     I4R,
-    /// 2 bits per coordinate after the rotation, fixed Gaussian Lloyd-Max levels (sangdb's TurboQuant cell).
+    /// 2 bits per coordinate after the rotation, fixed Gaussian Lloyd-Max levels (iotadb's TurboQuant cell).
     B2,
     /// the sign of each rotated coordinate.
     Bin,
