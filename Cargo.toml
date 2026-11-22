@@ -29,6 +29,8 @@ serde = { version = "1", default-features = false, features = ["std"], optional 
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
+# Property tests with shrinking (tests/properties.rs). No default features: no fork, no timeout, no bit-set.
+proptest = { version = "1", default-features = false, features = ["std"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(procmasq_no_export)'] }
