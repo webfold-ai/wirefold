@@ -1,0 +1,78 @@
+name: Release on main
+
+# Every push to main is a release. `caretakers-bump` plans the semver bump from the conventional
+# commits since the last tag, rewrites Cargo.toml/Cargo.lock/CHANGELOG.md, commits, and pushes the
+# `vX.Y.Z` tag; `release.yml` then packages, signs and attests it.
+#
+# Without this, the crate stays at 0.1.0 with no tag forever, and its dependents can only pin
+# `rev = "<sha>"` — which is why a one-line fix here used to need a hand-move in every repository
+# that depends on it.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-on-main
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: bump, changelog, tag
+    # The bump's own commit must not start another release.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      !contains(github.event.head_commit.message, '[caretakers-bump]')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out main with tags
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          # caretakers-bump diffs against the last tag.
+          fetch-depth: 0
+          # A tag pushed with GITHUB_TOKEN does not start a workflow; RELEASE_TOKEN (a PAT or app
+          # token) does, and is also what lets the Release workflow run from this tag.
+          token: ${{ secrets.RELEASE_TOKEN || github.token }}
+
+      - name: Identity for the bump commit
+        run: |
+          git config user.name "caretakers-bump"
+          git config user.email "caretakers-bump@twn.systems"
+
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+
+      # The house tool, at a pinned revision (DEP-1: a git source at a full sha, never a path).
+      # Bump this rev with caretaker-pins like any other pinned dependency.
+      - name: Build caretakers-bump
+        env:
+          CARETAKER_REV: a0f8f0c95d9cdf83e01a0b381e360a2c5787ff7e
+        run: cargo install --locked --git https://github.com/webfold-ai/caretaker --rev "$CARETAKER_REV" caretaker-bump
+
+      - name: Is a release owed?
+        id: plan
+        run: |
+          caretakers-bump --package wirefold plan --json | tee plan.json
+          bump=$(python3 -c 'import json;print(json.load(open("plan.json"))["bump"])')
+          echo "bump=$bump"
+          echo "owed=$([ "$bump" = none ] && echo no || echo yes)" >> "$GITHUB_OUTPUT"
+
+      # Unsigned tags: signing is the tool's default and a release runner has no key. Add a
+      # signing key to the runner before dropping --no-sign.
+      - name: Release
+        if: steps.plan.outputs.owed == 'yes'
+        id: release
+        run: |
+          caretakers-bump --package wirefold --no-sign apply --auto-push
+          echo "tag=$(git describe --tags --abbrev=0)" >> "$GITHUB_OUTPUT"
+
+      - name: Start the tag-triggered Release workflow
+        if: steps.release.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: gh workflow run release.yml --ref "$TAG"
