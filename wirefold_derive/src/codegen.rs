@@ -485,6 +485,29 @@ pub(crate) fn derive_struct(name: &Ident, fields: &[Field]) -> proc_masq::TokenS
     let leg_cols_j = concat_tokens(leg_cols);
     let leg_fields_j = join_comma(leg_fields);
 
+    // The expansion is emitted in three functions, one per top-level item. It used to be one
+    // `quote_tokens!` block; that function compiled to a WASM function with more locals than a
+    // proc-macro host will translate ("too many locals", indexable-inc/blaze#2449), so every
+    // derive in this crate was unavailable there. The tokens are identical, only the function
+    // boundaries moved.
+    let mut out = derive_struct_emit_impl(f_asserts_j, leg_cols_j, leg_fields_j, legacy_nsections, name.clone(), scalar_bytes, view.clone());
+    out.extend(derive_struct_emit_view(aliases_j, col_accs_j, col_checks_j, col_opens_j, f_accs_j, f_checks_j, f_opens_j, f_slices_j, f_view_fields_j, f_view_inits_j, get_ref_method, name.clone(), nsections, owned_fields_j, ref_struct, vec_owned_fields_j, view.clone(), view_fields_j, view_inits_j).into_tokens());
+    out.extend(derive_struct_emit_elem(col_size_lets_j, f_inits_j, f_size_ids_j, f_size_lets_j, f_writes_j, name.clone(), str_finals_j, str_inits_j, str_scatters_j, sz_ids_j, vec_emits_j, view.clone()).into_tokens());
+    out
+}
+
+/// One section of the `Collapse` expansion. Split out of `derive_struct` one top-level item
+/// per function: see `derive_struct`.
+#[allow(clippy::too_many_arguments)]
+fn derive_struct_emit_impl(
+    f_asserts_j: proc_masq::TokenStream,
+    leg_cols_j: proc_masq::TokenStream,
+    leg_fields_j: proc_masq::TokenStream,
+    legacy_nsections: usize,
+    name: proc_masq::Ident,
+    scalar_bytes: proc_masq::TokenStream,
+    view: proc_masq::Ident,
+) -> proc_masq::TokenStream {
     quote_tokens! {
         impl #name {
             pub const COLLAPSE_SCALAR_BYTES: usize = #scalar_bytes;
@@ -532,6 +555,34 @@ pub(crate) fn derive_struct(name: &Ident, fields: &[Field]) -> proc_masq::TokenS
             }
         }
         #f_asserts_j
+    }
+}
+
+/// One section of the `Collapse` expansion. Split out of `derive_struct` one top-level item
+/// per function: see `derive_struct`.
+#[allow(clippy::too_many_arguments)]
+fn derive_struct_emit_view(
+    aliases_j: proc_masq::TokenStream,
+    col_accs_j: proc_masq::TokenStream,
+    col_checks_j: proc_masq::TokenStream,
+    col_opens_j: proc_masq::TokenStream,
+    f_accs_j: proc_masq::TokenStream,
+    f_checks_j: proc_masq::TokenStream,
+    f_opens_j: proc_masq::TokenStream,
+    f_slices_j: proc_masq::TokenStream,
+    f_view_fields_j: proc_masq::TokenStream,
+    f_view_inits_j: proc_masq::TokenStream,
+    get_ref_method: proc_masq::TokenStream,
+    name: proc_masq::Ident,
+    nsections: usize,
+    owned_fields_j: proc_masq::TokenStream,
+    ref_struct: proc_masq::TokenStream,
+    vec_owned_fields_j: proc_masq::TokenStream,
+    view: proc_masq::Ident,
+    view_fields_j: proc_masq::TokenStream,
+    view_inits_j: proc_masq::TokenStream,
+) -> proc_masq::TokenStream {
+    quote_tokens! {
         pub struct #view<'a> {
             #f_view_fields_j
             #view_fields_j
@@ -571,6 +622,27 @@ pub(crate) fn derive_struct(name: &Ident, fields: &[Field]) -> proc_masq::TokenS
             #col_accs_j
             #get_ref_method
         }
+    }
+}
+
+/// One section of the `Collapse` expansion. Split out of `derive_struct` one top-level item
+/// per function: see `derive_struct`.
+#[allow(clippy::too_many_arguments)]
+fn derive_struct_emit_elem(
+    col_size_lets_j: proc_masq::TokenStream,
+    f_inits_j: proc_masq::TokenStream,
+    f_size_ids_j: proc_masq::TokenStream,
+    f_size_lets_j: proc_masq::TokenStream,
+    f_writes_j: proc_masq::TokenStream,
+    name: proc_masq::Ident,
+    str_finals_j: proc_masq::TokenStream,
+    str_inits_j: proc_masq::TokenStream,
+    str_scatters_j: proc_masq::TokenStream,
+    sz_ids_j: proc_masq::TokenStream,
+    vec_emits_j: proc_masq::TokenStream,
+    view: proc_masq::Ident,
+) -> proc_masq::TokenStream {
+    quote_tokens! {
         impl ::wirefold::codec::web::CollapseElem for #name {
             type View<'a> = #view<'a>;
             fn collapse_size(items: &[#name]) -> usize {
