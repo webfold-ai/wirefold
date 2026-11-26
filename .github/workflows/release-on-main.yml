@@ -2,11 +2,9 @@ name: Release on main
 
 # Every push to main is a release. `caretakers-bump` plans the semver bump from the conventional
 # commits since the last tag, rewrites Cargo.toml/Cargo.lock/CHANGELOG.md, commits, and pushes the
-# `vX.Y.Z` tag; `release.yml` then packages, signs and attests it.
-#
-# Without this, the crate stays at 0.1.0 with no tag forever, and its dependents can only pin
-# `rev = "<sha>"` — which is why a one-line fix here used to need a hand-move in every repository
-# that depends on it.
+# `vX.Y.Z` tag. Without this the crate stays at its current version with no tag forever, and its
+# dependents can only pin `rev = "<sha>"` — which is why a one-line fix here used to need a hand-move
+# in every repository that depends on it.
 
 on:
   push:
@@ -75,4 +73,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
           TAG: ${{ steps.release.outputs.tag }}
-        run: gh workflow run release.yml --ref "$TAG"
+        run: |
+          if gh workflow view release.yml >/dev/null 2>&1; then
+            gh workflow run release.yml --ref "$TAG"
+          else
+            echo "this repository has no release.yml: the tag is the release"
+          fi
