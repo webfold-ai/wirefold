@@ -770,6 +770,52 @@ measured. The size claims are unaffected because they are machine-independent:
 | encoded planes | 107638 | 219402 | **2.04x smaller** |
 | columns | 167109 | 219402 | **1.31x smaller** |
 
+### Same-machine A/B: `75e99d9` (2026-11-13) against HEAD, today
+
+To separate "the machine changed" from "the code changed", the recorded run's commit was built and
+run on the same box, minutes apart from the HEAD run:
+
+```
+cd bench && cargo run -j 1 --release --quiet --bin wirefold-bench -- 20000 3   # at each commit
+```
+
+Dataset 1 (telemetry-shaped, 20,000 records), milliseconds:
+
+| pipeline | encode 75e99d9 | encode HEAD | factor | decode 75e99d9 | decode HEAD | factor |
+|---|---:|---:|---:|---:|---:|---:|
+| wirefold Collapse raw | 0.38 | 0.79 | 2.08x | 1.84 | 3.77 | **2.05x** |
+| bincode 1.3 raw | 0.30 | 0.55 | 1.83x | 1.18 | 2.41 | **2.04x** |
+| rkyv 0.8 (validated) raw | 0.29 | 0.59 | 2.03x | 1.07 | 2.43 | 2.27x |
+| wirefold columns + encoded planes, zstd -3 | 5.30 | 11.21 | 2.12x | 2.96 | 4.62 | 1.56x |
+| bincode + zstd -3 | 3.30 | 7.42 | 2.25x | 2.02 | 4.03 | 2.00x |
+
+The multiplier is *the same for wirefold and for the baselines* — 2.05x against bincode's 2.04x on
+decode — so no regression is visible for the raw path. Across the bench's three datasets and both
+directions the same-code factors span **0.73x to 2.52x** for every arm, including the ones that did
+not change: the run-to-run noise on this loaded box (load average 10.94) is larger than any
+wirefold-specific effect. Settling it needs a quiet machine, pinned cores and more than three runs;
+that measurement has not been taken, so this file claims neither a regression nor its absence.
+
+### Known cost: encode allocation *calls* in the columnar path
+
+The allocation column is `N (M)` — **N allocation calls, M MiB requested** — and the deployable
+configuration is the one place wirefold is behind:
+
+| | encode | decode |
+|---|---|---|
+| wirefold columns + encoded planes, zstd -3 | **245 calls, 7.9 MiB** | 20112 calls, 5.9 MiB |
+| wirefold raw | 3 calls, 1.5 MiB | 20001 calls, 1.1 MiB |
+| bincode + zstd -3 | **1 call, 0.7 MiB** | 20001 calls, 1.1 MiB |
+| rkyv (validated) raw | 18 calls, 2.9 MiB | 20002 calls, 2.1 MiB |
+
+It is the same at `75e99d9` (245 calls, 7.9 MiB), so it is a property of the design, not a change:
+each column is packed as its own seed with its own string sections. `CollapseElem::collapse_pack`
+already does the right thing *per element type* — it computes the length, allocates once and emits
+in place (`src/codec.rs`, the `collapse_pack` default body) — the columns path simply does not
+aggregate across columns. The fix is that same pattern applied once to the whole buffer: a size pass
+over all sections, one allocation, emit in place. Until then, every claim about the columnar
+configuration should carry the allocation cost beside it.
+
 **What to quote from this file.** Sizes and ratios; not absolute milliseconds. If an absolute
 number matters, re-run the command above on the machine in question and add a dated section — that
 is what this section is.
