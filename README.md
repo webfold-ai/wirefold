@@ -32,6 +32,9 @@ wirefold = { git = "https://github.com/webfold-ai/wirefold", features = ["derive
   method, the data generators and the limits.
 - [Benchmarks](docs/BENCHMARKS.md): wirefold against serde_json, bincode, postcard, rmp-serde, rkyv and zstd,
   with the harness in `bench/` and a plain statement of where it wins and where it does not.
+- [Composition](docs/COMPOSITION.md): how the speed (`web`), size (`cm`) and surface (`syntax`) faces are used
+  together without trading one for another — one canonical buffer, the other two at its edges, with the
+  per-operation complexity and the per-plane table.
 - [Contributing](CONTRIBUTING.md), [security policy](SECURITY.md), [code of conduct](CODE_OF_CONDUCT.md),
   [changelog](CHANGELOG.md).
 
