@@ -45,7 +45,12 @@ Consequences, all of which are properties of the layout rather than of any code 
 same object under different compression settings still agree on its address, and a recompression
 never mints a new object.
 
-Decompression is O(bytes), paid once per load and never per access. So "mutually exclusive" becomes
+Decompression is O(bytes), paid once per load and never per access.
+
+Measured, not assumed: re-running the serialization bench on a second machine reproduced every
+serialized size to the byte for 44 of 45 rows, while the entropy-coded form of an identical input
+shifted by 3 bytes (222540 -> 222543). A compressed byte stream is not a stable address; the
+canonical bytes are (`docs/BENCHMARKS.md`, re-run 2026-11-27). So "mutually exclusive" becomes
 a per-buffer decision made at the edge — cold bulk gets `cm`, hot and randomly-read planes stay
 packed — and the two never meet inside a hot path.
 

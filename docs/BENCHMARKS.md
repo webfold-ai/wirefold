@@ -723,6 +723,57 @@ cargo run --release -- blocks ordered 20000    # the block store (try 1000000 re
 cargo run --release -- bf16 4000000            # synthetic bf16 weights
 ```
 
+## Re-run, 2026-11-27 (same harness, different machine)
+
+Command: `cd bench && cargo run -j 1 --release --quiet --bin wirefold-bench -- 20000 3` (the bench
+workspace's release profile: `opt-level = 3`, `lto = true`). One cargo job, so the run did not
+compete with itself; the box is shared and its load average was **10.94** at the start (16 logical
+CPUs, 15 GB). No setting was changed to make the numbers look better, and nothing below is tuned.
+
+**The sizes are identical, to the byte, for 44 of the 45 rows.** Every serialized form —
+`Collapse`, bincode, postcard, rkyv, MessagePack, JSON — reproduced its recorded size exactly
+(`713212`, `713060`, `492525`, `800008`, `1646252`, `107638`, `167109`, `219402`, ...). That is the
+part of this file a reader can rely on across machines: encoding is deterministic.
+
+The one exception is the entropy-coded size face: `Collapse + wirefold compress()` reproduced
+**222543** bytes against the recorded **222540** — a 3-byte drift on an identical input. The
+compressed form is therefore *not* byte-stable across builds of the coder, which is the measured
+reason a content address must be the canonical pre-compression bytes and never the compressed ones
+(`docs/COMPOSITION.md`, R2).
+
+**The times are not comparable to the recorded run, and no regression should be read from them.**
+Every library, including the baselines, is 2.2x to 3.2x slower here:
+
+| raw | encode, recorded (ms) | encode, 2026-11-27 (ms) | decode, recorded (ms) | decode, 2026-11-27 (ms) |
+|---|---:|---:|---:|---:|
+| wirefold Collapse | 0.25 | 0.79 | 1.38 | 3.77 |
+| bincode 1.3 | 0.19 | 0.55 | 0.96 | 2.41 |
+| postcard | 0.46 | 1.22 | 1.14 | 2.74 |
+| rkyv 0.8 (validated) | 0.28 | 0.59 | 1.21 | 2.43 |
+| serde_json | 2.65 | 5.44 | 6.05 | 9.99 |
+
+Because the same multiplier applies to every arm, the *ordering* is what survives, and it did:
+
+| wirefold raw against | encode ratio, recorded | encode ratio, 2026-11-27 | decode ratio, recorded | decode ratio, 2026-11-27 |
+|---|---:|---:|---:|---:|
+| bincode 1.3 | 1.32 | 1.44 | 1.44 | 1.56 |
+| postcard | 0.54 | 0.65 | 1.21 | 1.38 |
+| rkyv 0.8 (validated) | 0.89 | 1.34 | 1.14 | 1.55 |
+| serde_json | 0.09 | 0.15 | 0.23 | 0.38 |
+
+Read that as: still 1.4x-1.6x bincode's decode time and 2.6x-4.3x faster than JSON, still faster to
+encode than postcard and JSON, and now further behind rkyv on raw decode than the recorded run
+measured. The size claims are unaffected because they are machine-independent:
+
+| at zstd -3 | wirefold | bincode | ratio |
+|---|---:|---:|---:|
+| encoded planes | 107638 | 219402 | **2.04x smaller** |
+| columns | 167109 | 219402 | **1.31x smaller** |
+
+**What to quote from this file.** Sizes and ratios; not absolute milliseconds. If an absolute
+number matters, re-run the command above on the machine in question and add a dated section — that
+is what this section is.
+
 ## Earlier benchmarks
 
 Before the split, the codec's benchmarks lived in the `hashtrinity` examples
