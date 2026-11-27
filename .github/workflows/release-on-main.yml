@@ -71,8 +71,13 @@ jobs:
           git push origin "refs/tags/$tag"
           echo "tagged $(git rev-parse --short HEAD) as $tag"
           # A tag pushed with GITHUB_TOKEN does not start a workflow; start the packaging job explicitly.
-          if gh workflow view release.yml >/dev/null 2>&1; then
+          # A tag pushed with GITHUB_TOKEN does not start a workflow, so start the packaging job here —
+          # but only if it can be started. A `release.yml` that triggers on push rather than on tags has no
+          # workflow_dispatch, and dispatching it fails this job for nothing: the tag is still the release.
+          if [ ! -f .github/workflows/release.yml ]; then
+            echo "no release.yml: the tag is the release"
+          elif grep -qE '^[[:space:]]*workflow_dispatch:' .github/workflows/release.yml; then
             gh workflow run release.yml --ref "$tag"
           else
-            echo "this repository has no release.yml: the tag is the release"
+            echo "release.yml does not offer workflow_dispatch: the tag is the release"
           fi
