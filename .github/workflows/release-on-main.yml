@@ -1,10 +1,18 @@
-name: Release on main
+name: Tag the release main declares
 
-# Every push to main is a release. `caretakers-bump` plans the semver bump from the conventional
-# commits since the last tag, rewrites Cargo.toml/Cargo.lock/CHANGELOG.md, commits, and pushes the
-# `vX.Y.Z` tag. Without this the crate stays at its current version with no tag forever, and its
-# dependents can only pin `rev = "<sha>"` — which is why a one-line fix here used to need a hand-move
-# in every repository that depends on it.
+# A merge becomes a release with no human and no private dependency: read the version the default branch
+# declares, and if nothing on the remote carries it, tag that commit. `release.yml` (tag-triggered, where
+# a repository has one) then packages and signs it.
+#
+# This is the tag half of the release, not the bump half. Bumping the version is a pull request, which is
+# where the version is decided and reviewed; this makes the tag appear so that dependents have a semver to
+# pin instead of `rev = "<sha>"`, and so `caretaker-pins --prefer-tags` has a tag to move to.
+#
+# It deliberately does not fetch `caretakers-bump`: that tool lives in a private repository, and a public
+# repository's runner cannot install it (measured: `cargo install --git .../caretaker` fails on every push
+# to main, and no RELEASE_TOKEN secret exists in any of these repositories). The scheduled fleet job runs
+# the same step from the box, where the token and the tool both exist; this is the version that works with
+# nothing but the repository itself.
 
 on:
   push:
@@ -19,63 +27,52 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release:
-    name: bump, changelog, tag
-    # The bump's own commit must not start another release.
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      !contains(github.event.head_commit.message, '[caretakers-bump]')
+  tag:
+    name: tag the declared version
     runs-on: ubuntu-latest
     steps:
       - name: Check out main with tags
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
-          # caretakers-bump diffs against the last tag.
           fetch-depth: 0
-          # A tag pushed with GITHUB_TOKEN does not start a workflow; RELEASE_TOKEN (a PAT or app
-          # token) does, and is also what lets the Release workflow run from this tag.
           token: ${{ secrets.RELEASE_TOKEN || github.token }}
 
-      - name: Identity for the bump commit
-        run: |
-          git config user.name "caretakers-bump"
-          git config user.email "caretakers-bump@twn.systems"
-
-      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
-
-      # The house tool, at a pinned revision (DEP-1: a git source at a full sha, never a path).
-      # Bump this rev with caretaker-pins like any other pinned dependency.
-      - name: Build caretakers-bump
-        env:
-          CARETAKER_REV: a0f8f0c95d9cdf83e01a0b381e360a2c5787ff7e
-        run: cargo install --locked --git https://github.com/webfold-ai/caretaker --rev "$CARETAKER_REV" caretaker-bump
-
-      - name: Is a release owed?
-        id: plan
-        run: |
-          caretakers-bump --package wirefold plan --json | tee plan.json
-          bump=$(python3 -c 'import json;print(json.load(open("plan.json"))["bump"])')
-          echo "bump=$bump"
-          echo "owed=$([ "$bump" = none ] && echo no || echo yes)" >> "$GITHUB_OUTPUT"
-
-      # Unsigned tags: signing is the tool's default and a release runner has no key. Add a
-      # signing key to the runner before dropping --no-sign.
-      - name: Release
-        if: steps.plan.outputs.owed == 'yes'
-        id: release
-        run: |
-          caretakers-bump --package wirefold --no-sign apply --auto-push
-          echo "tag=$(git describe --tags --abbrev=0)" >> "$GITHUB_OUTPUT"
-
-      - name: Start the tag-triggered Release workflow
-        if: steps.release.outputs.tag != ''
+      - name: Tag the version the manifest declares, once
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
-          TAG: ${{ steps.release.outputs.tag }}
         run: |
+          set -euo pipefail
+          # `[package] version = "..."`, or `[workspace.package]` when the package inherits it.
+          version="$(awk '
+            /^[[:space:]]*\[/ { s = $0; gsub(/[][[:space:]]/, "", s); next }
+            s == "package" && $0 ~ /^version[[:space:]]*=[[:space:]]*"/ {
+              v = $0; sub(/^[^"]*"/, "", v); sub(/"[[:space:]]*$/, "", v); print v; exit
+            }' Cargo.toml)"
+          if [ -z "$version" ]; then
+            version="$(awk '
+              /^[[:space:]]*\[/ { s = $0; gsub(/[][[:space:]]/, "", s); next }
+              s == "workspace.package" && $0 ~ /^version[[:space:]]*=[[:space:]]*"/ {
+                v = $0; sub(/^[^"]*"/, "", v); sub(/"[[:space:]]*$/, "", v); print v; exit
+              }' Cargo.toml)"
+          fi
+          if [ -z "$version" ]; then
+            echo "no [package] version and no [workspace.package] version in Cargo.toml" >&2
+            exit 1
+          fi
+          tag="v$version"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "$tag is already on the remote: nothing to release"
+            exit 0
+          fi
+          git config user.name "caretakers-bump"
+          git config user.email "caretakers-bump@twn.systems"
+          git tag -a "$tag" -m "$tag"
+          git push origin "refs/tags/$tag"
+          echo "tagged $(git rev-parse --short HEAD) as $tag"
+          # A tag pushed with GITHUB_TOKEN does not start a workflow; start the packaging job explicitly.
           if gh workflow view release.yml >/dev/null 2>&1; then
-            gh workflow run release.yml --ref "$TAG"
+            gh workflow run release.yml --ref "$tag"
           else
             echo "this repository has no release.yml: the tag is the release"
           fi
