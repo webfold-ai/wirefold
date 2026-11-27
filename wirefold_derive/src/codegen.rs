@@ -490,9 +490,56 @@ pub(crate) fn derive_struct(name: &Ident, fields: &[Field]) -> proc_masq::TokenS
     // proc-macro host will translate ("too many locals", indexable-inc/blaze#2449), so every
     // derive in this crate was unavailable there. The tokens are identical, only the function
     // boundaries moved.
-    let mut out = derive_struct_emit_impl(f_asserts_j, leg_cols_j, leg_fields_j, legacy_nsections, name.clone(), scalar_bytes, view.clone());
-    out.extend(derive_struct_emit_view(aliases_j, col_accs_j, col_checks_j, col_opens_j, f_accs_j, f_checks_j, f_opens_j, f_slices_j, f_view_fields_j, f_view_inits_j, get_ref_method, name.clone(), nsections, owned_fields_j, ref_struct, vec_owned_fields_j, view.clone(), view_fields_j, view_inits_j).into_tokens());
-    out.extend(derive_struct_emit_elem(col_size_lets_j, f_inits_j, f_size_ids_j, f_size_lets_j, f_writes_j, name.clone(), str_finals_j, str_inits_j, str_scatters_j, sz_ids_j, vec_emits_j, view.clone()).into_tokens());
+    let mut out = derive_struct_emit_impl(
+        f_asserts_j,
+        leg_cols_j,
+        leg_fields_j,
+        legacy_nsections,
+        name.clone(),
+        scalar_bytes,
+        view.clone(),
+    );
+    out.extend(
+        derive_struct_emit_view(
+            aliases_j,
+            col_accs_j,
+            col_checks_j,
+            col_opens_j,
+            f_accs_j,
+            f_checks_j,
+            f_opens_j,
+            f_slices_j,
+            f_view_fields_j,
+            f_view_inits_j,
+            get_ref_method,
+            name.clone(),
+            nsections,
+            owned_fields_j,
+            ref_struct,
+            vec_owned_fields_j,
+            view.clone(),
+            view_fields_j,
+            view_inits_j,
+        )
+        .into_tokens(),
+    );
+    out.extend(
+        derive_struct_emit_elem(
+            col_size_lets_j,
+            f_inits_j,
+            f_size_ids_j,
+            f_size_lets_j,
+            f_writes_j,
+            name.clone(),
+            str_finals_j,
+            str_inits_j,
+            str_scatters_j,
+            sz_ids_j,
+            vec_emits_j,
+            view.clone(),
+        )
+        .into_tokens(),
+    );
     out
 }
 
