@@ -110,28 +110,38 @@ context-mixing coder was used here before. It was 28% smaller than this one on t
 bytes, below zstd -19) and level on random data; it took 3.5 s to encode and 1.5 s to decode the same bytes
 after being made 5 to 7 times faster by caching and chunking, and was removed for that cost.
 
-## Numbers: in-tree ryu and itoa
+## Numbers: in-tree safe formatters
 
-`ryu` (floats) and `itoa` (integers) are very good: the benchmark measures them about 1.9x and 2.8x faster than the
-standard library's `Display`. Wirefold closed this gap by implementing its own zero-dependency in-tree formatters
-in `wirefold::num` (`num::itoa` and `num::ryu`), without bringing in external dependencies:
+Where decoded or serialized numbers become text (the MessagePack and protobuf decoders, the serde bridge),
+wirefold uses `wirefold::num`: safe Rust only (`#![forbid(unsafe_code)]`, enforced again by `tests/num_safe.rs`,
+no feature flag for an unchecked variant), no dependencies (`itoa`, `ryu`, `zmij` are dev-dependencies of the
+benchmark only).
 
 - In **JSON and YAML, numbers are never formatted.** `Atom::Num(String)` keeps the source text, so parse then
-  render is a copy. This is also lossless (`1.0`, `1e3` and `0.10` survive), which a parse to `f64` and format
-  back through `ryu` would not guarantee. There is no formatting step for a faster formatter to speed up.
-- In **Collapse**, numbers are fixed-width binary. There is no text at all.
-- In the **MessagePack and protobuf decoders**, and in the **serde bridge**, decoded or serialized numbers are
-  converted to text using `wirefold::num`.
-  - The integer formatter (`num::itoa`) uses a 200-byte digit-pair lookup table (`PAIRS_U16`), 16-bit stores to
-    write two ASCII digits simultaneously, and 4-digit division unrolling into a 40-byte stack buffer (`IntBuffer`).
-    It outperforms external `itoa` on small integers (3.3 ns vs 4.5 ns) and JSON distributions (2.3 ns vs 2.4 ns)
-    with zero heap allocation.
-  - The float formatter (`num::ryu`) implements shortest-roundtrip decimal formatting using static power-of-5 split
-    tables writing to a stack buffer (`FloatBuffer`). It runs on par with or faster than `ryu` (~29.9 ns vs ~30.1 ns),
-    and was exhaustively validated with 0 round-trip failures across all 4,294,967,296 ($2^{32}$) `f32` bit patterns.
+  render is a copy, which is also lossless (`1.0`, `1e3`, `0.10`). In **Collapse**, numbers are fixed-width binary.
+- **Integers** (`num::itoa`, core `num::itoa_core`): fixed-position constant-index stores into a 40-byte buffer, the
+  digit count from `leading_zeros` and a power-of-ten table, four size classes, a flat digit-pair LUT. The core is
+  extracted to Lean with Charon and Aeneas and proved ([`proofs/README.md`](../proofs/README.md)): for every
+  `u64`, `u32` and `i64` no panic or overflow, ASCII digits only, no leading zero, length = number of decimal
+  digits, and the digits read back as the input.
+- **Floats** (`num::float`, core `num::float_core`): an independent safe implementation of the Schubfach algorithm,
+  one `u64 x u64 -> u128` multiply per bound, the power-of-ten table generated from exact big-integer arithmetic.
+  Three layouts of the same shortest digits: the `ryu` layout (byte-identical to the `ryu` crate), the `Display`
+  layout (identical to `f64::to_string`) and the `Debug` layout (identical to `format!("{:?}")`). The call sites
+  use the layout they used before (`Display` for the decoders, `Debug` for the serde bridge), so their output did
+  not change. Proved in Lean: the table is exact, the exponent and shift ranges hold for every `f64`/`f32`, and the
+  128-bit multiplications cannot overflow. NOT proved: that the result is the shortest and closest decimal. That
+  is evidenced by the exhaustive sweep of all 2^32 `f32` patterns against the `ryu` crate and `core::fmt`
+  and by differential tests on `f64` (`tests/float_diff.rs`).
 
-The philosophy is that the cheapest number format is none: keep the representation the data already has, and
-convert only at a boundary that needs text using zero-dependency, cache-conscious in-tree primitives.
+What safe code cost, measured ([BENCHMARKS.md](BENCHMARKS.md#number-formatting)): the unsafe version this replaces
+(`write_unaligned`, `from_utf8_unchecked`) was not faster than `itoa`; the safe core is faster than both. The float
+formatter is NOT faster than the `ryu` crate or `zmij` in the `ryu` layout (the safe core alone is, the digit
+layout around it is not); it is faster than `core::fmt` in the `Display`/`Debug` layouts, which is what the call
+sites replaced.
+
+The cheapest number format is still none: keep the representation the data already has and convert only at a
+boundary that needs text.
 
 ## Compression and storage
 

@@ -55,4 +55,21 @@ Two things the extraction taught, kept as constraints on the Rust:
 
 ## Statement of what is and is not proved
 
-See the table at the end of this file once the theorems are in; it is regenerated with the receipt.
+Every theorem is in namespace `wirefold_extract`, uses only `propext`, `Classical.choice`, `Quot.sound`
+(`Audit.lean`, checked by `check`), and has no `sorry`. A spec of the form `f x ⦃ r => P ⦄` says `f x` returns
+`ok` (no panic, no overflow, no out-of-bounds index) and `P` holds.
+
+| Theorem | Statement | Status |
+|---|---|---|
+| `fmt_u64_roundtrip` | for all `u64`: no panic, bytes `buf[start..40]` are ASCII digits, no leading zero unless `0`, length = number of decimal digits, `valueOf = input` | proved |
+| `fmt_u32_roundtrip` | same for `u32` | proved |
+| `fmt_i64_roundtrip` | same for `i64` including `i64::MIN`; a `-` precedes the magnitude | proved |
+| `pairs_digits`, `pow10_get` | the digit-pair LUT and the powers-of-ten table are what they say | proved (`decide +kernel`) |
+| `divmod100`, `digit_count_spec` | the divmod arithmetic and the digit-count formula (`leading_zeros`, `1233/4096`, table compare) | proved |
+| `put4_spec`, `put8_spec`, `put16_spec`, `fmt_u64_spec` | the chunk writers and the size-class dispatch | proved |
+| `table_exact` | all 617 entries of the float power-of-ten table are `ceil(10^j * 2^(125-f))` | proved (`decide +kernel`, about 10 GB RAM, 30 s) |
+| `exp_regular_ok`, `exp_irregular_ok` | for every `f64`/`f32` binary exponent the decimal exponent, table index and shift `h` are in range | proved |
+| `rop_no_overflow` | the two `u64 x u64 -> u128` products and their sum cannot overflow | proved |
+| value of `rop` (round-to-odd), no panic of `shortest` end to end, `strip_zeros` | | NOT proved |
+| the float result is the SHORTEST and CLOSEST decimal that round-trips | research-grade (Schubfach correctness) | NOT proved: exhaustive `f32` sweep and `f64` differential tests are the evidence |
+| the layout layer (`itoa.rs`, `float.rs`), `u128`/`i128` formatting | | NOT proved: tested |
