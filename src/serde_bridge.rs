@@ -123,8 +123,8 @@ pub fn from_msgpack<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, Error> {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TermSerializer;
 
-fn num(s: &impl ToString) -> SyntaxTerm {
-    SyntaxTerm::B(Atom::Num(s.to_string()))
+fn num<I: crate::num::Integer>(v: I) -> SyntaxTerm {
+    SyntaxTerm::B(Atom::Num(crate::num::int_to_string(v)))
 }
 
 fn float(text: String, finite: bool) -> Result<SyntaxTerm, Error> {
@@ -139,7 +139,7 @@ fn float(text: String, finite: bool) -> Result<SyntaxTerm, Error> {
 
 macro_rules! ser_num {
     ($($f:ident($t:ty)),* $(,)?) => {$(
-        fn $f(self, v: $t) -> Result<SyntaxTerm, Error> { Ok(num(&v)) }
+        fn $f(self, v: $t) -> Result<SyntaxTerm, Error> { Ok(num(v)) }
     )*};
 }
 
@@ -171,10 +171,10 @@ impl ser::Serializer for TermSerializer {
         Ok(SyntaxTerm::B(Atom::Bool(v)))
     }
     fn serialize_f32(self, v: f32) -> Result<SyntaxTerm, Error> {
-        float(format!("{v:?}"), v.is_finite())
+        float(crate::num::float_to_string(v), v.is_finite())
     }
     fn serialize_f64(self, v: f64) -> Result<SyntaxTerm, Error> {
-        float(format!("{v:?}"), v.is_finite())
+        float(crate::num::float_to_string(v), v.is_finite())
     }
     fn serialize_char(self, v: char) -> Result<SyntaxTerm, Error> {
         Ok(SyntaxTerm::B(Atom::Str(v.to_string())))
@@ -183,7 +183,7 @@ impl ser::Serializer for TermSerializer {
         Ok(SyntaxTerm::B(Atom::Str(v.to_owned())))
     }
     fn serialize_bytes(self, v: &[u8]) -> Result<SyntaxTerm, Error> {
-        Ok(SyntaxTerm::Fourth(v.iter().map(num).collect()))
+        Ok(SyntaxTerm::Fourth(v.iter().copied().map(num).collect()))
     }
     fn serialize_none(self) -> Result<SyntaxTerm, Error> {
         Ok(SyntaxTerm::Nb)
@@ -408,7 +408,7 @@ fn key_err() -> Error {
 
 macro_rules! key_num {
     ($($f:ident($t:ty)),* $(,)?) => {$(
-        fn $f(self, v: $t) -> Result<String, Error> { Ok(v.to_string()) }
+        fn $f(self, v: $t) -> Result<String, Error> { Ok(crate::num::int_to_string(v)) }
     )*};
 }
 
@@ -423,8 +423,15 @@ impl ser::Serializer for KeySerializer {
     type SerializeStruct = ser::Impossible<String, Error>;
     type SerializeStructVariant = ser::Impossible<String, Error>;
 
+    fn serialize_bool(self, v: bool) -> Result<String, Error> {
+        Ok(v.to_string())
+    }
+
+    fn serialize_char(self, v: char) -> Result<String, Error> {
+        Ok(v.to_string())
+    }
+
     key_num!(
-        serialize_bool(bool),
         serialize_i8(i8),
         serialize_i16(i16),
         serialize_i32(i32),
@@ -435,7 +442,6 @@ impl ser::Serializer for KeySerializer {
         serialize_u32(u32),
         serialize_u64(u64),
         serialize_u128(u128),
-        serialize_char(char),
     );
 
     fn serialize_f32(self, _: f32) -> Result<String, Error> {

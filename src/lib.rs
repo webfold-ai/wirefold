@@ -54,6 +54,8 @@
 #[allow(missing_docs)]
 pub mod codec;
 
+pub mod num;
+
 #[cfg(feature = "serde")]
 pub mod serde_bridge;
 

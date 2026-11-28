@@ -3992,39 +3992,41 @@ pub mod msgpack {
             0xc2 => Ok(SyntaxTerm::B(Atom::Bool(false))),
             0xc3 => Ok(SyntaxTerm::B(Atom::Bool(true))),
             // fixint (positive 0x00..=0x7f, negative 0xe0..=0xff)
-            0x00..=0x7f => Ok(SyntaxTerm::B(Atom::Num((code as i64).to_string()))),
-            0xe0..=0xff => Ok(SyntaxTerm::B(Atom::Num((code as i8 as i64).to_string()))),
-            0xd0 => Ok(SyntaxTerm::B(Atom::Num(
-                (take_byte(bytes, pos)? as i8 as i64).to_string(),
-            ))),
-            0xd1 => Ok(SyntaxTerm::B(Atom::Num(
-                (i16::from_be_bytes(take(bytes, pos, 2)?.try_into().unwrap()) as i64).to_string(),
-            ))),
-            0xd2 => Ok(SyntaxTerm::B(Atom::Num(
-                (i32::from_be_bytes(take(bytes, pos, 4)?.try_into().unwrap()) as i64).to_string(),
-            ))),
-            0xd3 => Ok(SyntaxTerm::B(Atom::Num(
-                i64::from_be_bytes(take(bytes, pos, 8)?.try_into().unwrap()).to_string(),
-            ))),
-            0xcc => Ok(SyntaxTerm::B(Atom::Num(
-                (take_byte(bytes, pos)? as i64).to_string(),
-            ))),
-            0xcd => Ok(SyntaxTerm::B(Atom::Num(
-                (u16::from_be_bytes(take(bytes, pos, 2)?.try_into().unwrap()) as i64).to_string(),
-            ))),
-            0xce => Ok(SyntaxTerm::B(Atom::Num(
-                (u32::from_be_bytes(take(bytes, pos, 4)?.try_into().unwrap()) as i64).to_string(),
-            ))),
-            0xcf => Ok(SyntaxTerm::B(Atom::Num(
-                u64::from_be_bytes(take(bytes, pos, 8)?.try_into().unwrap()).to_string(),
-            ))),
+            0x00..=0x7f => Ok(SyntaxTerm::B(Atom::Num(crate::num::int_to_string(code)))),
+            0xe0..=0xff => Ok(SyntaxTerm::B(Atom::Num(crate::num::int_to_string(
+                code as i8,
+            )))),
+            0xd0 => Ok(SyntaxTerm::B(Atom::Num(crate::num::int_to_string(
+                take_byte(bytes, pos)? as i8,
+            )))),
+            0xd1 => Ok(SyntaxTerm::B(Atom::Num(crate::num::int_to_string(
+                i16::from_be_bytes(take(bytes, pos, 2)?.try_into().unwrap()),
+            )))),
+            0xd2 => Ok(SyntaxTerm::B(Atom::Num(crate::num::int_to_string(
+                i32::from_be_bytes(take(bytes, pos, 4)?.try_into().unwrap()),
+            )))),
+            0xd3 => Ok(SyntaxTerm::B(Atom::Num(crate::num::int_to_string(
+                i64::from_be_bytes(take(bytes, pos, 8)?.try_into().unwrap()),
+            )))),
+            0xcc => Ok(SyntaxTerm::B(Atom::Num(crate::num::int_to_string(
+                take_byte(bytes, pos)?,
+            )))),
+            0xcd => Ok(SyntaxTerm::B(Atom::Num(crate::num::int_to_string(
+                u16::from_be_bytes(take(bytes, pos, 2)?.try_into().unwrap()),
+            )))),
+            0xce => Ok(SyntaxTerm::B(Atom::Num(crate::num::int_to_string(
+                u32::from_be_bytes(take(bytes, pos, 4)?.try_into().unwrap()),
+            )))),
+            0xcf => Ok(SyntaxTerm::B(Atom::Num(crate::num::int_to_string(
+                u64::from_be_bytes(take(bytes, pos, 8)?.try_into().unwrap()),
+            )))),
             0xca => {
                 let f = f32::from_be_bytes(take(bytes, pos, 4)?.try_into().unwrap());
-                Ok(SyntaxTerm::B(Atom::Num(f.to_string())))
+                Ok(SyntaxTerm::B(Atom::Num(crate::num::float_to_string(f))))
             }
             0xcb => {
                 let f = f64::from_be_bytes(take(bytes, pos, 8)?.try_into().unwrap());
-                Ok(SyntaxTerm::B(Atom::Num(f.to_string())))
+                Ok(SyntaxTerm::B(Atom::Num(crate::num::float_to_string(f))))
             }
             // fixstr / str8 / str16 / str32
             0xa0..=0xbf | 0xd9 | 0xda | 0xdb => {
@@ -4864,7 +4866,7 @@ pub mod proto {
     fn push_scalar(fields: &mut Vec<(String, SyntaxTerm)>, f: &ProtoField, v: u64) {
         let term = match f.kind {
             ProtoKind::Bool => SyntaxTerm::B(Atom::Bool(v != 0)),
-            _ => SyntaxTerm::B(Atom::Num((v as i64).to_string())),
+            _ => SyntaxTerm::B(Atom::Num(crate::num::int_to_string(v as i64))),
         };
         push_value(fields, f, term);
     }
@@ -5646,10 +5648,10 @@ pub mod syntax {
     /// `Atom::Num`/`Atom::Bool` where it parses as one, so this reads that back rather than
     /// re-parsing from a string every time.
     macro_rules! positional_scalar_as_term {
-        ($ty:ty) => {
+        ($ty:ty, $fmt:expr) => {
             impl AsTerm for $ty {
                 fn to_term(&self) -> SyntaxTerm {
-                    SyntaxTerm::B(Atom::Num(self.to_string()))
+                    SyntaxTerm::B(Atom::Num($fmt(*self)))
                 }
                 fn from_term(term: &SyntaxTerm) -> Result<Self, SyntaxError> {
                     let s = match term {
@@ -5680,11 +5682,11 @@ pub mod syntax {
         };
     }
 
-    positional_scalar_as_term!(i64);
-    positional_scalar_as_term!(i32);
-    positional_scalar_as_term!(u64);
-    positional_scalar_as_term!(u32);
-    positional_scalar_as_term!(f64);
+    positional_scalar_as_term!(i64, crate::num::int_to_string);
+    positional_scalar_as_term!(i32, crate::num::int_to_string);
+    positional_scalar_as_term!(u64, crate::num::int_to_string);
+    positional_scalar_as_term!(u32, crate::num::int_to_string);
+    positional_scalar_as_term!(f64, crate::num::float_to_string);
 
     impl AsTerm for bool {
         fn to_term(&self) -> SyntaxTerm {

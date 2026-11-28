@@ -16,6 +16,10 @@ path = "src/main.rs"
 name = "embed"
 path = "src/embed.rs"
 
+[[bin]]
+name = "num-bench"
+path = "src/num_bench.rs"
+
 [dependencies]
 wirefold = { path = "..", features = ["derive", "syntax", "compress"] }
 serde = { version = "1", features = ["derive"] }

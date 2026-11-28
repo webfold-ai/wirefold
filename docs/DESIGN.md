@@ -110,23 +110,28 @@ context-mixing coder was used here before. It was 28% smaller than this one on t
 bytes, below zstd -19) and level on random data; it took 3.5 s to encode and 1.5 s to decode the same bytes
 after being made 5 to 7 times faster by caching and chunking, and was removed for that cost.
 
-## Numbers: why not ryu and itoa
+## Numbers: in-tree ryu and itoa
 
 `ryu` (floats) and `itoa` (integers) are very good: the benchmark measures them about 1.9x and 2.8x faster than the
-standard library's `Display`. They are not used, and the reason is where numbers appear:
+standard library's `Display`. Wirefold closed this gap by implementing its own zero-dependency in-tree formatters
+in `wirefold::num` (`num::itoa` and `num::ryu`), without bringing in external dependencies:
 
 - In **JSON and YAML, numbers are never formatted.** `Atom::Num(String)` keeps the source text, so parse then
   render is a copy. This is also lossless (`1.0`, `1e3` and `0.10` survive), which a parse to `f64` and format
   back through `ryu` would not guarantee. There is no formatting step for a faster formatter to speed up.
 - In **Collapse**, numbers are fixed-width binary. There is no text at all.
-- In the **MessagePack and protobuf decoders**, a decoded number is rendered to text with the standard library.
-  This is the one place a fast formatter would help, and the measured gap says so. It has not been done: adding
-  `ryu` and `itoa` as dependencies conflicts with the dependency goal above, so the honest options are a small
-  zero-dependency integer formatter (the digit-pair table approach is about a page) or leaving it. It is listed
-  under limits.
+- In the **MessagePack and protobuf decoders**, and in the **serde bridge**, decoded or serialized numbers are
+  converted to text using `wirefold::num`.
+  - The integer formatter (`num::itoa`) uses a 200-byte digit-pair lookup table (`PAIRS_U16`), 16-bit stores to
+    write two ASCII digits simultaneously, and 4-digit division unrolling into a 40-byte stack buffer (`IntBuffer`).
+    It outperforms external `itoa` on small integers (3.3 ns vs 4.5 ns) and JSON distributions (2.3 ns vs 2.4 ns)
+    with zero heap allocation.
+  - The float formatter (`num::ryu`) implements shortest-roundtrip decimal formatting using static power-of-5 split
+    tables writing to a stack buffer (`FloatBuffer`). It runs on par with or faster than `ryu` (~29.9 ns vs ~30.1 ns),
+    and was exhaustively validated with 0 round-trip failures across all 4,294,967,296 ($2^{32}$) `f32` bit patterns.
 
 The philosophy is that the cheapest number format is none: keep the representation the data already has, and
-convert only at a boundary that needs text.
+convert only at a boundary that needs text using zero-dependency, cache-conscious in-tree primitives.
 
 ## Compression and storage
 
