@@ -1689,6 +1689,20 @@ fn number_formatting(only: Option<&str>) {
             }),
         );
     }
+    if want.is_empty() || want == "f64-ours" {
+        row(
+            "f64 to text, in-tree `num::ryu`",
+            "f64-ours",
+            ms(5, || {
+                let mut b = wirefold::num::FloatBuffer::new();
+                let mut total = 0usize;
+                for f in &floats {
+                    total += b.format(*f).len();
+                }
+                total
+            }),
+        );
+    }
     if want.is_empty() || want == "u64-std" {
         row(
             "u64 to text, std `Display`",
@@ -1711,6 +1725,20 @@ fn number_formatting(only: Option<&str>) {
             "u64-itoa",
             ms(5, || {
                 let mut b = itoa::Buffer::new();
+                let mut total = 0usize;
+                for v in &ints {
+                    total += b.format(*v).len();
+                }
+                total
+            }),
+        );
+    }
+    if want.is_empty() || want == "u64-ours" {
+        row(
+            "u64 to text, in-tree `num::itoa`",
+            "u64-ours",
+            ms(5, || {
+                let mut b = wirefold::num::IntBuffer::new();
                 let mut total = 0usize;
                 for v in &ints {
                     total += b.format(*v).len();

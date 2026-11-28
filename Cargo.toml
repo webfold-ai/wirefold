@@ -31,6 +31,8 @@ serde = { version = "1", default-features = false, features = ["std"], optional 
 serde = { version = "1", features = ["derive"] }
 # Property tests with shrinking (tests/properties.rs). No default features: no fork, no timeout, no bit-set.
 proptest = { version = "1", default-features = false, features = ["std"] }
+ryu = "1"
+itoa = "1"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(procmasq_no_export)'] }
@@ -88,3 +90,6 @@ required-features = ["syntax"]
 [[test]]
 name = "serde_bridge"
 required-features = ["serde"]
+
+[[test]]
+name = "num_correctness"

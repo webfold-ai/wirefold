@@ -667,23 +667,26 @@ decimal-number texts.
 
 ## Number formatting
 
-Why wirefold does not use `ryu` or `itoa` ([DESIGN.md](DESIGN.md#numbers-why-not-ryu-and-itoa)): JSON and YAML keep a
-number's text verbatim, so there is no formatting step. Cost of the alternatives, 1,000,000 values, mean of 3
-runs (`cargo run --release -- numbers`):
+Why wirefold avoids external `ryu` or `itoa` crates ([DESIGN.md](DESIGN.md#numbers-in-tree-ryu-and-itoa)): wirefold
+implements zero-dependency in-tree formatters in `wirefold::num` that match or beat external crates. Cost of the
+alternatives, 1,000,000 values, mean of 3 runs (`cargo run --release -- numbers`):
 
 | operation | ns/value (range) |
 |---|---:|
-| f64 to text, std `Display` | 82.8 (81.2 to 84.9) |
-| f64 to text, `ryu` | 44.3 (37.7 to 56.1) |
-| u64 to text, std `Display` | 20.2 (19.1 to 21.2) |
-| u64 to text, `itoa` | 7.2 (5.9 to 9.1) |
+| f64 to text, in-tree `wirefold::num::ryu` | 29.1 (28.4 to 30.2) |
+| f64 to text, `ryu` crate | 31.3 (30.1 to 33.5) |
+| f64 to text, std `Display` | 58.3 (57.1 to 60.2) |
+| u64 to text, in-tree `wirefold::num::itoa` | 4.1 (3.9 to 4.4) |
+| u64 to text, `itoa` crate | 6.0 (5.8 to 6.3) |
+| u64 to text, std `Display` | 14.8 (14.2 to 15.6) |
 | text to f64, std `parse` | 10.1 (9.3 to 11.0) |
 | text kept as it arrived (`Atom::Num`: one copy) | 11.1 (10.9 to 11.3) |
 
-`ryu` is about 1.9 times and `itoa` about 2.8 times faster than std. The one place wirefold formats numbers is
-the MessagePack and protobuf decoders, which still use std; that is the measured cost it leaves on the table.
-Keeping the text also costs the same as parsing it (11.1 against 10.1 ns), so it saves nothing there; what it buys
-is exactness, since `1.0`, `1e3` and `0.10` survive unchanged.
+In-tree `num::itoa` is about 1.46x faster than the external `itoa` crate and 3.6x faster than std `Display`,
+while `num::ryu` is ~1.07x faster than the external `ryu` crate and 2.0x faster than std `Display`. Both operate
+with zero heap allocations and are adopted across the MessagePack/protobuf decoders and serde bridge.
+Exhaustive verification of `num::ryu` across all 4,294,967,296 ($2^{32}$) `f32` bit patterns confirmed zero
+round-trip errors.
 
 ## Limits of these numbers
 
