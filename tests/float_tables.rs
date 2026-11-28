@@ -60,9 +60,7 @@ impl Big {
         }
     }
     fn bit(&self, i: usize) -> bool {
-        self.0
-            .get(i / 32)
-            .map_or(false, |l| (l >> (i % 32)) & 1 == 1)
+        self.0.get(i / 32).is_some_and(|l| (l >> (i % 32)) & 1 == 1)
     }
     fn cmp(&self, o: &Big) -> std::cmp::Ordering {
         self.0

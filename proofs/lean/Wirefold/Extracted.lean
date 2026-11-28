@@ -67,7 +67,7 @@ def float_core.rop
   ok (vb ||| i8)
 
 /-- [wirefold_extract::float_tables::G]
-    Source: '../../src/num/float_tables.rs', lines 7:0-625:2
+    Source: '../../src/num/float_tables.rs', lines 7:0-1242:2
     Visibility: public -/
 @[global_simps, irreducible]
 def float_tables.G : Array Std.U64 1234#usize :=
@@ -511,7 +511,7 @@ def float_tables.G : Array Std.U64 1234#usize :=
 @[global_simps, irreducible] def float_tables.J_MIN : Std.I32 := (-292)#i32
 
 /-- [wirefold_extract::float_core::strip_zeros]:
-    Source: '../../src/num/float_core.rs', lines 137:0-161:1
+    Source: '../../src/num/float_core.rs', lines 153:0-177:1
     Visibility: public -/
 def float_core.strip_zeros
   (m : Std.U64) (e : Std.I32) : Result (Std.U64 × Std.I32) := do
@@ -556,7 +556,7 @@ def float_core.strip_zeros
   else ok (m4, e4)
 
 /-- [wirefold_extract::float_core::shortest]:
-    Source: '../../src/num/float_core.rs', lines 63:0-110:1
+    Source: '../../src/num/float_core.rs', lines 63:0-114:1
     Visibility: public -/
 def float_core.shortest
   (c : Std.U64) (q : Std.I32) (c_min : Std.U64) (q_min : Std.I32)
@@ -657,7 +657,7 @@ def float_core.shortest
         else ok (t, k)
 
 /-- [wirefold_extract::float_core::dec_f64]:
-    Source: '../../src/num/float_core.rs', lines 114:0-120:1
+    Source: '../../src/num/float_core.rs', lines 118:0-130:1
     Visibility: public -/
 def float_core.dec_f64
   (mant : Std.U64) (exp : Std.U32) (tie_even : Bool) :
@@ -675,7 +675,7 @@ def float_core.dec_f64
     float_core.shortest i1 i3 i (-1074)#i32 tie_even
 
 /-- [wirefold_extract::float_core::dec_f32]:
-    Source: '../../src/num/float_core.rs', lines 124:0-130:1
+    Source: '../../src/num/float_core.rs', lines 134:0-146:1
     Visibility: public -/
 def float_core.dec_f32
   (mant : Std.U32) (exp : Std.U32) (tie_even : Bool) :
@@ -701,7 +701,7 @@ def float_core.dec_f32
 @[global_simps, irreducible] def itoa_core.BUF_LEN : Std.Usize := 40#usize
 
 /-- [wirefold_extract::itoa_core::PAIRS]
-    Source: '../../src/num/itoa_core.rs', lines 24:0-125:2
+    Source: '../../src/num/itoa_core.rs', lines 24:0-38:2
     Visibility: public -/
 @[global_simps, irreducible]
 def itoa_core.PAIRS : Array Std.U8 200#usize :=
@@ -729,7 +729,7 @@ def itoa_core.PAIRS : Array Std.U8 200#usize :=
     ]
 
 /-- [wirefold_extract::itoa_core::POW10]
-    Source: '../../src/num/itoa_core.rs', lines 128:0-149:2
+    Source: '../../src/num/itoa_core.rs', lines 41:0-62:2
     Visibility: public -/
 @[global_simps, irreducible]
 def itoa_core.POW10 : Array Std.U64 20#usize :=
@@ -742,7 +742,7 @@ def itoa_core.POW10 : Array Std.U64 20#usize :=
     ]
 
 /-- [wirefold_extract::itoa_core::digit_count]:
-    Source: '../../src/num/itoa_core.rs', lines 153:0-161:1
+    Source: '../../src/num/itoa_core.rs', lines 66:0-74:1
     Visibility: public -/
 def itoa_core.digit_count (v : Std.U64) : Result Std.Usize := do
   let x ← if v = 0#u64
@@ -759,7 +759,7 @@ def itoa_core.digit_count (v : Std.U64) : Result Std.Usize := do
   i3 - i5
 
 /-- [wirefold_extract::itoa_core::put4]:
-    Source: '../../src/num/itoa_core.rs', lines 165:0-172:1 -/
+    Source: '../../src/num/itoa_core.rs', lines 78:0-85:1 -/
 def itoa_core.put4
   (buf : Array Std.U8 40#usize) («at» : Std.Usize) (v : Std.U32) :
   Result (Array Std.U8 40#usize)
@@ -785,7 +785,7 @@ def itoa_core.put4
   Array.update buf3 i12 i11
 
 /-- [wirefold_extract::itoa_core::put8]:
-    Source: '../../src/num/itoa_core.rs', lines 176:0-179:1 -/
+    Source: '../../src/num/itoa_core.rs', lines 89:0-92:1 -/
 def itoa_core.put8
   (buf : Array Std.U8 40#usize) («at» : Std.Usize) (v : Std.U32) :
   Result (Array Std.U8 40#usize)
@@ -797,7 +797,7 @@ def itoa_core.put8
   itoa_core.put4 buf1 i1 i2
 
 /-- [wirefold_extract::itoa_core::put16]:
-    Source: '../../src/num/itoa_core.rs', lines 183:0-188:1 -/
+    Source: '../../src/num/itoa_core.rs', lines 96:0-101:1 -/
 def itoa_core.put16
   (buf : Array Std.U8 40#usize) («at» : Std.Usize) (v : Std.U64) :
   Result (Array Std.U8 40#usize)
@@ -811,7 +811,7 @@ def itoa_core.put16
   itoa_core.put8 buf1 i2 lo
 
 /-- [wirefold_extract::itoa_core::fmt_u64]:
-    Source: '../../src/num/itoa_core.rs', lines 195:0-210:1
+    Source: '../../src/num/itoa_core.rs', lines 108:0-123:1
     Visibility: public -/
 def itoa_core.fmt_u64
   (buf : Array Std.U8 40#usize) (v : Std.U64) :
@@ -843,7 +843,7 @@ def itoa_core.fmt_u64
   ok (i, buf1)
 
 /-- [wirefold_extract::itoa_core::fmt_u32]:
-    Source: '../../src/num/itoa_core.rs', lines 214:0-216:1
+    Source: '../../src/num/itoa_core.rs', lines 127:0-129:1
     Visibility: public -/
 def itoa_core.fmt_u32
   (buf : Array Std.U8 40#usize) (v : Std.U32) :
@@ -853,7 +853,7 @@ def itoa_core.fmt_u32
   itoa_core.fmt_u64 buf i
 
 /-- [wirefold_extract::itoa_core::fmt_i64]:
-    Source: '../../src/num/itoa_core.rs', lines 223:0-232:1
+    Source: '../../src/num/itoa_core.rs', lines 136:0-149:1
     Visibility: public -/
 def itoa_core.fmt_i64
   (buf : Array Std.U8 40#usize) (v : Std.I64) :
