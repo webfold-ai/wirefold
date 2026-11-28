@@ -667,26 +667,53 @@ decimal-number texts.
 
 ## Number formatting
 
-Why wirefold avoids external `ryu` or `itoa` crates ([DESIGN.md](DESIGN.md#numbers-in-tree-ryu-and-itoa)): wirefold
-implements zero-dependency in-tree formatters in `wirefold::num` that match or beat external crates. Cost of the
-alternatives, 1,000,000 values, mean of 3 runs (`cargo run --release -- numbers`):
+`wirefold::num` against `itoa`, `ryu`, `zmij` and `core::fmt` ([DESIGN.md](DESIGN.md#numbers-in-tree-safe-formatters)).
+All pools are SYNTHETIC (fixed seeds, N = 100,000). Three runs of each benchmark in one process pinned to one core
+of the shared build box (8 cores, other jobs running, so absolute ns are noisy; compare rows of one run). Reproduce
+from a clean checkout: `cd bench && cargo run --release --bin itoa-ladder 3` and `--bin float-bench 3`. Every
+row also reports quality: bytes compared against the reference for every input.
 
-| operation | ns/value (range) |
-|---|---:|
-| f64 to text, in-tree `wirefold::num::ryu` | 29.1 (28.4 to 30.2) |
-| f64 to text, `ryu` crate | 31.3 (30.1 to 33.5) |
-| f64 to text, std `Display` | 58.3 (57.1 to 60.2) |
-| u64 to text, in-tree `wirefold::num::itoa` | 4.1 (3.9 to 4.4) |
-| u64 to text, `itoa` crate | 6.0 (5.8 to 6.3) |
-| u64 to text, std `Display` | 14.8 (14.2 to 15.6) |
-| text to f64, std `parse` | 10.1 (9.3 to 11.0) |
-| text kept as it arrived (`Atom::Num`: one copy) | 11.1 (10.9 to 11.3) |
+Measured at commit `ae49124` (clean tree, mirrored to the box); previous in-tree version for comparison
+(`d806af3`, unsafe, same box, same pools, 3 runs, SYNTHETIC): u64 uniform bits 8.98 ns vs `itoa` 8.84 (0.98x), small-int
+pool 3.25 vs 3.54, f64 uniform bits 29.97 vs `ryu` 30.10 (1.00x). The "1.46x" figure in the old commit message was
+not reproducible and is withdrawn.
 
-In-tree `num::itoa` is about 1.46x faster than the external `itoa` crate and 3.6x faster than std `Display`,
-while `num::ryu` is ~1.07x faster than the external `ryu` crate and 2.0x faster than std `Display`. Both operate
-with zero heap allocations and are adopted across the MessagePack/protobuf decoders and serde bridge.
-Exhaustive verification of `num::ryu` across all 4,294,967,296 ($2^{32}$) `f32` bit patterns confirmed zero
-round-trip errors.
+### Integers: output = plain decimal (identical to `itoa` and `core::fmt`), safe, 0 byte differences in every row
+
+ns/op, median [min..max] over 3 runs, and ratio to `itoa`:
+
+| pool (SYNTHETIC) | shipped `itoa_core` | `itoa` | `core::fmt` | best safe variant measured |
+|---|---:|---:|---:|---:|
+| u64 uniform random bits | 8.32 [8.27..8.33] = 1.16x | 9.67 [9.60..10.65] | 21.80 | L4 SWAR 7.43 = 1.30x |
+| u64 random digit length 1..20 | 8.48 [8.23..8.77] = 1.47x | 12.47 [12.35..13.44] | 24.87 | L3 SWAR 7.86 = 1.59x |
+| u64 small-int-heavy | 2.87 [2.85..2.88] = 1.32x | 3.78 [3.76..3.79] | 15.25 | L2 LUT 2.69 = 1.41x |
+| u64 JSON-like (ids, ms timestamps) | 7.07 [7.04..7.44] = 1.09x | 7.68 [7.55..8.02] | 19.49 | L3 SWAR 6.64 = 1.16x |
+
+Ladder (div-10 loop < pair LUT with dynamic offset < fixed-position LUT = shipped < SWAR multiply): each rung is faster
+than the one before on uniform bits (26.6, 12.8, 8.2, 7.9 ns). The SWAR variants are 3 to 10% faster but their bit-lane
+arithmetic is not proved without `Lean.ofReduceBool` (`bv_decide`), which the audit forbids; they are measured, not
+shipped. L4 (zero count taken from the top chunk) is slower on small values: a failed attempt, not retried.
+
+### Floats: quality 0 byte differences against `ryu` for the `ryu` layout (f64: 4 pools; f32: exhaustive over all 2^32)
+
+| pool (SYNTHETIC), ns/op median [min..max] | wirefold (ryu layout) | `ryu` | `zmij` | wirefold Display layout | `core::fmt` Display |
+|---|---:|---:|---:|---:|---:|
+| f64 uniform random bits | 49.4 [48.1..56.4] | 38.4 | 20.7 (47,106 layout differences) | 120.8 | 234.8 |
+| f64 JSON-like decimals | 41.4 [40.1..53.1] | 45.5 | 15.4 | 57.0 | 91.5 |
+| f64 integer-valued | 43.1 [41.9..43.9] | 33.6 | 20.2 | 54.2 | 79.8 |
+| f64 uniform [0,1) | 53.6 [42.7..53.9] | 40.7 | 20.2 | 49.7 | 91.4 |
+| f32 uniform random bits | 44.6 [43.4..49.7] | 32.3 | 16.8 (33,050 layout differences) | | 126.3 |
+| f32 two-decimal values | 35.1 [32.9..35.9] | 30.9 | 14.2 | | 76.9 |
+
+Outputs of the `Display` layout equal `f64::to_string` byte for byte on all four f64 pools (0 differences).
+
+Verdict: in the `ryu` layout the in-tree float formatter is slower than `ryu` (0.72x to 1.10x) and about 2x slower than
+`zmij`; it is NOT adopted on speed. The safe `float_core` alone is 10 to 20 ns (diagnostic row), under `ryu`'s total; the
+cost is the digit generation and layout around it (about 8 ns for digits, 9 for layout, 7 for the checked
+`from_utf8`). Two designs were tried (variable-length copies; constant-size copies with trailing zeros stripped inside
+the core): no measurable gain. A third attempt (fusing digit generation into the layout, SWAR digits) was not made;
+that is the located boundary. It is adopted at the decoder call sites only in the `Display` and `Debug` layouts,
+where it is 1.1x to 1.9x faster than the `core::fmt` those sites used, with identical output.
 
 ## Limits of these numbers
 

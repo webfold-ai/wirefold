@@ -1691,7 +1691,7 @@ fn number_formatting(only: Option<&str>) {
     }
     if want.is_empty() || want == "f64-ours" {
         row(
-            "f64 to text, in-tree `num::ryu`",
+            "f64 to text, in-tree `num::float`",
             "f64-ours",
             ms(5, || {
                 let mut b = wirefold::num::FloatBuffer::new();

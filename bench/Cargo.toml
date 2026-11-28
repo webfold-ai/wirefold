@@ -17,8 +17,12 @@ name = "embed"
 path = "src/embed.rs"
 
 [[bin]]
-name = "num-bench"
-path = "src/num_bench.rs"
+name = "itoa-ladder"
+path = "src/itoa_ladder.rs"
+
+[[bin]]
+name = "float-bench"
+path = "src/float_bench.rs"
 
 [dependencies]
 wirefold = { path = "..", features = ["derive", "syntax", "compress"] }
@@ -38,8 +42,10 @@ flate2 = "1"
 brotli = "7"
 ryu = "1"
 itoa = "1"
+zmij = "1"
 
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
+
