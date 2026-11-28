@@ -2,15 +2,13 @@
 //! (plain decimal, no sign for unsigned, `-` for negative, no padding, no exponent).
 //!
 //! rungs: L0 div-10 loop < L1 digit-pair LUT, dynamic offset (safe) < L2 wirefold core (fixed-position
-//! stores, safe) < L3 the same with an SWAR multiply instead of the LUT. HEAD is the previous in-tree
-//! `write_u64` (unsafe), kept as a reference. baselines: `itoa` and `core::fmt`.
+//! stores, safe) < L3 the same with an SWAR multiply instead of the LUT. Baselines: `itoa` and `core::fmt`.
+//! The previous unsafe in-tree version is not compiled here; its numbers are in docs/BENCHMARKS.md.
 //! Usage: itoa-ladder [rounds]   (default 3 runs; prints median and min/max over the runs)
 
 #![allow(dead_code)]
 #[path = "../../src/num/itoa_core.rs"]
 mod core_safe;
-#[path = "itoa_head_unsafe.rs"]
-mod head;
 
 use core_safe::{digit_count, BUF_LEN, PAIRS};
 use std::hint::black_box;
@@ -230,10 +228,6 @@ fn main() {
                     fails[k] += 1;
                 }
             }
-            let mut hb = [0u8; 40];
-            if head::write_u64(&mut hb, v) != want {
-                fails[6] += 1;
-            }
         }
         let rungs: Vec<(&str, Box<dyn Fn(&[u64]) -> usize>)> = vec![
             ("L0 div-10 loop", Box::new(|d: &[u64]| { let mut b = [0u8; BUF_LEN]; let mut t = 0; for &v in d { let i = l0(&mut b, black_box(v)); black_box(&b[i..]); t += BUF_LEN - i; } t })),
@@ -242,7 +236,6 @@ fn main() {
             ("L3 fixed stores, SWAR, to_le_bytes (safe)", Box::new(|d: &[u64]| { let mut b = [0u8; BUF_LEN]; let mut t = 0; for &v in d { let i = l3(&mut b, black_box(v)); black_box(&b[i..]); t += BUF_LEN - i; } t })),
             ("L4 SWAR + zero-count from top chunk (safe)", Box::new(|d: &[u64]| { let mut b = [0u8; BUF_LEN]; let mut t = 0; for &v in d { let i = l4(&mut b, black_box(v)); black_box(&b[i..]); t += BUF_LEN - i; } t })),
             ("SHIPPED: wirefold itoa_core (== L2, safe, proved)", Box::new(|d: &[u64]| { let mut b = [0u8; BUF_LEN]; let mut t = 0; for &v in d { let i = l3s(&mut b, black_box(v)); black_box(&b[i..]); t += BUF_LEN - i; } t })),
-            ("HEAD d806af3 write_u64 (unsafe)", Box::new(|d: &[u64]| { let mut b = [0u8; 40]; let mut t = 0; for &v in d { let s = head::write_u64(&mut b, black_box(v)); black_box(s); t += s.len(); } t })),
             ("itoa crate", Box::new(|d: &[u64]| { let mut b = itoa::Buffer::new(); let mut t = 0; for &v in d { let s = b.format(black_box(v)); black_box(s); t += s.len(); } t })),
             ("core::fmt", Box::new(|d: &[u64]| { use std::fmt::Write; let mut s = String::with_capacity(32); let mut t = 0; for &v in d { s.clear(); write!(s, "{}", black_box(v)).unwrap(); black_box(&s); t += s.len(); } t })),
         ];
@@ -254,9 +247,9 @@ fn main() {
             }
         }
         let med = |v: &Vec<f64>| { let mut s = v.clone(); s.sort_by(|a, b| a.partial_cmp(b).unwrap()); s[s.len() / 2] };
-        let itoa_med = med(&res[7]);
+        let itoa_med = med(&res[6]);
         for (k, (label, _)) in rungs.iter().enumerate() {
-            let q = if k < 7 { fails[k].to_string() } else { "0 (reference)".into() };
+            let q = if k < 6 { fails[k].to_string() } else { "0 (reference)".into() };
             let (mn, mx) = (res[k].iter().cloned().fold(f64::MAX, f64::min), res[k].iter().cloned().fold(0.0, f64::max));
             println!("| {label} | {q} | {:.2} [{mn:.2}..{mx:.2}] | {:.2}x |", med(&res[k]), itoa_med / med(&res[k]));
         }

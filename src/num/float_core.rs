@@ -66,7 +66,11 @@ pub fn shortest(c: u64, q: i32, c_min: u64, q_min: i32, tie_even: bool) -> (u64,
     let cbr = cb + 2;
     let regular = (c != c_min) | (q == q_min);
     let cbl = if regular { cb - 2 } else { cb - 1 };
-    let k = if regular { flog10_pow2(q) } else { flog10_three_quarters_pow2(q) };
+    let k = if regular {
+        flog10_pow2(q)
+    } else {
+        flog10_three_quarters_pow2(q)
+    };
     let h = q + flog2_pow10(-k) + 1;
     let gi = ((-k - J_MIN) as usize) * 2;
     let g = [G[gi], G[gi + 1]];
@@ -115,7 +119,13 @@ pub fn dec_f64(mant: u64, exp: u32, tie_even: bool) -> (u64, i32) {
     if exp == 0 {
         shortest(mant, -1074, 1 << 52, -1074, tie_even)
     } else {
-        shortest(mant | (1 << 52), (exp as i32) - 1075, 1 << 52, -1074, tie_even)
+        shortest(
+            mant | (1 << 52),
+            (exp as i32) - 1075,
+            1 << 52,
+            -1074,
+            tie_even,
+        )
     }
 }
 
@@ -125,7 +135,13 @@ pub fn dec_f32(mant: u32, exp: u32, tie_even: bool) -> (u64, i32) {
     if exp == 0 {
         shortest(mant as u64, -149, 1 << 23, -149, tie_even)
     } else {
-        shortest((mant | (1 << 23)) as u64, (exp as i32) - 150, 1 << 23, -149, tie_even)
+        shortest(
+            (mant | (1 << 23)) as u64,
+            (exp as i32) - 150,
+            1 << 23,
+            -149,
+            tie_even,
+        )
     }
 }
 

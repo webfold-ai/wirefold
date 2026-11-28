@@ -78,10 +78,24 @@ mod private {
             let exp = ((bits >> 52) & 0x7ff) as u32;
             let neg = bits >> 63 != 0;
             if exp == 0 && mant == 0 {
-                return Parts { neg, zero: true, m: 0, e: 0, hi: 16, lo: -5 };
+                return Parts {
+                    neg,
+                    zero: true,
+                    m: 0,
+                    e: 0,
+                    hi: 16,
+                    lo: -5,
+                };
             }
             let (m, e) = float_core::dec_f64(mant, exp, tie_even);
-            Parts { neg, zero: false, m, e, hi: 16, lo: -5 }
+            Parts {
+                neg,
+                zero: false,
+                m,
+                e,
+                hi: 16,
+                lo: -5,
+            }
         }
     }
 
@@ -106,10 +120,24 @@ mod private {
             let exp = (bits >> 23) & 0xff;
             let neg = bits >> 31 != 0;
             if exp == 0 && mant == 0 {
-                return Parts { neg, zero: true, m: 0, e: 0, hi: 13, lo: -6 };
+                return Parts {
+                    neg,
+                    zero: true,
+                    m: 0,
+                    e: 0,
+                    hi: 13,
+                    lo: -6,
+                };
             }
             let (m, e) = float_core::dec_f32(mant, exp, tie_even);
-            Parts { neg, zero: false, m, e, hi: 13, lo: -6 }
+            Parts {
+                neg,
+                zero: false,
+                m,
+                e,
+                hi: 13,
+                lo: -6,
+            }
         }
     }
 }
@@ -141,7 +169,9 @@ impl FloatBuffer {
     /// Create a new, reusable float buffer.
     #[inline]
     pub fn new() -> Self {
-        Self { bytes: [0; OUT_LEN] }
+        Self {
+            bytes: [0; OUT_LEN],
+        }
     }
 
     /// Format any float in the `ryu` layout (`NaN`, `inf`, `-inf` included) and return the ASCII

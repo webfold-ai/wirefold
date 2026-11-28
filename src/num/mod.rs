@@ -15,7 +15,8 @@ pub mod float_tables;
 pub mod itoa;
 pub mod itoa_core;
 
-pub use float::{float_debug_string, 
-    append_float, append_float_display, float_display_string, float_to_string, Float, FloatBuffer,
+pub use float::{
+    append_float, append_float_display, float_debug_string, float_display_string, float_to_string,
+    Float, FloatBuffer,
 };
 pub use itoa::{append_int, int_to_string, IntBuffer, Integer};

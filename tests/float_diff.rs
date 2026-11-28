@@ -16,7 +16,11 @@ fn check32(fb: &mut FloatBuffer, rb: &mut ryu::Buffer, bits: u32) -> Result<(), 
     let ours = fb.format(f);
     if !f.is_finite() {
         let want = rb.format(f);
-        return if ours == want { Ok(()) } else { Err(format!("{bits:#010x}: {ours} vs {want}")) };
+        return if ours == want {
+            Ok(())
+        } else {
+            Err(format!("{bits:#010x}: {ours} vs {want}"))
+        };
     }
     let want = rb.format_finite(f);
     if ours != want {
@@ -30,7 +34,10 @@ fn check32(fb: &mut FloatBuffer, rb: &mut ryu::Buffer, bits: u32) -> Result<(), 
 
 #[test]
 fn f32_exhaustive() {
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 16) as u64;
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(2, 16) as u64;
     let total = 1u64 << 32;
     let chunk = total / threads;
     let done = AtomicU64::new(0);
@@ -39,7 +46,14 @@ fn f32_exhaustive() {
         for t in 0..threads {
             let (done, fails) = (&done, &fails);
             s.spawn(move || {
-                let (lo, hi) = (t * chunk, if t == threads - 1 { total } else { (t + 1) * chunk });
+                let (lo, hi) = (
+                    t * chunk,
+                    if t == threads - 1 {
+                        total
+                    } else {
+                        (t + 1) * chunk
+                    },
+                );
                 let mut fb = FloatBuffer::new();
                 let mut rb = ryu::Buffer::new();
                 for bits in lo..hi {
@@ -65,7 +79,11 @@ fn f32_exhaustive() {
             });
         }
     });
-    assert_eq!(done.load(Ordering::Relaxed), total, "did not visit all 2^32 patterns");
+    assert_eq!(
+        done.load(Ordering::Relaxed),
+        total,
+        "did not visit all 2^32 patterns"
+    );
     let f = fails.lock().unwrap();
     assert!(f.is_empty(), "{} failures, first: {:#?}", f.len(), *f);
 }
@@ -107,7 +125,18 @@ fn run64(patterns: impl Iterator<Item = u64>, what: &str) {
 fn edge_patterns() -> Vec<u64> {
     let mut v = Vec::new();
     for e in 0..=0x7ffu64 {
-        for m in [0u64, 1, 2, 3, (1 << 51), (1 << 51) + 1, (1 << 52) - 2, (1 << 52) - 1, 0x5555_5555_5555_5, 0xaaaa_aaaa_aaaa_a] {
+        for m in [
+            0u64,
+            1,
+            2,
+            3,
+            (1 << 51),
+            (1 << 51) + 1,
+            (1 << 52) - 2,
+            (1 << 52) - 1,
+            0x5555_5555_5555_5,
+            0xaaaa_aaaa_aaaa_a,
+        ] {
             for sign in [0u64, 1] {
                 v.push(sign << 63 | e << 52 | m);
             }
@@ -141,7 +170,9 @@ fn f64_edges() {
 fn f64_short_decimals() {
     // every decimal with up to 6 digits at several exponents, parsed to the nearest double
     let mut pats = Vec::new();
-    for e in [-300i32, -23, -7, -5, -4, -2, -1, 0, 1, 5, 15, 16, 17, 22, 23, 100, 300] {
+    for e in [
+        -300i32, -23, -7, -5, -4, -2, -1, 0, 1, 5, 15, 16, 17, 22, 23, 100, 300,
+    ] {
         for k in (1u32..1_000_000).step_by(7) {
             pats.push(format!("{k}e{e}").parse::<f64>().unwrap().to_bits());
         }
@@ -174,10 +205,37 @@ fn f64_random_bits() {
 
 #[test]
 fn display_layout_matches_core_for_f32_classes() {
-    for v in [0.0f32, -0.0, 1.0, 0.5, 100.0, 1e-7, 1e21, 16777216.0, f32::MAX, f32::MIN_POSITIVE, f32::EPSILON, 3.4028235e38, 1.0e-45, 0.1, 123456.79] {
+    for v in [
+        0.0f32,
+        -0.0,
+        1.0,
+        0.5,
+        100.0,
+        1e-7,
+        1e21,
+        16777216.0,
+        f32::MAX,
+        f32::MIN_POSITIVE,
+        f32::EPSILON,
+        3.4028235e38,
+        1.0e-45,
+        0.1,
+        123456.79,
+    ] {
         assert_eq!(float_display_string(v), v.to_string(), "{v:e}");
     }
-    for v in [0.0f64, -0.0, 1.0, 5e-324, f64::MAX, 1e22, 1e23, 0.3, 2.5e-5, 123456789012345680.0] {
+    for v in [
+        0.0f64,
+        -0.0,
+        1.0,
+        5e-324,
+        f64::MAX,
+        1e22,
+        1e23,
+        0.3,
+        2.5e-5,
+        123456789012345680.0,
+    ] {
         assert_eq!(float_display_string(v), v.to_string(), "{v:e}");
     }
 }
@@ -185,10 +243,40 @@ fn display_layout_matches_core_for_f32_classes() {
 #[test]
 fn debug_layout_matches_core_fmt() {
     use wirefold::num::float_debug_string;
-    for v in [0.0f64, -0.0, 1.0, 0.5, 100.0, 1e-4, 0.00009999, 1e-5, 1e15, 1e16, 9999999999999998.0, 1.5e-7, 1e21, f64::MAX, 5e-324, 0.1, 123456789.125] {
+    for v in [
+        0.0f64,
+        -0.0,
+        1.0,
+        0.5,
+        100.0,
+        1e-4,
+        0.00009999,
+        1e-5,
+        1e15,
+        1e16,
+        9999999999999998.0,
+        1.5e-7,
+        1e21,
+        f64::MAX,
+        5e-324,
+        0.1,
+        123456789.125,
+    ] {
         assert_eq!(float_debug_string(v), format!("{v:?}"), "{v:e}");
     }
-    for v in [0.0f32, -0.0, 1.0, 1e-4, 1e-5, 1e15, 1e16, 3.4028235e38, 1.0e-45, 16777216.0, 0.1] {
+    for v in [
+        0.0f32,
+        -0.0,
+        1.0,
+        1e-4,
+        1e-5,
+        1e15,
+        1e16,
+        3.4028235e38,
+        1.0e-45,
+        16777216.0,
+        0.1,
+    ] {
         assert_eq!(float_debug_string(v), format!("{v:?}"), "{v:e}");
     }
     let mut x = 0x2545_F491_4F6C_DD1Du64;
@@ -198,11 +286,21 @@ fn debug_layout_matches_core_fmt() {
         x ^= x >> 27;
         let f = f64::from_bits(x.wrapping_mul(0x2545_F491_4F6C_DD1D));
         if f.is_finite() {
-            assert_eq!(float_debug_string(f), format!("{f:?}"), "{:#x}", f.to_bits());
+            assert_eq!(
+                float_debug_string(f),
+                format!("{f:?}"),
+                "{:#x}",
+                f.to_bits()
+            );
         }
         let g = f32::from_bits((x >> 32) as u32);
         if g.is_finite() {
-            assert_eq!(float_debug_string(g), format!("{g:?}"), "{:#x}", g.to_bits());
+            assert_eq!(
+                float_debug_string(g),
+                format!("{g:?}"),
+                "{:#x}",
+                g.to_bits()
+            );
         }
     }
 }

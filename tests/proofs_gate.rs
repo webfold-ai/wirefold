@@ -29,7 +29,10 @@ fn proof_receipt_binds_the_current_sources() {
     match receipt::verify_fresh(root()) {
         Ok(r) => {
             assert!(!r.theorems.is_empty(), "receipt lists no theorem");
-            assert!(r.tools.iter().any(|t| t.0 == "aeneas-sha256"), "receipt records no tool identity");
+            assert!(
+                r.tools.iter().any(|t| t.0 == "aeneas-sha256"),
+                "receipt records no tool identity"
+            );
         }
         Err(e) => panic!("PROOFS NOT DONE: {e}"),
     }
@@ -45,6 +48,9 @@ fn proof_theorems_are_the_required_set() {
         "wirefold_extract.pairs_digits",
         "wirefold_extract.divmod100",
     ] {
-        assert!(have.iter().any(|h| h == want), "required theorem {want} is not audited; audited: {have:?}");
+        assert!(
+            have.iter().any(|h| h == want),
+            "required theorem {want} is not audited; audited: {have:?}"
+        );
     }
 }

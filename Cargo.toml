@@ -93,3 +93,8 @@ required-features = ["serde"]
 
 [[test]]
 name = "num_correctness"
+
+# The exhaustive f32 sweep (tests/float_diff.rs) visits all 2^32 patterns; the library is built optimised
+# even under `cargo test` so that it finishes in about a minute on 8 cores.
+[profile.dev.package.wirefold]
+opt-level = 3

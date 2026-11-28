@@ -17,10 +17,6 @@ name = "embed"
 path = "src/embed.rs"
 
 [[bin]]
-name = "num-bench"
-path = "src/num_bench.rs"
-
-[[bin]]
 name = "itoa-ladder"
 path = "src/itoa_ladder.rs"
 

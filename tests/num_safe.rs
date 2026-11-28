@@ -22,7 +22,10 @@ fn num_sources_contain_no_escape_hatches() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/num");
     let mut files = Vec::new();
     rs_files(&root, &mut files);
-    assert!(files.len() >= 6, "expected the num sources, found {files:?}");
+    assert!(
+        files.len() >= 6,
+        "expected the num sources, found {files:?}"
+    );
     let banned = [
         "unsafe",
         "get_unchecked",
@@ -48,17 +51,29 @@ fn num_sources_contain_no_escape_hatches() {
             }
         }
     }
-    assert!(hits.is_empty(), "escape hatches in src/num:\n{}", hits.join("\n"));
+    assert!(
+        hits.is_empty(),
+        "escape hatches in src/num:\n{}",
+        hits.join("\n")
+    );
 }
 
 #[test]
 fn num_module_forbids_unsafe_code() {
-    let m = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/num/mod.rs")).unwrap();
-    assert!(m.contains("#![forbid(unsafe_code)]"), "src/num/mod.rs must carry #![forbid(unsafe_code)]");
+    let m =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/num/mod.rs")).unwrap();
+    assert!(
+        m.contains("#![forbid(unsafe_code)]"),
+        "src/num/mod.rs must carry #![forbid(unsafe_code)]"
+    );
 }
 
 #[test]
 fn num_has_no_feature_gated_variant() {
-    let cargo = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml")).unwrap();
-    assert!(!cargo.contains("num-unchecked"), "no unchecked variant may be offered behind a feature");
+    let cargo =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml")).unwrap();
+    assert!(
+        !cargo.contains("num-unchecked"),
+        "no unchecked variant may be offered behind a feature"
+    );
 }

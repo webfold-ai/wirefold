@@ -22,106 +22,19 @@ pub const BUF_LEN: usize = 40;
 /// ASCII bytes of `n`. (Flat, not `[[u8; 2]; 100]`: Aeneas turns a nested literal into a Lean term whose
 /// elaboration exhausts memory, a flat one elaborates in seconds.)
 pub const PAIRS: [u8; 200] = [
-    b'0', b'0',
-    b'0', b'1',
-    b'0', b'2',
-    b'0', b'3',
-    b'0', b'4',
-    b'0', b'5',
-    b'0', b'6',
-    b'0', b'7',
-    b'0', b'8',
-    b'0', b'9',
-    b'1', b'0',
-    b'1', b'1',
-    b'1', b'2',
-    b'1', b'3',
-    b'1', b'4',
-    b'1', b'5',
-    b'1', b'6',
-    b'1', b'7',
-    b'1', b'8',
-    b'1', b'9',
-    b'2', b'0',
-    b'2', b'1',
-    b'2', b'2',
-    b'2', b'3',
-    b'2', b'4',
-    b'2', b'5',
-    b'2', b'6',
-    b'2', b'7',
-    b'2', b'8',
-    b'2', b'9',
-    b'3', b'0',
-    b'3', b'1',
-    b'3', b'2',
-    b'3', b'3',
-    b'3', b'4',
-    b'3', b'5',
-    b'3', b'6',
-    b'3', b'7',
-    b'3', b'8',
-    b'3', b'9',
-    b'4', b'0',
-    b'4', b'1',
-    b'4', b'2',
-    b'4', b'3',
-    b'4', b'4',
-    b'4', b'5',
-    b'4', b'6',
-    b'4', b'7',
-    b'4', b'8',
-    b'4', b'9',
-    b'5', b'0',
-    b'5', b'1',
-    b'5', b'2',
-    b'5', b'3',
-    b'5', b'4',
-    b'5', b'5',
-    b'5', b'6',
-    b'5', b'7',
-    b'5', b'8',
-    b'5', b'9',
-    b'6', b'0',
-    b'6', b'1',
-    b'6', b'2',
-    b'6', b'3',
-    b'6', b'4',
-    b'6', b'5',
-    b'6', b'6',
-    b'6', b'7',
-    b'6', b'8',
-    b'6', b'9',
-    b'7', b'0',
-    b'7', b'1',
-    b'7', b'2',
-    b'7', b'3',
-    b'7', b'4',
-    b'7', b'5',
-    b'7', b'6',
-    b'7', b'7',
-    b'7', b'8',
-    b'7', b'9',
-    b'8', b'0',
-    b'8', b'1',
-    b'8', b'2',
-    b'8', b'3',
-    b'8', b'4',
-    b'8', b'5',
-    b'8', b'6',
-    b'8', b'7',
-    b'8', b'8',
-    b'8', b'9',
-    b'9', b'0',
-    b'9', b'1',
-    b'9', b'2',
-    b'9', b'3',
-    b'9', b'4',
-    b'9', b'5',
-    b'9', b'6',
-    b'9', b'7',
-    b'9', b'8',
-    b'9', b'9',
+    b'0', b'0', b'0', b'1', b'0', b'2', b'0', b'3', b'0', b'4', b'0', b'5', b'0', b'6', b'0', b'7',
+    b'0', b'8', b'0', b'9', b'1', b'0', b'1', b'1', b'1', b'2', b'1', b'3', b'1', b'4', b'1', b'5',
+    b'1', b'6', b'1', b'7', b'1', b'8', b'1', b'9', b'2', b'0', b'2', b'1', b'2', b'2', b'2', b'3',
+    b'2', b'4', b'2', b'5', b'2', b'6', b'2', b'7', b'2', b'8', b'2', b'9', b'3', b'0', b'3', b'1',
+    b'3', b'2', b'3', b'3', b'3', b'4', b'3', b'5', b'3', b'6', b'3', b'7', b'3', b'8', b'3', b'9',
+    b'4', b'0', b'4', b'1', b'4', b'2', b'4', b'3', b'4', b'4', b'4', b'5', b'4', b'6', b'4', b'7',
+    b'4', b'8', b'4', b'9', b'5', b'0', b'5', b'1', b'5', b'2', b'5', b'3', b'5', b'4', b'5', b'5',
+    b'5', b'6', b'5', b'7', b'5', b'8', b'5', b'9', b'6', b'0', b'6', b'1', b'6', b'2', b'6', b'3',
+    b'6', b'4', b'6', b'5', b'6', b'6', b'6', b'7', b'6', b'8', b'6', b'9', b'7', b'0', b'7', b'1',
+    b'7', b'2', b'7', b'3', b'7', b'4', b'7', b'5', b'7', b'6', b'7', b'7', b'7', b'8', b'7', b'9',
+    b'8', b'0', b'8', b'1', b'8', b'2', b'8', b'3', b'8', b'4', b'8', b'5', b'8', b'6', b'8', b'7',
+    b'8', b'8', b'8', b'9', b'9', b'0', b'9', b'1', b'9', b'2', b'9', b'3', b'9', b'4', b'9', b'5',
+    b'9', b'6', b'9', b'7', b'9', b'8', b'9', b'9',
 ];
 
 /// `POW10[i] = 10^i` for every power that fits in a `u64`.
@@ -221,7 +134,11 @@ pub fn fmt_u32(buf: &mut [u8; BUF_LEN], v: u32) -> usize {
 /// nothing overflows. (`unsigned_abs` would be an opaque external in the extraction.)
 #[inline]
 pub fn fmt_i64(buf: &mut [u8; BUF_LEN], v: i64) -> usize {
-    let mag = if v < 0 { ((-(v + 1)) as u64) + 1 } else { v as u64 };
+    let mag = if v < 0 {
+        ((-(v + 1)) as u64) + 1
+    } else {
+        v as u64
+    };
     let start = fmt_u64(buf, mag);
     if v < 0 {
         buf[start - 1] = b'-';
@@ -334,7 +251,16 @@ mod tests {
                 assert_eq!(s(v), v.to_string());
             }
         }
-        for v in [u64::MAX, u64::MAX - 1, u64::MAX / 2, 1 << 63, 99_999_999, 100_000_000, 9_999, 10_000] {
+        for v in [
+            u64::MAX,
+            u64::MAX - 1,
+            u64::MAX / 2,
+            1 << 63,
+            99_999_999,
+            100_000_000,
+            9_999,
+            10_000,
+        ] {
             assert_eq!(s(v), v.to_string());
         }
         let mut st = 0x9E37_79B9_7F4A_7C15u64;
@@ -346,7 +272,18 @@ mod tests {
 
     #[test]
     fn i64_all_edges() {
-        for v in [i64::MIN, i64::MIN + 1, -1, 0, 1, i64::MAX, -10, -99, -100, -9_999_999_999_999_999_999i128 as i64] {
+        for v in [
+            i64::MIN,
+            i64::MIN + 1,
+            -1,
+            0,
+            1,
+            i64::MAX,
+            -10,
+            -99,
+            -100,
+            -9_999_999_999_999_999_999i128 as i64,
+        ] {
             assert_eq!(si64(v), v.to_string());
         }
         let mut st = 0xD1B5_4A32_D192_ED03u64;
@@ -358,7 +295,14 @@ mod tests {
 
     #[test]
     fn u128_boundaries_and_random() {
-        for v in [u128::MAX, u128::MAX - 1, u64::MAX as u128, u64::MAX as u128 + 1, 1u128 << 64, 1u128 << 127] {
+        for v in [
+            u128::MAX,
+            u128::MAX - 1,
+            u64::MAX as u128,
+            u64::MAX as u128 + 1,
+            1u128 << 64,
+            1u128 << 127,
+        ] {
             assert_eq!(s128(v), v.to_string());
         }
         let mut p: u128 = 1;

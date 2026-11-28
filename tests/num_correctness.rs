@@ -221,4 +221,3 @@ fn test_floats_random_samples() {
         }
     }
 }
-

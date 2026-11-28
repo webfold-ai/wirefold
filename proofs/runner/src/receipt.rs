@@ -25,11 +25,12 @@ pub const FORBIDDEN: [&str; 8] = [
     "axiom ",
 ];
 
-const FIXED: [&str; 11] = [
+const FIXED: [&str; 12] = [
     "src/num/itoa_core.rs",
     "proofs/extract/lib.rs",
     "proofs/extract/Cargo.toml",
     "proofs/lean/Wirefold.lean",
+    "proofs/runner/Cargo.toml",
     "proofs/lean/lakefile.lean",
     "proofs/lean/lake-manifest.json",
     "proofs/lean/lean-toolchain",
@@ -80,7 +81,10 @@ pub fn audited_theorems(root: &Path) -> Result<Vec<String>, String> {
 pub fn scan_forbidden(root: &Path) -> Result<Vec<String>, String> {
     let mut hits = Vec::new();
     for rel in bound_files(root)? {
-        if !rel.ends_with(".lean") || rel.ends_with("/Extracted.lean") || rel.ends_with("lakefile.lean") {
+        if !rel.ends_with(".lean")
+            || rel.ends_with("/Extracted.lean")
+            || rel.ends_with("lakefile.lean")
+        {
             continue;
         }
         let text = fs::read_to_string(root.join(&rel)).map_err(|e| format!("read {rel}: {e}"))?;
@@ -100,7 +104,11 @@ pub fn scan_forbidden(root: &Path) -> Result<Vec<String>, String> {
 pub fn extracted_axioms(root: &Path) -> Result<Vec<String>, String> {
     let p = root.join("proofs/lean/Wirefold/Extracted.lean");
     let text = fs::read_to_string(&p).map_err(|e| format!("read {}: {e}", p.display()))?;
-    Ok(text.lines().filter(|l| l.starts_with("axiom ")).map(|l| l.to_string()).collect())
+    Ok(text
+        .lines()
+        .filter(|l| l.starts_with("axiom "))
+        .map(|l| l.to_string())
+        .collect())
 }
 
 pub struct Receipt {
@@ -119,20 +127,32 @@ pub fn render(r: &Receipt) -> String {
         s.push_str(&format!("digest {p} {d}\n"));
     }
     for (t, axs) in &r.theorems {
-        let a = if axs.is_empty() { "-".to_string() } else { axs.join(",") };
+        let a = if axs.is_empty() {
+            "-".to_string()
+        } else {
+            axs.join(",")
+        };
         s.push_str(&format!("theorem {t} {a}\n"));
     }
     s
 }
 
 pub fn parse(text: &str) -> Receipt {
-    let mut r = Receipt { digests: vec![], theorems: vec![], tools: vec![] };
+    let mut r = Receipt {
+        digests: vec![],
+        theorems: vec![],
+        tools: vec![],
+    };
     for line in text.lines() {
         let mut it = line.splitn(3, ' ');
         match (it.next(), it.next(), it.next()) {
             (Some("digest"), Some(p), Some(d)) => r.digests.push((p.to_string(), d.to_string())),
             (Some("theorem"), Some(t), Some(a)) => {
-                let axs = if a == "-" { vec![] } else { a.split(',').map(str::to_string).collect() };
+                let axs = if a == "-" {
+                    vec![]
+                } else {
+                    a.split(',').map(str::to_string).collect()
+                };
                 r.theorems.push((t.to_string(), axs));
             }
             (Some("tool"), Some(t), Some(v)) => r.tools.push((t.to_string(), v.to_string())),
@@ -146,8 +166,9 @@ pub fn parse(text: &str) -> Receipt {
 /// current bytes, every audited theorem is listed with allowed axioms only, and the hand-written
 /// Lean has no forbidden token.
 pub fn verify_fresh(root: &Path) -> Result<Receipt, String> {
-    let text = fs::read_to_string(root.join("proofs/RECEIPT"))
-        .map_err(|e| format!("proofs/RECEIPT missing ({e}); run `wirefold-proofs check --write-receipt`"))?;
+    let text = fs::read_to_string(root.join("proofs/RECEIPT")).map_err(|e| {
+        format!("proofs/RECEIPT missing ({e}); run `wirefold-proofs check --write-receipt`")
+    })?;
     let r = parse(&text);
     let now = digests(root)?;
     if r.digests != now {
@@ -161,7 +182,9 @@ pub fn verify_fresh(root: &Path) -> Result<Receipt, String> {
     let want = audited_theorems(root)?;
     let have: Vec<&String> = r.theorems.iter().map(|t| &t.0).collect();
     if want.iter().collect::<Vec<_>>() != have {
-        return Err(format!("receipt theorems {have:?} differ from Audit.lean {want:?}"));
+        return Err(format!(
+            "receipt theorems {have:?} differ from Audit.lean {want:?}"
+        ));
     }
     for (t, axs) in &r.theorems {
         for a in axs {
