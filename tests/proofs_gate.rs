@@ -13,6 +13,7 @@
 //! been run the receipt is stale or missing and this test fails. A missing toolchain is never a pass.
 
 #[path = "../proofs/runner/src/receipt.rs"]
+#[allow(dead_code)]
 mod receipt;
 #[path = "../proofs/runner/src/sha256.rs"]
 #[allow(dead_code)]

@@ -11,7 +11,7 @@ fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
         let p = e.unwrap().path();
         if p.is_dir() {
             rs_files(&p, out);
-        } else if p.extension().map_or(false, |x| x == "rs") {
+        } else if p.extension().is_some_and(|x| x == "rs") {
             out.push(p);
         }
     }

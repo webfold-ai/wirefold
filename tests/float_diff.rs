@@ -134,8 +134,8 @@ fn edge_patterns() -> Vec<u64> {
             (1 << 51) + 1,
             (1 << 52) - 2,
             (1 << 52) - 1,
-            0x5555_5555_5555_5,
-            0xaaaa_aaaa_aaaa_a,
+            0x0005_5555_5555_5555,
+            0x000a_aaaa_aaaa_aaaa,
         ] {
             for sign in [0u64, 1] {
                 v.push(sign << 63 | e << 52 | m);

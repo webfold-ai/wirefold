@@ -8,6 +8,13 @@
 #![forbid(unsafe_code)]
 #![allow(missing_docs)]
 #![allow(clippy::all)]
+#![allow(
+    clippy::needless_pass_by_value,
+    clippy::range_plus_one,
+    clippy::bool_to_int_with_if,
+    clippy::nonminimal_bool,
+    clippy::needless_bitwise_bool
+)]
 
 pub mod float;
 pub mod float_core;
