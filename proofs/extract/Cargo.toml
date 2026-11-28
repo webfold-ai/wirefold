@@ -1,0 +1,12 @@
+[package]
+name = "wirefold_extract"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Charon translation unit for the wirefold number formatters. Development-only; not a member of the wirefold workspace."
+
+[lib]
+path = "lib.rs"
+
+# Its own workspace root: cargo must not treat it as part of the library workspace.
+[workspace]

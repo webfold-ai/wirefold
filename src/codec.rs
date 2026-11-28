@@ -4022,11 +4022,11 @@ pub mod msgpack {
             )))),
             0xca => {
                 let f = f32::from_be_bytes(take(bytes, pos, 4)?.try_into().unwrap());
-                Ok(SyntaxTerm::B(Atom::Num(crate::num::float_to_string(f))))
+                Ok(SyntaxTerm::B(Atom::Num(crate::num::float_display_string(f))))
             }
             0xcb => {
                 let f = f64::from_be_bytes(take(bytes, pos, 8)?.try_into().unwrap());
-                Ok(SyntaxTerm::B(Atom::Num(crate::num::float_to_string(f))))
+                Ok(SyntaxTerm::B(Atom::Num(crate::num::float_display_string(f))))
             }
             // fixstr / str8 / str16 / str32
             0xa0..=0xbf | 0xd9 | 0xda | 0xdb => {
@@ -5686,7 +5686,7 @@ pub mod syntax {
     positional_scalar_as_term!(i32, crate::num::int_to_string);
     positional_scalar_as_term!(u64, crate::num::int_to_string);
     positional_scalar_as_term!(u32, crate::num::int_to_string);
-    positional_scalar_as_term!(f64, crate::num::float_to_string);
+    positional_scalar_as_term!(f64, crate::num::float_display_string);
 
     impl AsTerm for bool {
         fn to_term(&self) -> SyntaxTerm {

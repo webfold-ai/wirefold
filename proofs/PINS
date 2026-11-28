@@ -1,0 +1,11 @@
+# Pinned proof toolchain. `wirefold-proofs setup` and `check` fail when any of these does not match.
+# Prior art: apeiron's proof/bootstrap.sh and proof/patches/PINS pin the same Aeneas release and the same
+# Charon commit; this repo uses the published release archive and applies no tool patch (the
+# itoa/ryu core does not reach the array-repeat or Vec model gaps those patches close).
+AENEAS_ARCHIVE_URL=https://github.com/AeneasVerif/aeneas/releases/download/nightly-2026.09.09-505b6ca/aeneas-linux-x86_64.tar.gz
+AENEAS_ARCHIVE_SHA256=d5ba53b1370d30866bcd86de5e34abfbadf09e76b3689a7f70f458cd0c133591
+CHARON_COMMIT=b104e24fea7d721b71e6c39fd70f26ff20bc0980
+CHARON_VERSION=0.1.254
+RUST_TOOLCHAIN=nightly-2026-08-18
+LEAN_TOOLCHAIN=leanprover/lean4:v4.31.0
+MATHLIB_REV=fabf563a7c95a166b8d7b6efca11c8b4dc9d911f

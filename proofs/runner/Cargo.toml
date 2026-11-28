@@ -1,0 +1,13 @@
+[package]
+name = "wirefold-proofs"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Runs the wirefold proof pipeline: Charon (Rust to LLBC), Aeneas (LLBC to Lean), lake build, and the axiom audit. Dev-only; no dependencies."
+
+# Its own workspace root: not part of the library workspace.
+[workspace]
+
+[[bin]]
+name = "wirefold-proofs"
+path = "src/main.rs"

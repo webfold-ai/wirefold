@@ -27,3 +27,12 @@ rustc-ice-*.txt
 /wirefold_bindings/dist/
 __pycache__/
 *.pyc
+
+# local run logs
+/.work/
+# proof toolchain install and box run outputs (pinned release archive is fetched by `wirefold-proofs setup`)
+/.box/
+/proofs/**/.lake/
+/proofs/**/*.llbc
+/proofs/runner/target/
+/proofs/extract/target/

@@ -171,10 +171,10 @@ impl ser::Serializer for TermSerializer {
         Ok(SyntaxTerm::B(Atom::Bool(v)))
     }
     fn serialize_f32(self, v: f32) -> Result<SyntaxTerm, Error> {
-        float(crate::num::float_to_string(v), v.is_finite())
+        float(crate::num::float_debug_string(v), v.is_finite())
     }
     fn serialize_f64(self, v: f64) -> Result<SyntaxTerm, Error> {
-        float(crate::num::float_to_string(v), v.is_finite())
+        float(crate::num::float_debug_string(v), v.is_finite())
     }
     fn serialize_char(self, v: char) -> Result<SyntaxTerm, Error> {
         Ok(SyntaxTerm::B(Atom::Str(v.to_string())))
